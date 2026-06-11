@@ -247,6 +247,75 @@ test("manifest: every malformed shape is a named problem (validation gates apply
   assert.ok(tzProblems.some((p) => p.code === "timezone" && /not implemented/.test(p.message)));
 });
 
+test("manifest: [run] env parses static string values; defaults to {} when absent", () => {
+  const withEnv = validateManifest(
+    parseToml(
+      `machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\nenv = { AUTONOMOUS_SESSION = "1", AUTONOMOUS_LABEL = "nightly" }\n`,
+    ),
+    { dirName: "x" },
+  );
+  assert.deepEqual(withEnv.problems, []);
+  assert.deepEqual(withEnv.warnings, []);
+  assert.deepEqual(withEnv.manifest?.run.env, { AUTONOMOUS_SESSION: "1", AUTONOMOUS_LABEL: "nightly" });
+
+  // [run.env] subtable form parses identically
+  const subtable = validateManifest(
+    parseToml(`machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\n[run.env]\nFOO = "bar"\n`),
+    { dirName: "x" },
+  );
+  assert.deepEqual(subtable.manifest?.run.env, { FOO: "bar" });
+
+  const without = validateManifest(
+    parseToml(`machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\n`),
+    { dirName: "x" },
+  );
+  assert.deepEqual(without.manifest?.run.env, {});
+});
+
+test("manifest: [run] env validation — non-string values, pointer-shaped values, [secrets] collisions", () => {
+  const base = `machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\n`;
+
+  // numbers/booleans rejected with a clear message — quote the value
+  const nonString = validateManifest(parseToml(base + `env = { COUNT = 3 }\n`), { dirName: "auto" });
+  assert.ok(nonString.problems.some((p) => p.code === "run-env" && /plain string/.test(p.message)));
+  const boolVal = validateManifest(parseToml(base + `env = { FLAG = true }\n`), { dirName: "auto" });
+  assert.ok(boolVal.problems.some((p) => p.code === "run-env"));
+  // empty keys rejected
+  const emptyKey = validateManifest(parseToml(base + `[run.env]\n"" = "x"\n`), { dirName: "auto" });
+  assert.ok(emptyKey.problems.some((p) => p.code === "run-env" && /non-empty/.test(p.message)));
+
+  // pointer-shaped value → belongs in [secrets]
+  const pointer = validateManifest(parseToml(base + `env = { TOKEN = "op://Vault/item/field" }\n`), {
+    dirName: "auto",
+  });
+  assert.ok(pointer.problems.some((p) => p.code === "run-env-pointer" && /move it to \[secrets\]/.test(p.message)));
+
+  // the same key in run.env AND [secrets] is declared twice — an error
+  const collision = validateManifest(
+    parseToml(base + `env = { TOKEN = "static" }\n[secrets]\nTOKEN = "op://Vault/item/field"\n`),
+    { dirName: "auto" },
+  );
+  assert.ok(
+    collision.problems.some(
+      (p) => p.code === "run-env-secret-collision" && /declare it once/.test(p.message),
+    ),
+  );
+});
+
+test("manifest: run.env under direct_exec is a WARNING, not an error (plists carry no env)", () => {
+  const { manifest, problems, warnings } = validateManifest(
+    parseToml(
+      `machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\ndirect_exec=true\nenv = { FOO = "bar" }\n`,
+    ),
+    { dirName: "auto" },
+  );
+  assert.deepEqual(problems, []);
+  assert.ok(manifest !== null); // valid — the warning does not block apply
+  assert.ok(
+    warnings.some((w) => w.code === "direct-exec-env" && /launchd login environment/.test(w.message)),
+  );
+});
+
 // ---------------------------------------------------------------------------
 // Plist generation — late binding invariants
 // ---------------------------------------------------------------------------

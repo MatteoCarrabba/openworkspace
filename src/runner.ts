@@ -267,9 +267,11 @@ export function runAutomation(options: RunnerOptions): RunOutcome {
     throw err;
   }
   const secretKeys = Object.keys(secretEnv);
+  const staticEnvKeys = Object.keys(manifest.run.env);
 
-  // 5–7. execute (the §7.4 seam), log, retain, record
-  const result = execute(manifest, canonicalRoot, { ...env, ...secretEnv });
+  // 5–7. execute (the §7.4 seam), log, retain, record. Child env precedence:
+  // runner base env < [run] env (static, non-secret) < resolved [secrets].
+  const result = execute(manifest, canonicalRoot, { ...env, ...manifest.run.env, ...secretEnv });
   const ok = result.exitCode === 0;
   const body =
     `--- stdout ---\n${result.stdout}` +
@@ -277,6 +279,7 @@ export function runAutomation(options: RunnerOptions): RunOutcome {
     `--- exit: ${result.exitCode ?? "none"}${result.timedOut ? " (timed out)" : ""} ---\n`;
   return finish(ok ? "ok" : "failed", result.exitCode, body, [
     `# secrets: ${secretKeys.length > 0 ? secretKeys.join(", ") : "(none)"} (env-only, values never logged)`,
+    `# env: ${staticEnvKeys.length > 0 ? staticEnvKeys.join(", ") : "(none)"} (static)`,
   ]);
 }
 

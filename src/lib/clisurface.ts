@@ -13,7 +13,7 @@
  * positionals/flags only (no subcommand vocabulary to validate).
  */
 export const CLI_SURFACE: Readonly<Record<string, ReadonlySet<string> | null>> = {
-  home: new Set(["init", "list", "scan", "doctor", "mint-suffix", "runner-node"]),
+  home: new Set(["init", "list", "scan", "doctor", "mint-suffix", "runner-node", "machine-id"]),
   init: null,
   new: null,
   show: null,

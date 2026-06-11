@@ -69,6 +69,56 @@ export function machineId(store: MachineStore): string {
   }
 }
 
+const MACHINE_ID_RE = /^[a-z][a-z0-9-]*$/;
+
+/**
+ * Set this machine's id explicitly (overwriting the minted one). Validates
+ * the name, rewrites the store file atomically, and — because the id keys
+ * the synced per-machine registry (`.openworkspace/machines/<id>.toml`) —
+ * renames the registry file in every known workspace so the machine doesn't
+ * fork into two identities. Refuses when the target name's registry file
+ * already exists (that name belongs to another machine).
+ */
+export function setMachineId(store: MachineStore, name: string): { old: string; new: string } {
+  const trimmed = name.trim();
+  if (!MACHINE_ID_RE.test(trimmed)) {
+    throw new ConfigError(
+      `invalid machine-id "${name}": must match [a-z][a-z0-9-]* (e.g. "mini")`,
+    );
+  }
+  const old = machineId(store); // mints if absent — there is always an "old"
+  if (old !== trimmed) {
+    // refuse-first: check every known workspace BEFORE mutating anything.
+    // Dedupe by realpath — the same workspace can be registered under path
+    // aliases (e.g. /var vs /private/var on macOS) and must rename once.
+    const renames: Array<{ from: string; to: string }> = [];
+    const seen = new Set<string>();
+    for (const wsRoot of readKnownWorkspaces(store)) {
+      const machinesDir = path.join(wsRoot, ".openworkspace", "machines");
+      let realDir: string;
+      try {
+        realDir = fs.realpathSync(machinesDir);
+      } catch {
+        continue; // no machines dir in this workspace — nothing to rename
+      }
+      if (seen.has(realDir)) continue;
+      seen.add(realDir);
+      const from = path.join(machinesDir, `${old}.toml`);
+      const to = path.join(machinesDir, `${trimmed}.toml`);
+      if (!fs.existsSync(from)) continue;
+      if (fs.existsSync(to)) {
+        throw new ConflictError(
+          `machine registry ${to} already exists — "${trimmed}" is taken by another machine; pick a different name`,
+        );
+      }
+      renames.push({ from, to });
+    }
+    for (const r of renames) fs.renameSync(r.from, r.to);
+  }
+  writeFileAtomic(path.join(store.dir, "machine-id"), trimmed + "\n");
+  return { old, new: trimmed };
+}
+
 // --- per-machine mint suffix (PRD §4.4: "Mini-minted records take a machine
 // suffix"). Machine-local intent: the off-canonical machine declares its
 // suffix ONCE (a `mint-suffix` file in the store, or the env override) and

@@ -351,6 +351,36 @@ test("cli: home mint-suffix wires §4.4 machine-suffixed minting end to end", (t
   assert.equal((JSON.parse(plain.stdout) as { id: string }).id, "task-2");
 });
 
+test("cli: home machine-id — show (mints if absent), validated set with old → new, registry rename", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+
+  // show: prints the current id (already minted by home init), --json shape
+  const show0 = run(["home", "machine-id", "--json"], fx.root, fx.storeDir);
+  assert.equal(show0.status, 0, show0.stderr);
+  const current = (JSON.parse(show0.stdout) as { machineId: string }).machineId;
+  assert.equal(current, fs.readFileSync(path.join(fx.storeDir, "machine-id"), "utf8").trim());
+
+  // set: returns {old, new}; the synced registry file follows the rename
+  const set = run(["home", "machine-id", "renamed-machine", "--json"], fx.root, fx.storeDir);
+  assert.equal(set.status, 0, set.stderr);
+  assert.deepEqual(JSON.parse(set.stdout), { old: current, new: "renamed-machine" });
+  const machinesDir = path.join(fx.root, ".openworkspace", "machines");
+  assert.ok(!fs.existsSync(path.join(machinesDir, `${current}.toml`)));
+  assert.ok(fs.existsSync(path.join(machinesDir, "renamed-machine.toml")));
+
+  // round-trip: show now reports the new id
+  const show1 = run(["home", "machine-id", "--json"], fx.root, fx.storeDir);
+  assert.equal((JSON.parse(show1.stdout) as { machineId: string }).machineId, "renamed-machine");
+
+  // invalid names are rejected (exit 1), id unchanged
+  assert.equal(run(["home", "machine-id", "Bad_Name"], fx.root, fx.storeDir).status, 1);
+  assert.equal(
+    fs.readFileSync(path.join(fx.storeDir, "machine-id"), "utf8").trim(),
+    "renamed-machine",
+  );
+});
+
 test("cli: home runner-node — show, validated set, clear (decision-1 machine-local fact)", (t) => {
   const fx = makeFixture();
   t.after(fx.cleanup);

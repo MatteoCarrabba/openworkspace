@@ -27,6 +27,7 @@ import {
   openMachineStore,
   readMintSuffix,
   readRunnerNode,
+  setMachineId,
   writeMintSuffix,
   writeRunnerNode,
   writeUidCacheEntry,
@@ -82,6 +83,7 @@ Workspace
   projects home doctor [--json]           workspace + every project's invariant checks
   projects home mint-suffix [<suffix>|--clear]   this machine's ID suffix (e.g. "mini" → task-7-mini)
   projects home runner-node [<path>|--clear]     this machine's granted runner node binary (decision-1)
+  projects home machine-id [<name>]       this machine's id — matched against manifests' machines = [...]
 
 Projects
   projects init [<path>]                  stamp the full _project/ skeleton (default: the cwd)
@@ -380,6 +382,31 @@ function cmdHome(argv: string[]): void {
       else print(`runner-node set: ${resolved} (re-run \`projects automation apply --all\` to regenerate plists)`);
       return;
     }
+    case "machine-id": {
+      // The machine's identity: minted lazily (hostname + 2 hex bytes), or
+      // set explicitly here. It is what automation manifests' machines =
+      // [...] declarations are matched against, and it keys the synced
+      // registry file (.openworkspace/machines/<id>.toml) — setMachineId
+      // renames that file in every known workspace.
+      const { values, positionals } = parse(rest, FLAG_JSON);
+      const store = getStore();
+      const name = positionals[0];
+      if (name === undefined) {
+        const current = machineId(store); // mints on first read
+        if (values["json"] === true) printJson({ machineId: current });
+        else print(`machine-id: ${current}`);
+        return;
+      }
+      const result = setMachineId(store, name);
+      if (values["json"] === true) printJson(result);
+      else
+        print(
+          result.old === result.new
+            ? `machine-id unchanged: ${result.new}`
+            : `machine-id set: ${result.old} → ${result.new} (manifests' machines = [...] now match "${result.new}")`,
+        );
+      return;
+    }
     case "list": {
       const { values } = parse(rest, { ...FLAG_JSON, all: { type: "boolean", default: false } });
       const ws = openWorkspaceRegistered(process.cwd());
@@ -430,7 +457,7 @@ function cmdHome(argv: string[]): void {
     }
     default:
       throw new ConfigError(
-        `unknown home subcommand: ${sub ?? "(none)"} (expected init|list|scan|doctor|mint-suffix|runner-node)`,
+        `unknown home subcommand: ${sub ?? "(none)"} (expected init|list|scan|doctor|mint-suffix|runner-node|machine-id)`,
       );
   }
 }

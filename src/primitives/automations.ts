@@ -97,6 +97,8 @@ export interface AutomationManifest {
     /** §7.4 TCC fallback: plist ProgramArguments = the command itself. */
     directExec: boolean;
     timeoutSeconds: number | null;
+    /** Static, NON-secret env injected into the child (secrets always win). */
+    env: Record<string, string>;
   };
   /** key → secret POINTER (<scheme>://<ref>); bare values never validate. */
   secrets: Record<string, string>;
@@ -248,9 +250,11 @@ function parseCalendarInterval(v: unknown): CalendarEntry[] {
 export function validateManifest(
   raw: TomlTable,
   options: { dirName: string },
-): { manifest: AutomationManifest | null; problems: ManifestProblem[] } {
+): { manifest: AutomationManifest | null; problems: ManifestProblem[]; warnings: ManifestProblem[] } {
   const problems: ManifestProblem[] = [];
+  const warnings: ManifestProblem[] = [];
   const prob = (code: string, message: string) => problems.push({ code, message });
+  const warn = (code: string, message: string) => warnings.push({ code, message });
 
   // name: defaults to the directory name; a disagreeing declared name is drift
   let name = options.dirName;
@@ -330,6 +334,7 @@ export function validateManifest(
   let command: string[] = [];
   let directExec = false;
   let timeoutSeconds: number | null = null;
+  const runEnv: Record<string, string> = {};
   const run = raw["run"];
   if (!isTable(run)) {
     prob("no-run", "missing [run] table (command = [...])");
@@ -349,6 +354,37 @@ export function validateManifest(
         prob("timeout_seconds", "[run] timeout_seconds must be a positive number");
       } else {
         timeoutSeconds = run["timeout_seconds"];
+      }
+    }
+    // [run] env: static, NON-secret values injected into the child env.
+    // Plain strings only; anything pointer-shaped belongs in [secrets].
+    if (run["env"] !== undefined) {
+      if (!isTable(run["env"])) {
+        prob("run-env", '[run] env must be a table of string values (env = { KEY = "value" })');
+      } else {
+        for (const [key, value] of Object.entries(run["env"] as TomlTable)) {
+          if (key.trim() === "") {
+            prob("run-env", "[run] env: keys must be non-empty strings");
+            continue;
+          }
+          if (typeof value !== "string") {
+            prob(
+              "run-env",
+              `[run] env ${key}: value must be a plain string (got ${Array.isArray(value) ? "array" : typeof value}) — ` +
+                `quote it (e.g. ${key} = "1")`,
+            );
+            continue;
+          }
+          if (SECRET_POINTER_RE.test(value)) {
+            prob(
+              "run-env-pointer",
+              `[run] env ${key}: value looks like a secret pointer (<scheme>://<ref>) — move it to [secrets] ` +
+                `so it is resolved at run time, never stored as a value`,
+            );
+            continue;
+          }
+          runEnv[key] = value;
+        }
       }
     }
   }
@@ -379,6 +415,27 @@ export function validateManifest(
       "direct-exec-secrets",
       "[secrets] cannot be combined with direct_exec = true — there is no runner in the " +
         "direct-exec path to resolve pointers, and resolved values never land in a plist",
+    );
+  }
+
+  // run.env ∩ [secrets]: one declaration per key — pointers go in [secrets],
+  // static values in run.env; the same key in both is an authoring error.
+  if (isTable(raw["secrets"])) {
+    for (const key of Object.keys(runEnv)) {
+      if ((raw["secrets"] as TomlTable)[key] !== undefined) {
+        prob(
+          "run-env-secret-collision",
+          `env key "${key}" appears in both [run] env and [secrets] — declare it once: ` +
+            `[secrets] for pointers, run.env for static values`,
+        );
+      }
+    }
+  }
+  if (directExec && Object.keys(runEnv).length > 0) {
+    warn(
+      "direct-exec-env",
+      "[run] env has no effect with direct_exec = true — direct_exec plists carry no " +
+        "EnvironmentVariables; the env rides the launchd login environment",
     );
   }
 
@@ -421,13 +478,13 @@ export function validateManifest(
     }
   }
 
-  if (problems.length > 0) return { manifest: null, problems };
+  if (problems.length > 0) return { manifest: null, problems, warnings };
   return {
     manifest: {
       name,
       machines,
       schedule: { cron, calendar, timezone, missPolicy },
-      run: { command, directExec, timeoutSeconds },
+      run: { command, directExec, timeoutSeconds, env: runEnv },
       secrets,
       supervise,
       signature,
@@ -435,6 +492,7 @@ export function validateManifest(
       raw,
     },
     problems,
+    warnings,
   };
 }
 
@@ -465,6 +523,8 @@ export interface ManifestScanEntry {
   manifestPath: string;
   manifest: AutomationManifest | null;
   problems: ManifestProblem[];
+  /** Non-blocking findings (e.g. run.env under direct_exec). */
+  warnings: ManifestProblem[];
 }
 
 /** Scan a project's automation definitions (forgiving: problems reported, not thrown). */
@@ -483,14 +543,15 @@ export function scanManifests(projectRoot: string): ManifestScanEntry[] {
     if (!fs.existsSync(manifestPath)) continue; // a dir without a manifest is not an automation
     try {
       const raw = readToml(manifestPath);
-      const { manifest, problems } = validateManifest(raw, { dirName: ent.name });
-      out.push({ name: ent.name, manifestPath, manifest, problems });
+      const { manifest, problems, warnings } = validateManifest(raw, { dirName: ent.name });
+      out.push({ name: ent.name, manifestPath, manifest, problems, warnings });
     } catch (err) {
       out.push({
         name: ent.name,
         manifestPath,
         manifest: null,
         problems: [{ code: "toml", message: err instanceof Error ? err.message : String(err) }],
+        warnings: [],
       });
     }
   }

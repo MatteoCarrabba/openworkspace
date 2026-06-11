@@ -379,3 +379,66 @@ test("runner: project rename mid-flight is transparent (late binding re-resolves
     fs.readFileSync(second.logPath as string, "utf8").includes(`ran at ${fs.realpathSync(newRoot)}`),
   );
 });
+
+test("runner: child env precedence — base env < [run] env (static) < resolved [secrets]; names-only log line", (t) => {
+  // the resolver lives OUTSIDE the workspace so the disk sweep can be total
+  const resolverDir = makeTmpDir("ow-resolver-");
+  const resolverPath = path.join(resolverDir, "resolver.sh");
+  fs.writeFileSync(resolverPath, `#!/bin/sh\necho "${SECRET_VALUE}"\n`, { mode: 0o755 });
+  const fx = makeFixture({
+    configToml: `[secrets.resolvers]\nfake = "${resolverPath} {ref}"\n`,
+  });
+  t.after(() => {
+    fx.cleanup();
+    rmrf(resolverDir);
+  });
+
+  writeManifest(
+    fx.project.root,
+    "env-merge",
+    nodeCommandToml(
+      `const e = process.env; ` +
+        `console.log('STATIC_ONLY=' + e.STATIC_ONLY); ` +
+        `console.log('FROM_BASE=' + e.FROM_BASE); ` +
+        `console.log('OVERRIDDEN=' + e.OVERRIDDEN); ` +
+        `console.log('TOKEN:len=' + (e.TOKEN ?? '').length)`,
+      `env = { STATIC_ONLY = "static-value", OVERRIDDEN = "static-wins-over-base" }\n` +
+        `[secrets]\nTOKEN = "fake://AI Secrets/item/field"\n`,
+    ),
+  );
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "env-merge",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+    env: { ...process.env, FROM_BASE: "base-value", OVERRIDDEN: "base-loses" },
+  });
+  assert.equal(outcome.status, "ok");
+  const content = fs.readFileSync(outcome.logPath as string, "utf8");
+  assert.ok(content.includes("STATIC_ONLY=static-value"), content); // run.env reaches the child
+  assert.ok(content.includes("FROM_BASE=base-value"), content); // base env still flows through
+  assert.ok(content.includes("OVERRIDDEN=static-wins-over-base"), content); // run.env beats base
+  assert.ok(content.includes(`TOKEN:len=${SECRET_VALUE.length}`), content); // secrets layer on top
+
+  // trailing header lines: names only, never values — same shape as # secrets:
+  assert.match(content, /# secrets: TOKEN \(env-only, values never logged\)/);
+  assert.match(content, /# env: STATIC_ONLY, OVERRIDDEN \(static\)/);
+
+  // no-secrets-on-disk sweep stays green with the env feature in play
+  assert.deepEqual(grepTree(fx.root, SECRET_VALUE), []);
+  assert.deepEqual(grepTree(fx.store.dir, SECRET_VALUE), []);
+});
+
+test("runner: a manifest without [run] env logs '# env: (none) (static)'", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeManifest(fx.project.root, "plain", nodeCommandToml(`console.log('plain')`));
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "plain",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "ok");
+  assert.match(fs.readFileSync(outcome.logPath as string, "utf8"), /# env: \(none\) \(static\)/);
+});

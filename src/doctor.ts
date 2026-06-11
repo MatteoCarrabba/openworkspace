@@ -530,8 +530,9 @@ export function doctorProject(
       err(manifestRel, "unparseable automation.toml");
       continue;
     }
-    const { manifest, problems } = validateManifest(raw, { dirName: ent.name });
+    const { manifest, problems, warnings: manifestWarnings } = validateManifest(raw, { dirName: ent.name });
     for (const prob of problems) err(manifestRel, prob.message);
+    for (const w of manifestWarnings) warn(manifestRel, w.message);
     if (manifest !== null) {
       // miss_policy beyond the default is recorded for the supervise pass
       // (C3, per §7.2) but NOT yet enforced at fire time — the runner's

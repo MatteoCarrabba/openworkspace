@@ -16,10 +16,11 @@ import {
   readRunnerNode,
   readUidCache,
   registerWorkspace,
+  setMachineId,
   writeRunnerNode,
   writeUidCacheEntry,
 } from "../src/lib/machine.js";
-import { ConfigError } from "../src/lib/errors.js";
+import { ConfigError, ConflictError } from "../src/lib/errors.js";
 import { makeTmpDir, makeTmpStore, rmrf } from "./helpers.js";
 
 test("store dir is injectable: explicit path and env override; default only as last resort", (t) => {
@@ -51,6 +52,53 @@ test("machineId respects a hand-placed id (e.g. 'mini')", (t) => {
   t.after(cleanup);
   fs.writeFileSync(path.join(store.dir, "machine-id"), "mini\n");
   assert.equal(machineId(store), "mini");
+});
+
+test("setMachineId: validated overwrite of the minted id; returns {old, new}", (t) => {
+  const { store, cleanup } = makeTmpStore();
+  t.after(cleanup);
+  const minted = machineId(store); // lazily minted "old"
+  const result = setMachineId(store, "mini");
+  assert.deepEqual(result, { old: minted, new: "mini" });
+  assert.equal(machineId(store), "mini");
+  // idempotent re-set: old == new, no error
+  assert.deepEqual(setMachineId(store, "mini"), { old: "mini", new: "mini" });
+});
+
+test("setMachineId: rejects names outside [a-z][a-z0-9-]*", (t) => {
+  const { store, cleanup } = makeTmpStore();
+  t.after(cleanup);
+  const before = machineId(store);
+  for (const bad of ["Mini", "9mini", "min_i", "", "-mini", "mini.local"]) {
+    assert.throws(() => setMachineId(store, bad), ConfigError);
+  }
+  assert.equal(machineId(store), before); // untouched on rejection
+});
+
+test("setMachineId: renames the synced registry file in known workspaces; refuses on collision", (t) => {
+  const { store, cleanup } = makeTmpStore();
+  t.after(cleanup);
+  const wsRoot = makeTmpDir("ow-ws-");
+  t.after(() => rmrf(wsRoot));
+  const machinesDir = path.join(wsRoot, ".openworkspace", "machines");
+  fs.mkdirSync(machinesDir, { recursive: true });
+  registerWorkspace(store, wsRoot);
+
+  fs.writeFileSync(path.join(store.dir, "machine-id"), "oldname\n");
+  fs.writeFileSync(path.join(machinesDir, "oldname.toml"), 'machine_id = "oldname"\n');
+
+  // collision: the target name's registry already exists → refuse, no mutation
+  fs.writeFileSync(path.join(machinesDir, "taken.toml"), 'machine_id = "taken"\n');
+  assert.throws(() => setMachineId(store, "taken"), ConflictError);
+  assert.equal(machineId(store), "oldname");
+  assert.ok(fs.existsSync(path.join(machinesDir, "oldname.toml")));
+
+  // clean rename: registry file follows the id
+  const result = setMachineId(store, "newname");
+  assert.deepEqual(result, { old: "oldname", new: "newname" });
+  assert.ok(!fs.existsSync(path.join(machinesDir, "oldname.toml")));
+  assert.match(fs.readFileSync(path.join(machinesDir, "newname.toml"), "utf8"), /machine_id = "oldname"/);
+  assert.equal(machineId(store), "newname");
 });
 
 test("UID cache: read/write/drop round-trip; corrupt cache reads as empty (rebuildable)", (t) => {
