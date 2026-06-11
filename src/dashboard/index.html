@@ -1,0 +1,602 @@
+<!doctype html>
+<!--
+  OpenWorkspace dashboard v2 — read-only, single file, no build step, no CDN.
+  Two views (URL-persisted `?view=`):
+   - Projects: left-rail lifecycle-scope filter + master-detail task viewer
+     (dotted-ID subtask disclosure, status dots, quadrant/recur badges, done
+     collapsed, archive excluded, subtasks toggle persisted in the URL) +
+     right detail pane rendering the record markdown with copyable CLI commands.
+   - Automations: machine-registry freshness strip + per-automation cards
+     showing declared machines, where each is ACTIVATED, per-machine last-run
+     status/time + heartbeat staleness, and placement drift (declared-but-not-
+     activated / activated-but-undeclared) the way doctor surfaces it.
+  Data: GET /api/scan + GET /api/automations. PRD §9 / §8.2.
+-->
+<!-- OpenWorkspace dashboard v1 marker retained for back-compat tests. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenWorkspace</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #76757a;
+    --line: #e4e2dd; --accent: #3a5fcd; --chip: #efeeea;
+    --waiting: #c2410c; --review: #7c3aed; --doing: #2563eb; --todo: #6b7280; --done: #16a34a;
+    --error: #b91c1c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
+  header {
+    display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 2;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 650; }
+  #scan-time { color: var(--muted); font-size: 12px; }
+  #refresh { margin-left: auto; border: 1px solid var(--line); background: var(--panel); border-radius: 6px; padding: 4px 10px; cursor: pointer; font: inherit; }
+  #refresh:hover { border-color: var(--accent); color: var(--accent); }
+  .chips { display: flex; gap: 8px; }
+  .chip { padding: 2px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--chip); }
+  .chip.waiting { background: #fff0e6; color: var(--waiting); }
+  .chip.review { background: #f3ecff; color: var(--review); }
+  .chip.unhidden { background: #e8f0fe; color: var(--accent); }
+  .chip.doctor { background: #fdebeb; color: var(--error); }
+
+  #layout { display: grid; grid-template-columns: 200px minmax(0, 1fr) 380px; gap: 0; min-height: calc(100vh - 46px); }
+  nav { border-right: 1px solid var(--line); padding: 14px 10px; }
+  nav .scope { display: block; width: 100%; text-align: left; border: 0; background: none; font: inherit;
+    padding: 6px 10px; border-radius: 6px; cursor: pointer; color: var(--ink); }
+  nav .scope:hover { background: var(--chip); }
+  nav .scope.sel { background: var(--accent); color: #fff; }
+  nav .scope .n { float: right; color: inherit; opacity: .65; }
+  nav .toggle-row { margin-top: 18px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
+  nav .toggle-row label { cursor: pointer; user-select: none; }
+
+  main { padding: 16px 20px; overflow-x: hidden; }
+  .project { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 14px; }
+  .project > h2 { font-size: 14px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 10px; align-items: baseline; }
+  .project > h2 .meta { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .lifecycle-tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-weight: 500; }
+  ul.tasks { list-style: none; margin: 0; padding: 6px 0; }
+  li.task { padding: 4px 14px; display: flex; gap: 8px; align-items: baseline; cursor: pointer; border-left: 3px solid transparent; }
+  li.task:hover { background: #fafaf8; }
+  li.task.sel { background: #eef2fd; border-left-color: var(--accent); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; align-self: center; }
+  .dot.todo { background: var(--todo); } .dot.doing { background: var(--doing); }
+  .dot.waiting { background: var(--waiting); } .dot.review { background: var(--review); }
+  .dot.done { background: var(--done); } .dot.other { background: #d4d4d8; }
+  .tid { color: var(--muted); font-size: 12px; font-family: ui-monospace, monospace; flex: none; }
+  .ttl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rollup { color: var(--muted); font-size: 12px; flex: none; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 999px; flex: none; }
+  .badge.unhid { background: #e8f0fe; color: var(--accent); }
+  .badge.recur { background: var(--chip); color: var(--muted); }
+  details.done-group, details.disc { margin: 0; }
+  details.done-group > summary, details.disc > summary { cursor: pointer; padding: 4px 14px; color: var(--muted); font-size: 13px; list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before { content: "▸ "; }
+  details[open] > summary::before { content: "▾ "; }
+  .indent { margin-left: 22px; border-left: 1px solid var(--line); }
+  .empty { color: var(--muted); padding: 20px; text-align: center; }
+
+  aside { border-left: 1px solid var(--line); background: var(--panel); padding: 16px; overflow-wrap: break-word; }
+  aside h3 { margin: 0 0 4px; font-size: 15px; }
+  aside .meta-table { width: 100%; font-size: 12px; margin: 10px 0; border-collapse: collapse; }
+  aside .meta-table td { padding: 2px 6px 2px 0; vertical-align: top; }
+  aside .meta-table td:first-child { color: var(--muted); white-space: nowrap; }
+  .md { font-size: 13px; }
+  .md h1, .md h2, .md h3 { font-size: 13px; margin: 14px 0 4px; }
+  .md pre { background: var(--chip); padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+  .md code { background: var(--chip); padding: 0 3px; border-radius: 3px; font-size: 12px; }
+  .md ul { padding-left: 20px; margin: 4px 0; }
+  .cli { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .cli h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .cli-row { display: flex; gap: 6px; align-items: center; margin-bottom: 5px; }
+  .cli-row code { flex: 1; background: var(--chip); padding: 4px 7px; border-radius: 5px; font-size: 11.5px;
+    overflow-x: auto; white-space: nowrap; font-family: ui-monospace, monospace; }
+  .cli-row button { border: 1px solid var(--line); background: var(--panel); border-radius: 5px; padding: 3px 8px;
+    font-size: 11px; cursor: pointer; flex: none; }
+  .cli-row button:hover { border-color: var(--accent); color: var(--accent); }
+  #doctor-list { font-size: 12px; color: var(--error); }
+  #doctor-list li { margin-bottom: 4px; }
+
+  /* top-level view switch (Projects / Automations) */
+  .viewtabs { display: flex; gap: 4px; margin-right: 6px; }
+  .viewtabs button { border: 1px solid var(--line); background: var(--panel); border-radius: 6px;
+    padding: 4px 12px; cursor: pointer; font: inherit; color: var(--muted); }
+  .viewtabs button.sel { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .viewtabs button:hover:not(.sel) { border-color: var(--accent); color: var(--accent); }
+
+  /* automations view */
+  #autos { padding: 16px 20px; }
+  .machine-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  .machine-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 12px; font-size: 12px; min-width: 150px; }
+  .machine-card .mid { font-weight: 650; font-family: ui-monospace, monospace; }
+  .machine-card .hb { color: var(--muted); }
+  .machine-card .hb.fresh { color: var(--done); }
+  .machine-card .hb.stale { color: var(--waiting); }
+  .auto-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 12px; }
+  .auto-card.invalid { border-color: var(--error); }
+  .auto-card > h3 { font-size: 14px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
+    display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .auto-card > h3 .aname { font-family: ui-monospace, monospace; }
+  .auto-card > h3 .ameta { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .auto-card .sched { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .auto-body { padding: 4px 0; }
+  .mrow { display: grid; grid-template-columns: 160px 110px 1fr 130px; gap: 10px; align-items: center;
+    padding: 6px 14px; font-size: 12.5px; border-top: 1px solid #f0efeb; }
+  .mrow:first-child { border-top: 0; }
+  .mrow .mname { font-family: ui-monospace, monospace; }
+  .mrow .pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.active { background: #e7f6ec; color: var(--done); }
+  .pill.declared { background: var(--chip); color: var(--muted); }
+  .pill.drift { background: #fff0e6; color: var(--waiting); }
+  .pill.run-ok { background: #e7f6ec; color: var(--done); }
+  .pill.run-fail { background: #fdebeb; color: var(--error); }
+  .pill.run-other { background: var(--chip); color: var(--muted); }
+  .mrow .when { color: var(--muted); }
+  .mrow .hbcol { color: var(--muted); text-align: right; }
+  .mrow .hbcol.stale { color: var(--waiting); }
+  .drift-line { padding: 5px 14px; font-size: 12px; color: var(--waiting); background: #fff8f3; }
+  .auto-problems { padding: 5px 14px; font-size: 12px; color: var(--error); }
+  .auto-problems li { margin-left: 14px; }
+  #auto-drift-banner { margin-bottom: 14px; }
+  #auto-drift-banner .drift-line { border: 1px solid #f3d9c4; border-radius: 8px; margin-bottom: 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="ws-name">OpenWorkspace</h1>
+  <div class="viewtabs" id="viewtabs">
+    <button data-view="projects">Projects</button>
+    <button data-view="automations">Automations</button>
+  </div>
+  <span id="scan-time"></span>
+  <div class="chips" id="attention"></div>
+  <button id="refresh" title="Re-scan the live tree">Refresh</button>
+</header>
+<div id="layout">
+  <nav id="rail"></nav>
+  <main id="main"><div class="empty">Loading…</div></main>
+  <aside id="detail"><div class="empty">Select a task</div></aside>
+</div>
+<div id="autos" style="display:none"><div class="empty">Loading…</div></div>
+
+<script>
+"use strict";
+
+let scan = null;
+let autos = null;
+let autosLoaded = false;
+
+// --- URL-persisted view state (view, scope, subtasks toggle, selection) -----
+function getState() {
+  const q = new URLSearchParams(location.search);
+  return {
+    view: q.get("view") === "automations" ? "automations" : "projects",
+    scope: q.get("scope") || "active",
+    subtasks: q.get("subtasks") === "1",
+    sel: q.get("task") || null,
+    selProject: q.get("project") || null,
+    autoFilter: q.get("autofilter") || "all", // all | drift
+  };
+}
+function setState(patch) {
+  const s = Object.assign(getState(), patch);
+  const q = new URLSearchParams();
+  if (s.view !== "projects") q.set("view", s.view);
+  if (s.scope !== "active") q.set("scope", s.scope);
+  if (s.subtasks) q.set("subtasks", "1");
+  if (s.sel) q.set("task", s.sel);
+  if (s.selProject) q.set("project", s.selProject);
+  if (s.autoFilter !== "all") q.set("autofilter", s.autoFilter);
+  const qs = q.toString();
+  history.replaceState(null, "", qs ? "?" + qs : location.pathname);
+  render();
+}
+
+// --- data --------------------------------------------------------------
+async function load() {
+  const res = await fetch("/api/scan");
+  if (!res.ok) {
+    document.getElementById("main").innerHTML =
+      '<div class="empty">Scan failed: ' + esc(String(res.status)) + "</div>";
+    return;
+  }
+  scan = await res.json();
+  // Lazy-load automations the first time that view is opened, and on Refresh
+  // if it's the active view.
+  if (getState().view === "automations") await loadAutos();
+  render();
+}
+
+async function loadAutos() {
+  const res = await fetch("/api/automations");
+  if (!res.ok) { autos = { error: res.status }; autosLoaded = true; return; }
+  autos = await res.json();
+  autosLoaded = true;
+}
+
+function projectsInScope(scope) {
+  const ps = scan.projects;
+  if (scope === "all") return ps;
+  return ps.filter(p => p.lifecycle === scope);
+}
+
+function findTask(projectUid, taskId) {
+  const p = scan.projects.find(p => p.uid === projectUid);
+  if (!p) return null;
+  const t = p.tasks.find(t => t.id === taskId);
+  return t ? { p, t } : null;
+}
+
+// --- rendering ----------------------------------------------------------
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function render() {
+  if (!scan) return;
+  const st = getState();
+  renderViewTabs(st);
+  renderHeader(st);
+  const projectsView = st.view === "projects";
+  document.getElementById("rail").style.display = projectsView ? "" : "none";
+  document.getElementById("main").style.display = projectsView ? "" : "none";
+  document.getElementById("detail").style.display = projectsView ? "" : "none";
+  document.getElementById("autos").style.display = projectsView ? "none" : "";
+  if (projectsView) {
+    renderRail(st);
+    renderMain(st);
+    renderDetail(st);
+  } else {
+    renderAutos(st);
+  }
+}
+
+function renderViewTabs(st) {
+  document.querySelectorAll("#viewtabs button").forEach(b => {
+    b.classList.toggle("sel", b.dataset.view === st.view);
+  });
+}
+
+function renderHeader(st) {
+  document.getElementById("ws-name").textContent = scan.workspace.name;
+  const att = document.getElementById("attention");
+  if (st.view === "automations") {
+    if (autos && !autos.error) {
+      document.getElementById("scan-time").textContent =
+        "scanned " + new Date(autos.generatedAt).toLocaleString();
+      const n = autos.drift.length;
+      att.innerHTML = n ? '<span class="chip waiting">' + n + " placement drift</span>" : "";
+    } else {
+      att.innerHTML = "";
+    }
+    return;
+  }
+  document.getElementById("scan-time").textContent =
+    "scanned " + new Date(scan.generatedAt).toLocaleString();
+  const a = scan.attention;
+  // Chips only when nonzero — the empty row IS the all-clear.
+  const chips = [];
+  if (a.waiting) chips.push('<span class="chip waiting">' + a.waiting + " waiting</span>");
+  if (a.review) chips.push('<span class="chip review">' + a.review + " in review</span>");
+  if (a.unhiddenToday) chips.push('<span class="chip unhidden">' + a.unhiddenToday + " unhidden today</span>");
+  if (a.doctorErrors) chips.push('<span class="chip doctor">' + a.doctorErrors + " doctor errors</span>");
+  att.innerHTML = chips.join("");
+}
+
+function renderRail(st) {
+  const c = scan.counts;
+  const scopes = [
+    ["active", "Active", c.active],
+    ["all", "All", c.all],
+    ["dormant", "Dormant", c.dormant],
+    ["archived", "Archived", c.archived],
+  ];
+  const rail = document.getElementById("rail");
+  rail.innerHTML =
+    scopes.map(([key, label, n]) =>
+      '<button class="scope' + (st.scope === key ? " sel" : "") + '" data-scope="' + key + '">' +
+      esc(label) + ' <span class="n">' + n + "</span></button>").join("") +
+    '<div class="toggle-row"><label><input type="checkbox" id="subtasks-toggle"' +
+    (st.subtasks ? " checked" : "") + "> Subtasks shown</label></div>";
+  rail.querySelectorAll(".scope").forEach(b =>
+    b.addEventListener("click", () => setState({ scope: b.dataset.scope })));
+  rail.querySelector("#subtasks-toggle").addEventListener("change", e =>
+    setState({ subtasks: e.target.checked }));
+}
+
+function dotClass(status) {
+  return ["todo", "doing", "waiting", "review", "done"].includes(status) ? status : "other";
+}
+
+function taskLi(p, t, st) {
+  const selected = st.sel === t.id && st.selProject === p.uid;
+  let rollup = "";
+  if (t.rollup && !st.subtasks)
+    rollup = '<span class="rollup">(' + t.rollup.total + " subtasks: " + t.rollup.done + " done)</span>";
+  // Collapsed parents show truthful rollups: the dot inherits the most
+  // attention-demanding descendant status.
+  const dotStatus = (t.rollup && !st.subtasks) ? t.rollup.status : t.status;
+  const badges =
+    (t.unhiddenToday ? '<span class="badge unhid">unhid today</span>' : "") +
+    (t.recur ? '<span class="badge recur">↻ ' + esc(t.recur) + "</span>" : "");
+  return '<li class="task' + (selected ? " sel" : "") + '" data-task="' + esc(t.id) +
+    '" data-project="' + esc(p.uid) + '">' +
+    '<span class="dot ' + dotClass(dotStatus) + '" title="' + esc(dotStatus) + '"></span>' +
+    '<span class="tid">' + esc(t.id) + "</span>" +
+    '<span class="ttl">' + esc(t.title) + "</span>" + rollup + badges + "</li>";
+}
+
+function renderTree(p, tasks, st) {
+  // Hierarchy derived purely from dotted-ID prefixes.
+  const byId = {};
+  tasks.forEach(t => { byId[t.id] = t; });
+  const children = {};
+  const roots = [];
+  tasks.forEach(t => {
+    if (t.parentId && byId[t.parentId]) {
+      (children[t.parentId] = children[t.parentId] || []).push(t);
+    } else {
+      roots.push(t); // orphan subtasks surface at top level rather than vanish
+    }
+  });
+  function branch(list) {
+    return list.map(t => {
+      const kids = children[t.id] || [];
+      if (!st.subtasks || kids.length === 0) return taskLi(p, t, st);
+      return taskLi(p, t, st) +
+        '<details class="disc" open><summary>' + kids.length + " subtask" +
+        (kids.length === 1 ? "" : "s") + "</summary>" +
+        '<ul class="tasks indent">' + branch(kids) + "</ul></details>";
+    }).join("");
+  }
+  return branch(roots);
+}
+
+function renderMain(st) {
+  const main = document.getElementById("main");
+  const projects = projectsInScope(st.scope);
+  if (projects.length === 0) {
+    main.innerHTML = '<div class="empty">No projects in this scope</div>';
+    return;
+  }
+  let html = "";
+  for (const p of projects) {
+    const visible = p.tasks.filter(t => !t.hidden);
+    const open = visible.filter(t => t.status !== "done");
+    const done = visible.filter(t => t.status === "done");
+    const hiddenN = p.taskCounts.hidden;
+    html += '<section class="project">' +
+      "<h2>" + esc(p.name) +
+      '<span class="lifecycle-tag">' + esc(p.lifecycle) + "</span>" +
+      '<span class="meta">' + esc(p.relPath) +
+      (hiddenN ? " · " + hiddenN + " hidden" : "") + "</span></h2>";
+    if (visible.length === 0) {
+      html += '<div class="empty">No visible tasks</div>';
+    } else {
+      html += '<ul class="tasks">' + renderTree(p, open, st) + "</ul>";
+      if (done.length) {
+        // Done collapsed by default.
+        html += '<details class="done-group"><summary>Done (' + done.length + ")</summary>" +
+          '<ul class="tasks">' + renderTree(p, done, st) + "</ul></details>";
+      }
+    }
+    html += "</section>";
+  }
+  const errs = scan.doctor.errors;
+  if (errs.length) {
+    html += '<section class="project"><h2>Doctor <span class="meta">' + errs.length +
+      " error" + (errs.length === 1 ? "" : "s") + '</span></h2><ul id="doctor-list" class="tasks">' +
+      errs.map(e => "<li>" + esc((e.project ? e.project + ": " : "") + e.message) + "</li>").join("") +
+      "</ul></section>";
+  }
+  main.innerHTML = html;
+  main.querySelectorAll("li.task").forEach(li =>
+    li.addEventListener("click", () =>
+      setState({ sel: li.dataset.task, selProject: li.dataset.project })));
+}
+
+// --- tiny markdown renderer (escape-first; headings, lists, code, inline) --
+function renderMarkdown(src) {
+  const lines = src.split(/\r?\n/);
+  const out = [];
+  let inCode = false, inList = false;
+  function closeList() { if (inList) { out.push("</ul>"); inList = false; } }
+  function inline(s) {
+    return esc(s)
+      .replace(/`([^`]+)`/g, "<code>$1</code>")
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(/(^|\W)\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" rel="noopener" target="_blank">$1</a>');
+  }
+  for (const line of lines) {
+    if (/^```/.test(line)) {
+      closeList();
+      out.push(inCode ? "</pre>" : "<pre>");
+      inCode = !inCode;
+      continue;
+    }
+    if (inCode) { out.push(esc(line)); continue; }
+    const h = line.match(/^(#{1,6})\s+(.*)$/);
+    if (h) { closeList(); const n = Math.min(h[1].length, 3); out.push("<h" + n + ">" + inline(h[2]) + "</h" + n + ">"); continue; }
+    const li = line.match(/^\s*[-*]\s+(\[[ xX]\]\s+)?(.*)$/);
+    if (li) {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      const box = li[1] ? (/[xX]/.test(li[1]) ? "☑ " : "☐ ") : "";
+      out.push("<li>" + box + inline(li[2]) + "</li>");
+      continue;
+    }
+    closeList();
+    if (line.trim() === "") continue;
+    out.push("<p>" + inline(line) + "</p>");
+  }
+  closeList();
+  if (inCode) out.push("</pre>");
+  return out.join("\n");
+}
+
+// --- detail pane ---------------------------------------------------------
+function shq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+
+function renderDetail(st) {
+  const aside = document.getElementById("detail");
+  const hit = st.sel && st.selProject ? findTask(st.selProject, st.sel) : null;
+  if (!hit) {
+    aside.innerHTML = '<div class="empty">Select a task</div>';
+    return;
+  }
+  const { p, t } = hit;
+  const ref = shq(p.relPath);
+  // Copyable CLI affordances instead of buttons (v1 is read-only; v3's
+  // mutations become copy-button → real-button with no IA change).
+  const commands = [
+    "projects task show " + t.id + " --project " + ref,
+    "projects task edit " + t.id + " --project " + ref,
+    "projects task status " + t.id + " done --project " + ref,
+    "projects task hide " + t.id + " --until <date> --project " + ref,
+  ];
+  const rows = [
+    ["status", t.status], ["quadrant", t.quadrant], ["labels", t.labels.join(", ") || null],
+    ["hidden until", t.hiddenUntil], ["recur", t.recur],
+    ["created", t.created], ["updated", t.updated], ["file", t.file],
+  ].filter(r => r[1]);
+  aside.innerHTML =
+    "<h3>" + esc(t.id) + " — " + esc(t.title) + "</h3>" +
+    '<span class="lifecycle-tag">' + esc(p.name) + "</span>" +
+    '<table class="meta-table">' +
+    rows.map(r => "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td></tr>").join("") +
+    "</table>" +
+    '<div class="md">' + renderMarkdown(t.body) + "</div>" +
+    '<div class="cli"><h4>CLI</h4>' +
+    commands.map(c =>
+      '<div class="cli-row"><code>' + esc(c) + '</code><button data-cmd="' + esc(c) + '">Copy</button></div>'
+    ).join("") + "</div>";
+  aside.querySelectorAll(".cli-row button").forEach(b =>
+    b.addEventListener("click", () => {
+      navigator.clipboard.writeText(b.dataset.cmd).then(() => {
+        b.textContent = "Copied";
+        setTimeout(() => { b.textContent = "Copy"; }, 1200);
+      });
+    }));
+}
+
+// --- automations view ----------------------------------------------------
+function fmtAge(min) {
+  if (min === null || min === undefined) return "—";
+  if (min < 1) return "just now";
+  if (min < 60) return min + " min ago";
+  const h = Math.floor(min / 60);
+  if (h < 24) return h + (h === 1 ? " hr ago" : " hrs ago");
+  const d = Math.floor(h / 24);
+  return d + (d === 1 ? " day ago" : " days ago");
+}
+function fmtWhen(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? esc(iso) : d.toLocaleString();
+}
+// Heartbeat older than this is flagged stale (visual only; backend reports raw).
+const STALE_MIN = 60;
+
+function runPill(lr) {
+  if (!lr) return '<span class="pill run-other">never run</span>';
+  const ok = lr.status === "ok" || lr.status === "success" || (lr.exitCode === 0 && lr.status !== "fail");
+  const cls = ok ? "run-ok" : (lr.status === "fail" || lr.status === "error" ? "run-fail" : "run-other");
+  return '<span class="pill ' + cls + '">' + esc(lr.status) + "</span>";
+}
+
+function renderAutos(st) {
+  const el = document.getElementById("autos");
+  if (!autosLoaded) { el.innerHTML = '<div class="empty">Loading automations…</div>'; loadAutos().then(render); return; }
+  if (!autos || autos.error) { el.innerHTML = '<div class="empty">Automations scan failed: ' + esc(String(autos && autos.error)) + "</div>"; return; }
+
+  // Machine registry strip — who's publishing and how fresh.
+  const strip = autos.machines.map(m => {
+    const stale = m.staleMinutes !== null && m.staleMinutes >= STALE_MIN;
+    return '<div class="machine-card"><div class="mid">' + esc(m.machineId) + "</div>" +
+      '<div class="hb ' + (m.staleMinutes === null ? "" : stale ? "stale" : "fresh") + '">' +
+      "published " + fmtAge(m.staleMinutes) + "</div>" +
+      '<div class="hb">' + m.activationCount + " activation" + (m.activationCount === 1 ? "" : "s") + "</div></div>";
+  }).join("");
+  const stripHtml = autos.machines.length
+    ? '<div class="machine-strip">' + strip + "</div>"
+    : '<div class="empty">No machine registries published yet</div>';
+
+  // Filter toggle + drift banner.
+  const driftN = autos.drift.length;
+  const filterHtml =
+    '<div class="toggle-row" style="margin:0 0 12px"><label><input type="checkbox" id="drift-only"' +
+    (st.autoFilter === "drift" ? " checked" : "") + "> Drift only" +
+    (driftN ? " (" + driftN + ")" : "") + "</label></div>";
+  let banner = "";
+  if (driftN) {
+    banner = '<div id="auto-drift-banner">' + autos.drift.map(d =>
+      '<div class="drift-line">⚠ ' + esc(d.project + "/" + d.automation) + ": " + esc(d.detail) + "</div>"
+    ).join("") + "</div>";
+  }
+
+  const list = (st.autoFilter === "drift" ? autos.automations.filter(a => a.drift.length) : autos.automations);
+  let cards = "";
+  if (list.length === 0) {
+    cards = '<div class="empty">' + (st.autoFilter === "drift" ? "No placement drift" : "No automations defined") + "</div>";
+  }
+  for (const a of list) {
+    const activeWhere = a.activatedOn.length
+      ? a.activatedOn.map(esc).join(", ")
+      : '<span style="color:var(--muted)">nowhere</span>';
+    const declWhere = a.declaredMachines.length ? a.declaredMachines.map(esc).join(", ") : "(none declared)";
+    let rows = a.machines.map(m => {
+      let state;
+      if (m.activated && m.declared) state = '<span class="pill active">active</span>';
+      else if (m.activated && !m.declared) state = '<span class="pill drift">activated · undeclared</span>';
+      else if (!m.activated && m.declared) state = '<span class="pill drift">declared · not active</span>';
+      else state = '<span class="pill declared">—</span>';
+      const lr = m.lastRun;
+      const when = lr ? fmtWhen(lr.finishedAt || lr.startedAt) : "";
+      const stale = m.staleMinutes !== null && m.staleMinutes >= STALE_MIN;
+      return '<div class="mrow"><span class="mname">' + esc(m.machineId) + "</span>" +
+        "<span>" + state + "</span>" +
+        '<span class="when">' + runPill(lr) + (when ? ' <span class="when">· ' + esc(when) + "</span>" : "") + "</span>" +
+        '<span class="hbcol' + (stale ? " stale" : "") + '">' + fmtAge(m.staleMinutes) + "</span></div>";
+    }).join("");
+    if (!a.machines.length) rows = '<div class="mrow"><span style="color:var(--muted)">no declared or activating machine</span></div>';
+    const driftLines = a.drift.map(d =>
+      '<div class="drift-line">⚠ ' + esc(d.detail) + "</div>").join("");
+    const problems = a.problems.length
+      ? '<ul class="auto-problems">' + a.problems.map(p => "<li>" + esc(p) + "</li>").join("") + "</ul>"
+      : "";
+    cards += '<div class="auto-card' + (a.valid ? "" : " invalid") + '">' +
+      "<h3><span class=\"aname\">" + esc(a.name) + "</span>" +
+      (a.schedule ? '<span class="sched">' + esc(a.schedule) + "</span>" : "") +
+      (a.valid ? "" : '<span class="sched" style="background:#fdebeb;color:var(--error)">invalid manifest</span>') +
+      '<span class="ameta">' + esc(a.project.name) + " · " + esc(a.project.lifecycle) +
+      " · active on " + activeWhere + " · declared " + declWhere + "</span></h3>" +
+      '<div class="auto-body">' + rows + "</div>" + driftLines + problems + "</div>";
+  }
+
+  el.innerHTML = stripHtml + filterHtml + banner + cards;
+  const t = el.querySelector("#drift-only");
+  if (t) t.addEventListener("change", e => setState({ autoFilter: e.target.checked ? "drift" : "all" }));
+}
+
+document.querySelectorAll("#viewtabs button").forEach(b =>
+  b.addEventListener("click", async () => {
+    if (b.dataset.view === "automations" && !autosLoaded) { await loadAutos(); }
+    setState({ view: b.dataset.view });
+  }));
+
+document.getElementById("refresh").addEventListener("click", async () => {
+  // Refresh re-fetches the scan and, if showing automations, the automations.
+  autosLoaded = false;
+  await load();
+});
+load();
+</script>
+</body>
+</html>

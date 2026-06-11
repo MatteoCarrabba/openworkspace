@@ -1,0 +1,55 @@
+[meta]
+directory_name = "Personal OS"
+created = "2026-05-23T13:33:49.545Z"
+
+[server]
+host = "127.0.0.1"
+
+[auth]
+require_token = true
+
+[ui]
+notify_when_blocked = true
+default_channel = "general"
+
+[[channels]]
+name = "general"
+purpose = "Default chat"
+
+[[channels]]
+name = "agents"
+purpose = "Agent sessions"
+notify_on_post = true
+
+[bridges.twilio]
+enabled = false
+auth_token_env = "TWILIO_AUTH_TOKEN"
+
+[bridges.github]
+enabled = false
+secret_env = "GITHUB_WEBHOOK_SECRET"
+
+[bridges.email]
+enabled = false
+secret_env = "EMAIL_BRIDGE_SECRET"
+
+[bridges.sendblue]
+enabled = true
+secret_env = "SENDBLUE_WEBHOOK_SECRET"
+api_key_env = "SENDBLUE_API_KEY"
+api_secret_env = "SENDBLUE_API_SECRET"
+from_number = "+13472689632"
+
+[[bridges.sendblue.routes]]
+from = "*"
+channel = "imessage"
+
+[bridges.claude-code]
+enabled = true
+channel = "claude-code"
+
+[bridges.codex]
+enabled = true
+channel = "codex"
+
+[bridges.generic]

@@ -1,0 +1,5 @@
+{"id":"01KSAH3J4S88S98W9MXPBQSSAA","thread_id":"01KSAH3J4R2KBZFNC7GE321CCC","channel":"agents","from":"matteo","ts":"2026-05-23T13:41:29.368Z","kind":"system","body":{"event":"thread_opened","title":"Live cat session"}}
+{"id":"01KSAH3J6EMBBQMSTSN6YR5PZ5","thread_id":"01KSAH3J4R2KBZFNC7GE321CCC","channel":"agents","from":"matteo","ts":"2026-05-23T13:41:29.422Z","kind":"stdin","body":"hello world"}
+{"id":"01KSAH3J6XZAQ15AV0RE35MQN6","thread_id":"01KSAH3J4R2KBZFNC7GE321CCC","channel":"agents","from":"matteo","ts":"2026-05-23T13:41:29.437Z","kind":"command_output","body":"hello world\r\nhello world\r\n","meta":{"run_id":"01KSAH3J584XQMC21CZV3H24JJ"}}
+{"id":"01KSAH3J73B0VGBHPG95YV4300","thread_id":"01KSAH3J4R2KBZFNC7GE321CCC","channel":"agents","from":"matteo","ts":"2026-05-23T13:41:29.443Z","kind":"text","body":"going AFK 5 min"}
+{"id":"01KSAH4Y1M8B11FZMQZNQZHZMK","thread_id":"01KSAH3J4R2KBZFNC7GE321CCC","channel":"agents","from":"matteo","ts":"2026-05-23T13:42:14.325Z","kind":"system","body":{"event":"daemon_restarted","message":"pty was lost on daemon restart"}}

@@ -1,0 +1,15 @@
+{
+  "id": "01KSAH3J4R2KBZFNC7GE321CCC",
+  "channel": "agents",
+  "title": "Live cat session",
+  "owner": "matteo",
+  "status": "errored",
+  "labels": [],
+  "started_at": "2026-05-23T13:41:29.368Z",
+  "last_activity_at": "2026-05-23T13:42:14.328Z",
+  "closed_at": "2026-05-23T13:42:14.328Z",
+  "mode": "pty",
+  "exec": [
+    "cat"
+  ]
+}

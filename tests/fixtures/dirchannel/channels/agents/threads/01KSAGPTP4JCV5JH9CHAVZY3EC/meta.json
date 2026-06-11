@@ -1,0 +1,16 @@
+{
+  "id": "01KSAGPTP4JCV5JH9CHAVZY3EC",
+  "channel": "agents",
+  "title": "pty test: echo",
+  "owner": "matteo",
+  "status": "done",
+  "labels": [],
+  "started_at": "2026-05-23T13:34:32.132Z",
+  "last_activity_at": "2026-05-23T13:34:32.143Z",
+  "closed_at": "2026-05-23T13:34:32.143Z",
+  "mode": "pty",
+  "exec": [
+    "echo",
+    "hello from pty thread"
+  ]
+}

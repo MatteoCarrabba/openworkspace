@@ -1,0 +1,381 @@
+/**
+ * Runner tests (PRD §7.1 late binding + §7.5 secrets): UID → canonical
+ * resolution at fire time, on_dormant_project, per-run secret resolution
+ * through configured scheme resolvers (env-only — the tests grep every
+ * written artifact to prove nothing lands on disk), machine-partitioned logs
+ * with retention, and last-run outcomes appended to THIS machine's synced
+ * registry file only (P15).
+ *
+ * Temp dirs only; no real ~/Library, no launchd (the runner never talks to
+ * launchd at all — launchd talks to IT).
+ */
+
+import * as assert from "node:assert/strict";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { test } from "node:test";
+
+import { ConfigError, ResolveError } from "../src/lib/errors.js";
+import { readTomlIfExists } from "../src/lib/toml.js";
+import { LOG_RETENTION, applyLogRetention, runAutomation } from "../src/runner.js";
+import { makeTmpDir, makeTmpStore, makeTmpWorkspace, rmrf } from "./helpers.js";
+
+const MACHINE = "runmach";
+const SECRET_VALUE = "SEKRET-VALUE-9b1c44";
+
+function makeFixture(options: { configToml?: string; projectRel?: string } = {}) {
+  const tmpWs = makeTmpWorkspace(options.configToml);
+  const project = tmpWs.addProject(options.projectRel ?? "Run: Proj A");
+  const tmpStore = makeTmpStore();
+  fs.writeFileSync(path.join(tmpStore.store.dir, "machine-id"), `${MACHINE}\n`);
+  return {
+    root: tmpWs.root,
+    project,
+    store: tmpStore.store,
+    addProject: tmpWs.addProject,
+    cleanup: () => {
+      tmpWs.cleanup();
+      tmpStore.cleanup();
+    },
+  };
+}
+
+function writeManifest(projectRoot: string, name: string, toml: string): void {
+  const dir = path.join(projectRoot, "_project", "automations", name);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "automation.toml"), toml);
+}
+
+function nodeCommandToml(script: string, extra = ""): string {
+  return (
+    `machines = ["${MACHINE}"]\n[schedule]\ncron = "0 9 * * *"\n[run]\n` +
+    `command = ${JSON.stringify([process.execPath, "-e", script])}\n${extra}`
+  );
+}
+
+function logFiles(projectRoot: string, name: string, machine = MACHINE): string[] {
+  const dir = path.join(projectRoot, "_project", "automations", name, "logs", machine);
+  try {
+    return fs
+      .readdirSync(dir)
+      .filter((f) => f.endsWith(".log"))
+      .sort()
+      .map((f) => path.join(dir, f));
+  } catch {
+    return [];
+  }
+}
+
+function registry(wsRoot: string): Record<string, unknown> {
+  return readTomlIfExists(path.join(wsRoot, ".openworkspace", "machines", `${MACHINE}.toml`));
+}
+
+function lastRun(wsRoot: string, uid: string, name: string): Record<string, unknown> {
+  const lastRuns = registry(wsRoot)["last_runs"] as Record<string, unknown> | undefined;
+  return (lastRuns?.[`${uid}--${name}`] ?? {}) as Record<string, unknown>;
+}
+
+/** Every file under `root`, read as UTF-8 (the no-secret-on-disk sweep). */
+function grepTree(root: string, needle: string): string[] {
+  const hits: string[] = [];
+  const walk = (dir: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) walk(full);
+      else if (ent.isFile() && fs.readFileSync(full, "utf8").includes(needle)) hits.push(full);
+    }
+  };
+  walk(root);
+  return hits;
+}
+
+// ---------------------------------------------------------------------------
+
+test("runner: resolves UID → canonical, cds there, logs machine-partitioned, records the outcome", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeManifest(
+    fx.project.root,
+    "hello",
+    nodeCommandToml(`console.log('hello-from ' + process.cwd()); console.error('warn-line')`),
+  );
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "hello",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "ok");
+  assert.equal(outcome.exitCode, 0);
+  assert.equal(outcome.machine, MACHINE);
+
+  const logs = logFiles(fx.project.root, "hello");
+  assert.equal(logs.length, 1);
+  assert.equal(outcome.logPath, logs[0]);
+  const content = fs.readFileSync(logs[0] as string, "utf8");
+  // cwd was the CANONICAL project root (late binding: the plist had no path);
+  // process.cwd() reports the realpath under macOS's symlinked tmpdir
+  assert.ok(content.includes(`hello-from ${fs.realpathSync(fx.project.root)}`), content);
+  assert.match(content, /warn-line/); // stderr captured too
+  assert.match(content, /# machine: runmach/);
+  assert.match(content, /# status: ok/);
+
+  // outcome appended to THIS machine's synced registry file only
+  const run = lastRun(fx.root, fx.project.uid, "hello");
+  assert.equal(run["status"], "ok");
+  assert.equal(run["exit_code"], 0);
+  assert.match(String(run["log"]), /logs\/runmach\//);
+  const machinesDir = path.join(fx.root, ".openworkspace", "machines");
+  assert.deepEqual(fs.readdirSync(machinesDir), [`${MACHINE}.toml`]); // P15: one writer, one file
+});
+
+test("runner §7.5: secrets resolve per-run into the child ENV — and NEVER land on disk", (t) => {
+  // the resolver lives OUTSIDE the workspace so the disk sweep can be total
+  const resolverDir = makeTmpDir("ow-resolver-");
+  const resolverPath = path.join(resolverDir, "resolver.sh");
+  fs.writeFileSync(resolverPath, `#!/bin/sh\necho "${SECRET_VALUE}"\n`, { mode: 0o755 });
+  const fx = makeFixture({
+    configToml: `[secrets.resolvers]\nfake = "${resolverPath} {ref}"\n`,
+  });
+  t.after(() => {
+    fx.cleanup();
+    rmrf(resolverDir);
+  });
+  // the child PROVES it saw the value without ever printing it (the log — and
+  // the manifest — must stay free of the literal for the disk sweep below)
+  writeManifest(
+    fx.project.root,
+    "secretive",
+    nodeCommandToml(
+      `const t = process.env.TOKEN ?? ''; ` +
+        `console.log('TOKEN:len=' + t.length + ':sha=' + require('crypto').createHash('sha256').update(t).digest('hex').slice(0, 12))`,
+      `[secrets]\nTOKEN = "fake://AI Secrets/item/field"\n`,
+    ),
+  );
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "secretive",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "ok");
+  const content = fs.readFileSync(outcome.logPath as string, "utf8");
+  // the child really got the value (length + sha prefix match), env-only
+  const sha = crypto.createHash("sha256").update(SECRET_VALUE).digest("hex").slice(0, 12);
+  assert.ok(content.includes(`TOKEN:len=${SECRET_VALUE.length}:sha=${sha}`), content);
+  assert.match(content, /# secrets: TOKEN \(env-only, values never logged\)/);
+
+  // THE assertion: grep every artifact the run could have written — the
+  // workspace tree (manifest, logs, registry) and the machine store — for
+  // the resolved value. Zero hits anywhere.
+  assert.deepEqual(grepTree(fx.root, SECRET_VALUE), []);
+  assert.deepEqual(grepTree(fx.store.dir, SECRET_VALUE), []);
+});
+
+test("runner: a secret scheme with no resolver fails loudly, with an error outcome on record", (t) => {
+  const fx = makeFixture(); // ships with an EMPTY resolver map (§4.1)
+  t.after(fx.cleanup);
+  writeManifest(
+    fx.project.root,
+    "unmapped",
+    nodeCommandToml(`console.log('should never run')`, `[secrets]\nTOKEN = "op://Vault/item/field"\n`),
+  );
+  assert.throws(
+    () =>
+      runAutomation({ uid: fx.project.uid, name: "unmapped", store: fx.store, extraWorkspaceRoots: [fx.root] }),
+    (err: unknown) => err instanceof ConfigError && /no resolver for scheme "op"/.test(err.message),
+  );
+  // the failure is still logged + recorded before the throw
+  const logs = logFiles(fx.project.root, "unmapped");
+  assert.equal(logs.length, 1);
+  const content = fs.readFileSync(logs[0] as string, "utf8");
+  assert.match(content, /# status: error/);
+  assert.ok(!content.includes("--- exit:"), "the command must never have executed");
+  assert.equal(lastRun(fx.root, fx.project.uid, "unmapped")["status"], "error");
+});
+
+test("runner: a manifest-load failure still writes the log and records the error outcome (§7.1 contract)", (t) => {
+  // Regression: loadManifest used to throw before the log/registry plumbing
+  // existed — a corrupted manifest silently killed a scheduled automation
+  // behind a fresh heartbeat and a registry forever showing the last
+  // successful run. The fire-time failure must be supervisable.
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  // an applied-then-corrupted manifest: bare [secrets] value = invalid
+  writeManifest(
+    fx.project.root,
+    "corrupt",
+    nodeCommandToml(`console.log('should never run')`, `[secrets]\nKEY = "sk-bare-value"\n`),
+  );
+  assert.throws(
+    () =>
+      runAutomation({ uid: fx.project.uid, name: "corrupt", store: fx.store, extraWorkspaceRoots: [fx.root] }),
+    (err: unknown) => err instanceof ConfigError && /invalid automation manifest/.test(err.message),
+  );
+  const logs = logFiles(fx.project.root, "corrupt");
+  assert.equal(logs.length, 1, "machine-partitioned log written despite the manifest failure");
+  const content = fs.readFileSync(logs[0] as string, "utf8");
+  assert.match(content, /# status: error/);
+  assert.match(content, /manifest load failed/);
+  assert.match(content, /# command: \(manifest unavailable\)/);
+  assert.ok(!content.includes("--- exit:"), "the command must never have executed");
+  assert.equal(lastRun(fx.root, fx.project.uid, "corrupt")["status"], "error");
+
+  // a MISSING manifest behaves the same (NotFoundError, still logged + recorded)
+  writeManifest(fx.project.root, "ghostly", nodeCommandToml(`console.log('x')`));
+  fs.rmSync(path.join(fx.project.root, "_project", "automations", "ghostly", "automation.toml"));
+  assert.throws(() =>
+    runAutomation({ uid: fx.project.uid, name: "ghostly", store: fx.store, extraWorkspaceRoots: [fx.root] }),
+  );
+  assert.equal(logFiles(fx.project.root, "ghostly").length, 1);
+  assert.equal(lastRun(fx.root, fx.project.uid, "ghostly")["status"], "error");
+});
+
+test("runner: nonzero exit → failed outcome with the child's exit code", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeManifest(fx.project.root, "crashy", nodeCommandToml(`console.error('boom'); process.exit(3)`));
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "crashy",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "failed");
+  assert.equal(outcome.exitCode, 3);
+  const content = fs.readFileSync(outcome.logPath as string, "utf8");
+  assert.match(content, /boom/);
+  assert.match(content, /--- exit: 3 ---/);
+  const run = lastRun(fx.root, fx.project.uid, "crashy");
+  assert.equal(run["status"], "failed");
+  assert.equal(run["exit_code"], 3);
+});
+
+test("runner: timeout_seconds terminates the child and reports failed/timed out", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  // nodeCommandToml ends inside [run]; the appended key stays in that table
+  writeManifest(fx.project.root, "sleepy", nodeCommandToml(`setTimeout(() => {}, 30000)`) + `timeout_seconds = 1\n`);
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "sleepy",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "failed");
+  assert.match(fs.readFileSync(outcome.logPath as string, "utf8"), /timed out/);
+});
+
+test("runner: on_dormant_project — stop skips (movement signals lifecycle); continue runs", (t) => {
+  const fx = makeFixture({ projectRel: path.join("Dormant Projects", "Sleeper") });
+  t.after(fx.cleanup);
+  const marker = path.join(fx.project.root, "should-not-exist.txt");
+  writeManifest(
+    fx.project.root,
+    "dormwatch",
+    nodeCommandToml(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`),
+  );
+  const skipped = runAutomation({
+    uid: fx.project.uid,
+    name: "dormwatch",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(skipped.status, "skipped-dormant");
+  assert.equal(skipped.exitCode, null);
+  assert.ok(!fs.existsSync(marker), "stop must not execute the command");
+  assert.match(fs.readFileSync(skipped.logPath as string, "utf8"), /project is dormant/);
+  assert.equal(lastRun(fx.root, fx.project.uid, "dormwatch")["status"], "skipped-dormant");
+
+  // continue: the same dormant project runs when the manifest says so
+  // (top-level key, so it goes BEFORE the [schedule]/[run] tables)
+  writeManifest(
+    fx.project.root,
+    "dormwatch",
+    `on_dormant_project = "continue"\n` +
+      nodeCommandToml(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`),
+  );
+  const ran = runAutomation({
+    uid: fx.project.uid,
+    name: "dormwatch",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(ran.status, "ok");
+  assert.ok(fs.existsSync(marker));
+});
+
+test("runner: log retention keeps the newest LOG_RETENTION files, own machine dir only", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeManifest(fx.project.root, "chatty", nodeCommandToml(`console.log('run')`));
+  const machineDir = path.join(fx.project.root, "_project", "automations", "chatty", "logs", MACHINE);
+  const otherDir = path.join(fx.project.root, "_project", "automations", "chatty", "logs", "othermac");
+  fs.mkdirSync(machineDir, { recursive: true });
+  fs.mkdirSync(otherDir, { recursive: true });
+  for (let i = 0; i < LOG_RETENTION + 5; i++) {
+    const stamp = `2026010${i % 10}T0${String(i).padStart(2, "0").slice(-1)}000${i % 10}Z`;
+    fs.writeFileSync(path.join(machineDir, `2026-old-${String(i).padStart(3, "0")}${stamp}.log`), "old\n");
+  }
+  fs.writeFileSync(path.join(otherDir, "20260101T000000Z.log"), "another machine's history\n");
+
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "chatty",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "ok");
+  assert.equal(logFiles(fx.project.root, "chatty").length, LOG_RETENTION);
+  // the newest (this run's) survived; P15 — the other machine's dir untouched
+  assert.ok(logFiles(fx.project.root, "chatty").some((f) => f === outcome.logPath));
+  assert.equal(fs.readdirSync(otherDir).length, 1);
+
+  // unit edge: retention never deletes below the keep threshold
+  assert.deepEqual(applyLogRetention(machineDir, 100), []);
+});
+
+test("runner: unresolvable UID is a LOUD ResolveError (exit-2 class) — never a guess", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.throws(
+    () =>
+      runAutomation({
+        uid: "33333333-3333-3333-3333-333333333333",
+        name: "anything",
+        store: fx.store,
+        extraWorkspaceRoots: [fx.root],
+      }),
+    (err: unknown) => {
+      assert.ok(err instanceof ResolveError);
+      assert.equal(err.exitCode, 2);
+      assert.match(err.message, /orphaned/);
+      return true;
+    },
+  );
+});
+
+test("runner: project rename mid-flight is transparent (late binding re-resolves)", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeManifest(fx.project.root, "mover", nodeCommandToml(`console.log('ran at ' + process.cwd())`));
+  // first run caches the canonical path
+  const first = runAutomation({ uid: fx.project.uid, name: "mover", store: fx.store, extraWorkspaceRoots: [fx.root] });
+  assert.equal(first.status, "ok");
+  // the project moves (rename) — the plist would be byte-identical; only the
+  // runner's resolution has to notice, via cache-verify → rescan
+  const newRoot = path.join(fx.root, "Run: Proj B");
+  fs.renameSync(fx.project.root, newRoot);
+  const second = runAutomation({ uid: fx.project.uid, name: "mover", store: fx.store, extraWorkspaceRoots: [fx.root] });
+  assert.equal(second.status, "ok");
+  assert.ok(
+    fs.readFileSync(second.logPath as string, "utf8").includes(`ran at ${fs.realpathSync(newRoot)}`),
+  );
+});
