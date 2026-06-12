@@ -245,6 +245,9 @@ function render() {
   renderViewTabs(st);
   renderHeader(st);
   const projectsView = st.view === "projects";
+  // Hide the grid container itself, not just its children — #layout carries a
+  // full-viewport min-height that otherwise pushes #autos below the fold.
+  document.getElementById("layout").style.display = projectsView ? "" : "none";
   document.getElementById("rail").style.display = projectsView ? "" : "none";
   document.getElementById("main").style.display = projectsView ? "" : "none";
   document.getElementById("detail").style.display = projectsView ? "" : "none";
