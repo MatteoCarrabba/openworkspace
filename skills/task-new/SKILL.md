@@ -1,11 +1,11 @@
 ---
 name: task-new
-description: Create a new task in the current project's `_tasks/` directory using the simplified Backlog.md CLI. Prompts for the Eisenhower quadrant if not specified and enforces the Q2 quality bar (a `## Why this matters` section). Use when the user wants to capture a task, add a TODO, or create a backlog item. Examples - "create a task to refactor the parser", "add a backlog item for...", "/task-new <title>".
+description: Create a new task in the current project's `_project/tasks/` directory using the `projects` CLI. Prompts for the Eisenhower quadrant if not specified and enforces the Q2 quality bar (a `## Why this matters` section). Use when the user wants to capture a task, add a TODO, or create a backlog item. Examples - "create a task to refactor the parser", "add a backlog item for...", "/task-new <title>".
 ---
 
 # /task-new
 
-Creates a new task in the current project's `_tasks/` directory.
+Creates a new task in the current project's `_project/tasks/` directory.
 
 ## When to use
 
@@ -15,43 +15,32 @@ Creates a new task in the current project's `_tasks/` directory.
 
 ## Tasks vs reminders — pick the right artifact first
 
-If the request is **time-keyed and not work-shaped** — "remind me about X in 3 weeks," "nudge me mid-trip," "check whether Plaid trial expired around June," "every December re-evaluate active project slots" — it's a **reminder**, not a task. Reminders live in `<scope>/_tasks/reminders/` per `~/Documents/Personal OS/_wiki/REMINDERS_DESIGN.md` §3. Schema:
+If the request is **time-keyed and not work-shaped** — "remind me about X in 3 weeks," "nudge me mid-trip," "check whether Plaid trial expired around June," "every December re-evaluate active project slots" — it's a **reminder**. Under OpenWorkspace v1 there is no separate reminders primitive: a reminder is just a **task with `hidden_until: <date>`** (hidden from default lists until then), plus `recur: <weekly|monthly|...>` if it repeats. Create it via the same CLI:
 
-```yaml
----
-id: REMINDER-N            # next id under the scope
-surface_on: 2026-06-05    # required, ISO date
-surface_to: brief         # brief | inbox-outbox (default brief)
-status: pending           # pending | surfaced | dismissed | promoted
-created: <ISO timestamp>
-created_by: user          # user | agent
-recur: null               # null | yearly | monthly | weekly | every-N-days
----
-
-# <one-line title>
-<2-5 sentence elaboration>
-
-## then (optional — pre-fills task body if user promotes)
-<suggested follow-on>
+```bash
+projects task create "<one-line title>" \
+    --hidden-until YYYY-MM-DD \
+    --desc "<2-5 sentence elaboration>"
+# add --recur weekly|monthly|... if it should repeat
 ```
 
-The CLI subcommand `backlog reminder create` is being implemented (Personal OS TASK-121). Until it ships, write the reminder file directly in the right `_tasks/reminders/` folder using the next `REMINDER-N` id, and the bootstrap surfacer (`python3 ~/Documents/C2/.scripts/list-due-reminders.py`) will pick it up. A future `reminder-new` companion skill will wrap this; for now, applying the schema directly is fine.
+A reminder-shaped task can be lighter than a work-shaped one (no full ACs / Definition of Done needed); the distinction is the `hidden_until:` frontmatter, not a separate folder. Reminder-tasks surface when due via `projects home scan`.
 
-**Heuristic:** if there's a clear "done" condition (acceptance criteria fit), it's a task. If it's "show me this string on this date and I'll decide what to do," it's a reminder. When ambiguous, ask.
+**Heuristic:** if there's a clear "done" condition (acceptance criteria fit), it's a normal task. If it's "show me this on this date and I'll decide what to do," it's a task with `hidden_until:`. When ambiguous, ask.
 
 ## Prerequisites
 
-- A `_tasks/` directory must exist in the current working directory or an ancestor. If not, run `backlog init <project-name> --no-git --defaults` first (ask the user before initializing — that's a meaningful project setup choice, not a side-effect).
+- A `_project/` control plane must exist in the current working directory or an ancestor (the `_project/tasks/` directory is where the task lands). If not, scaffold the project first with the `projects` CLI (ask the user before initializing — that's a meaningful project setup choice, not a side-effect).
 
 ## Protocol
 
 1. **Title**: from the user's input. Trim it.
-2. **Quadrant**: ask the user to classify (Q1/Q2/Q3/Q4) using the Eisenhower / 7 Habits framework documented in `~/Documents/Personal OS/_wiki/TASKS.md` §4. Don't skip this — explicit classification is the value of the framework. If the user explicitly declines, leave the field unset.
+2. **Quadrant**: ask the user to classify (Q1/Q2/Q3/Q4) using the Eisenhower / 7 Habits framework. Don't skip this — explicit classification is the value of the framework. If the user explicitly declines, leave the field unset.
 3. **Q2 quality bar** (if quadrant is Q2): ask for a one-sentence "why this matters" — the importance argument. Insert this into the task body under a `## Why this matters` section. Vague Q2 work is a Covey failure mode; the scanner will flag tasks lacking this section.
 4. **Other fields**: optionally prompt for `--priority`, `--labels`, `--ac` (acceptance criteria). Keep the prompt short — most tasks don't need all of these at creation time; they can be edited later.
 5. **Create**: run the CLI:
    ```bash
-   backlog task create "<title>" --plain \
+   projects task create "<title>" \
      [--quadrant Q2] \
      [--priority high|medium|low] \
      [--labels foo,bar] \
@@ -64,10 +53,11 @@ The CLI subcommand `backlog reminder create` is being implemented (Personal OS T
 
 ## Schema reference
 
-Per `~/Documents/Personal OS/_wiki/TASKS.md`:
+Per the OpenWorkspace task schema (`OPENWORKSPACE_PRD.md`):
 - Required: `id`, `title`, `status`, `created_date` (the CLI handles all of these).
-- Optional: `quadrant`, `priority`, `assignee`, `labels`, `dependencies`, `references`, `documentation`, `parent_task_id`, `milestone`.
-- Status values: `open`, `in-progress`, `blocked`, `review`, `done` (CLI uses `To Do`, `In Progress`, `Done` etc. depending on the project's configured statuses; verify with `backlog config get statuses`).
+- Optional: `quadrant`, `priority`, `assignee`, `labels`, `dependencies`, `references`, `documentation`, `parent_task_id`, `milestone`, `hidden_until`, `recur`.
+- Status values: `todo`, `doing`, `waiting`, `review`, `done`. Change status with `projects task status <id> <todo|doing|waiting|review|done>`.
+- Subtasks use dotted IDs (`task-36.7`); parentage is encoded in the ID alone, not in folder nesting.
 
 ## Don'ts
 

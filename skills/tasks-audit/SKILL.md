@@ -16,35 +16,35 @@ Walks the task corpus and reports quality issues. Read-only — does not modify 
 ## Protocol
 
 1. **Determine scope**:
-   - Default: all `~/Documents/*/_tasks/` (cross-project; excludes `Dormant Projects/*` and `Archives/*` by default).
+   - Default: all `~/Documents/*/_project/tasks/` (cross-project; excludes `Dormant Projects/*` and `Archives/*` by default).
    - If user passes a project name, scope to that project only.
 
-2. **Gather data**: run `backlog cross-project --exclude-dormant --exclude-archived --include-completed --json` for the default scope, or `backlog task list --json` for a single project. Parse.
+2. **Gather data**: run `projects home scan` for the default cross-project scope, or `projects task list` for a single project. Parse.
 
 3. **Run checks**:
    - **Vague Q2**: tasks with `quadrant: Q2` whose body lacks a `## Why this matters` section, OR have no acceptance criteria, OR have neither a description nor an implementation plan. These are Covey's classic Q2 failure mode — important work that hasn't been concretely planned.
    - **Untriaged**: open tasks with no `quadrant` field. List them so the user can classify.
-   - **Stale in-progress**: tasks in `In Progress` whose file `lastModified` is more than 7 days ago. The agent or human claimed them and never finished or released.
-   - **In-progress without Implementation Plan**: tasks whose `status` matches `In Progress` (case-insensitive; accept both the spec vocabulary `in-progress` and the live config vocabulary `In Progress` — drift tracked in TASK-150) whose body lacks a `## Implementation Plan` section header. Mirrors the Vague-Q2 header-grep pattern. TASKS.md §7 commits to "Plan before coding"; this check enforces it. Empirically the dominant failure mode (bulk-imported in-progress tasks that never had a plan written).
+   - **Stale in-progress**: tasks with `status: doing` whose file `lastModified` is more than 7 days ago. The agent or human claimed them and never finished or released.
+   - **In-progress without Implementation Plan**: tasks with `status: doing` whose body lacks a `## Implementation Plan` section header. Mirrors the Vague-Q2 header-grep pattern. "Plan before coding" is the convention this check enforces. Empirically the dominant failure mode (bulk-imported in-progress tasks that never had a plan written).
    - **Broken dependencies**: tasks whose `dependencies` reference IDs that don't exist in the project.
-   - **Done-without-evidence**: tasks marked `Done` but whose body has no `## Final Summary` section.
+   - **Done-without-evidence**: tasks with `status: done` but whose body has no `## Final Summary` section.
    - **Long-standing open**: open tasks whose `created_date` is more than 90 days old. Possibly should be archived or rewritten.
    - **Missing AC for in-progress**: in-progress tasks with zero acceptance criteria. Hard to know "done" without them.
 
-4. **Reminders sweep** (additive — `_tasks/reminders/*.md` across the same scope, schema in `~/Documents/Personal OS/_wiki/REMINDERS_DESIGN.md` §3):
-   - **Stuck-surfaced**: reminders with `status: surfaced` whose `fired_at` is more than 7 days ago and which have not been dismissed or promoted. The user saw it but never acted; either dismiss or promote.
-   - **Pending past surface_on**: reminders with `status: pending` and `surface_on <` today. These are surfacing-misses — should have fired but no caller queried, or the surfacer skipped them. Flag so the next briefing/cross-project run picks them up.
-   - **Malformed frontmatter**: reminder files missing `id`, `surface_on`, `status`, or `created_by`; or with a `surface_on` that doesn't parse as ISO date; or with a `status` value outside `{pending, surfaced, dismissed, promoted}`.
-   - **Recurring without recur_until and far-future surface_on > 5y**: gentle flag — possibly an unintended recurrence.
-   - Use `python3 ~/Documents/C2/.scripts/list-due-reminders.py` to enumerate; or once `backlog reminder list` ships, prefer that.
+4. **Reminders sweep** (additive — reminders are tasks with `hidden_until:` across the same scope; recurring ones also carry `recur:`):
+   - **Stale-surfaced**: reminder-tasks whose `hidden_until` arrived more than 7 days ago that are still open (not `done`) and show no activity. The user saw it (or should have) but never acted; either close it or reschedule (bump `hidden_until:`).
+   - **Long-overdue**: reminder-tasks with `hidden_until <` today that are still open. These should have surfaced already; flag so the next briefing / `projects home scan` picks them up.
+   - **Malformed frontmatter**: reminder-tasks with a `hidden_until` that doesn't parse as an ISO date, or a `recur:` value outside the recognized set (`weekly|monthly|...`).
+   - **Recurring with a far-future `hidden_until` > 5y**: gentle flag — possibly an unintended recurrence.
+   - Use `projects task list` (which respects `hidden_until:`) to enumerate; reminder-tasks are surfaced when due via `projects home scan`.
 
 5. **Report**:
    - Group findings by check, with a count and the affected task / reminder IDs.
-   - Format: terse, scannable. Don't dump full task content; the user can drill in via `backlog task view <id> --json` or by reading the reminder file directly.
+   - Format: terse, scannable. Don't dump full task content; the user can drill in via `projects task view <id>` or by reading the task file directly.
    - End with a one-line summary: "X total open tasks, Y reminders, Z issues found across N categories."
 
 ## Don'ts
 
 - **Don't auto-fix anything.** This skill is read-only. The point is to surface issues so the user decides.
 - Don't recommend a fix for "untriaged" — quadrant is a judgment call only the user can make.
-- Don't include archived (`completed/`) or draft tasks unless the user explicitly asks.
+- Don't include tasks in dormant/archived projects unless the user explicitly asks (the default scope already excludes `Dormant Projects/*` and `Archives/*`).

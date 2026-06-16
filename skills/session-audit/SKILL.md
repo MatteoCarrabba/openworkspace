@@ -24,9 +24,9 @@ For each project touched in the session, run these checks. Report findings group
 
 ### 1. Backlog hygiene
 
-- **Completed work has `## Final Summary`.** For every task moved to `Done` in this session, the task file must have a populated `## Final Summary` section. Tasks marked Done without one fail the audit.
-- **In-progress tasks are real.** Tasks in `In Progress` should correspond to work that's actually unfinished and intended to resume. If a task is `In Progress` but the work was abandoned or rolled into another task, mark it correctly.
-- **Done means done.** Acceptance criteria checked, work is actually complete, no scope expansion that should have been a separate task. (If unsure, this overlaps with `/task-review` — call that out instead of duplicating.)
+- **Completed work has `## Final Summary`.** For every task moved to `done` in this session, the task file must have a populated `## Final Summary` section. Tasks marked done without one fail the audit.
+- **In-progress tasks are real.** Tasks with `status: doing` should correspond to work that's actually unfinished and intended to resume. If a task is `doing` but the work was abandoned or rolled into another task, mark it correctly.
+- **`done` means done.** Acceptance criteria checked, work is actually complete, no scope expansion that should have been a separate task. (If unsure, this overlaps with `/task-review` — call that out instead of duplicating.)
 - **New tasks have correct quadrant + Why.** Q2 tasks created in this session must have `## Why this matters`. Untriaged tasks (no quadrant) are flagged.
 - **Dependency IDs resolve.** Any `dependencies:` entry must point to a real task ID. (Caught in this very codebase: an ID-collision bug where a session's create+edit assumed sequential IDs but the counter had advanced.)
 
@@ -43,7 +43,7 @@ For each project touched in the session, run these checks. Report findings group
 
 ### 4. Project README has resume guidance
 
-- **`<project>/README.md` (or equivalent landing doc) has a "Resuming this work" or "How to pick this up" section.** Even one paragraph is enough: "read this file, then context.md, then run `backlog task list -m <milestone> --plain`; look for tasks labeled `needs-user`."
+- **`<project>/README.md` (or equivalent landing doc) has a "Resuming this work" or "How to pick this up" section.** Even one paragraph is enough: "read this file, then context.md, then run `projects task list -m <milestone>`; look for tasks labeled `needs-user`."
 - **Phase pointer in `TODO.md`.** Any phase / arc / initiative that has tasks in the backlog should have a one-paragraph pointer in the project's `TODO.md`, naming the milestone, headline arc, and operational principles for the slice. Forward-looking prose, never a checkbox list (that drifts).
 
 ### 5. Cross-references and freshness
@@ -70,6 +70,6 @@ If everything's clean, say so in one line. The audit's value is partly in passin
 ## Implementation notes
 
 - The "what was touched in this session" set is the agent's responsibility — read it from your own conversation context. There's no machine-readable session log.
-- Backlog queries: `backlog task list --json --status "In Progress"`, `backlog task list --json --status "Done"`, `backlog task list -m <milestone> --plain` for milestone-scoped checks.
-- For cross-project sessions: `backlog cross-project --exclude-dormant --exclude-archived --json`.
+- Task queries: `projects task list --status doing`, `projects task list --status done`, `projects task list -m <milestone>` for milestone-scoped checks.
+- For cross-project sessions: `projects home scan`.
 - Files to scan for principle-capture checks: `<project>/context.md`, `<project>/decisions.md`, `<project>/CLAUDE.md`, `~/Documents/CLAUDE.md`.
