@@ -951,8 +951,10 @@ export interface DoctorWorkspaceOptions {
  *   a. dangling edge        — a subproject/path ref that resolves to nothing
  *   b. cycle                — an ownership loop over in-ws projects
  *   c. parent/child disagreement — physical FS nesting with no declared edge
- *   d. duplicate ownership  — one child owned by >1 parent
- *   e. ~/code name collision — two kind:"code" children sharing a bare name
+ *   d. duplicate ownership  — one SUBPROJECT child owned by >1 parent (code/
+ *      remote children may be shared, so they are exempt)
+ *   e. ~/code name collision — two DISTINCT kind:"code" children (different
+ *      resolved identities) sharing a bare name (the same shared child is fine)
  * Plus: malformed-edge parse problems surface as warnings.
  */
 function ownsGraphIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
@@ -1044,8 +1046,22 @@ function ownsGraphIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
     }
   }
 
-  // (d) duplicate ownership: a child uid owned by more than one parent.
-  for (const [uid, owners] of graph.ownersByChildKey) {
+  // (d) duplicate ownership — SUBPROJECTS ONLY. Per the project-graph design,
+  //     code/remote children MAY be multiply-owned (shared across parents is
+  //     legal and intended); only `subproject` children are single-owner. So a
+  //     child is flagged only when >1 parent owns it via a `subproject` edge.
+  //     (Aggregations de-dupe shared children by identity elsewhere; sharing is
+  //     not itself a violation for code/remote.)
+  const subprojectOwners = new Map<string, string[]>(); // child uid → owner relPaths (subproject edges only)
+  for (const node of graph.nodes) {
+    for (const e of node.edges) {
+      if (e.uid === null || e.edge.kind !== "subproject") continue;
+      const list = subprojectOwners.get(e.uid);
+      if (list === undefined) subprojectOwners.set(e.uid, [node.owner.relPath]);
+      else list.push(node.owner.relPath);
+    }
+  }
+  for (const [uid, owners] of subprojectOwners) {
     if (owners.length > 1) {
       // Resolve the child's relPath for the message.
       const child = all.find((p) => p.uid === uid);
@@ -1059,24 +1075,32 @@ function ownsGraphIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
     }
   }
 
-  // (e) ~/code name collision: two kind:"code" children sharing a bare name.
-  const codeNames = new Map<string, string[]>();
+  // (e) ~/code name collision — keyed on resolved child IDENTITY, not the bare
+  //     name. The SAME code child (same resolved path / URL) referenced by
+  //     multiple parents is LEGAL and silent — sharing is intended. A genuine
+  //     collision is TWO DISTINCT children (different resolved identities)
+  //     sharing the same display name; only that is flagged.
+  const codeNameIdentities = new Map<string, Set<string>>(); // bare name → set of distinct child identities
   for (const node of graph.nodes) {
     for (const e of node.edges) {
       if (e.edge.kind !== "code") continue;
       const bare = e.edge.name ?? path.basename(e.localPath ?? e.edge.ref);
-      const list = codeNames.get(bare);
-      if (list === undefined) codeNames.set(bare, [e.edge.ref]);
-      else list.push(e.edge.ref);
+      const identity = e.localPath !== null ? path.resolve(e.localPath) : e.edge.ref;
+      let set = codeNameIdentities.get(bare);
+      if (set === undefined) {
+        set = new Set<string>();
+        codeNameIdentities.set(bare, set);
+      }
+      set.add(identity);
     }
   }
-  for (const [name, refs] of codeNames) {
-    if (refs.length > 1) {
+  for (const [name, identities] of codeNameIdentities) {
+    if (identities.size > 1) {
       issues.push({
         severity: "error",
         project: null,
         file: null,
-        message: `code-child name collision: ${name} used by ${refs.join(", ")}`,
+        message: `code-child name collision: ${name} used by ${[...identities].join(", ")}`,
       });
     }
   }

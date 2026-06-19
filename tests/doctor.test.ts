@@ -796,6 +796,70 @@ test("owns doctor (e): two kind:code edges both named firmware → one collision
   assert.match(coll[0]?.message ?? "", /firmware/);
 });
 
+test("owns doctor (d): code/remote children MAY be shared — two parents owning the same code child is NOT flagged", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "shared-repo"));
+  // Both parents own the SAME code child (same resolved path). Legal sharing.
+  writeOwns(a.root, [{ ref: "shared-repo", kind: "code", name: null, lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "shared-repo", kind: "code", name: null, lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(
+    !issues.some((i) => /owned by multiple parents/.test(i.message)),
+    "code children are exempt from the single-owner rule",
+  );
+  assert.ok(
+    !issues.some((i) => /name collision/.test(i.message)),
+    "the SAME shared code child is not a name collision",
+  );
+});
+
+test("owns doctor (d): a SUBPROJECT child still cannot be multiply-owned (single-owner rule holds)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  tw.addProject("Sub");
+  writeOwns(a.root, [subEdge("Sub")]);
+  writeOwns(b.root, [subEdge("Sub")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const dupes = issues.filter((i) => /owned by multiple parents/.test(i.message));
+  assert.equal(dupes.length, 1);
+  assert.equal(dupes[0]?.severity, "error");
+});
+
+test("owns doctor (e): the SAME code child referenced by two parents is NOT a collision (shared identity)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "firmware"));
+  // Same resolved path, same name, two parents → legal sharing, silent.
+  writeOwns(a.root, [{ ref: "firmware", kind: "code", name: "fw", lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "firmware", kind: "code", name: "fw", lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /code-child name collision/.test(i.message)));
+});
+
+test("owns doctor (e): TWO DISTINCT code children sharing a name → genuine collision (still flagged)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "repo1"));
+  fs.mkdirSync(path.join(tw.root, "repo2"));
+  // Different resolved paths, same display name → genuine collision.
+  writeOwns(a.root, [{ ref: "repo1", kind: "code", name: "firmware", lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "repo2", kind: "code", name: "firmware", lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const coll = issues.filter((i) => /code-child name collision/.test(i.message));
+  assert.equal(coll.length, 1);
+  assert.equal(coll[0]?.severity, "error");
+  assert.match(coll[0]?.message ?? "", /firmware/);
+});
+
 test("owns doctor (e): distinct code names → no collision", (t) => {
   const tw = makeTmpWorkspace();
   t.after(tw.cleanup);

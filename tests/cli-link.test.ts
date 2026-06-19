@@ -227,6 +227,140 @@ test("cli tree: renders parent→child indentation; tags a cycle and terminates"
   assert.match(cycleTree.stdout, /\(cycle\)/);
 });
 
+test("cli home list --owner: a child reachable via two refs is de-duped (appears once in aggregation)", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.equal(run(["new", "Parent"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "Child"], fx.root, fx.storeDir).status, 0);
+  // Two DISTINCT refs that resolve to the SAME child (relative + absolute path).
+  assert.equal(run(["link", "add", "Child", "--project", "Parent"], fx.root, fx.storeDir).status, 0);
+  assert.equal(
+    run(["link", "add", path.join(fx.root, "Child"), "--project", "Parent", "--kind", "subproject"], fx.root, fx.storeDir)
+      .status,
+    0,
+  );
+
+  const list = run(["home", "list", "--owner", "Parent", "--json"], fx.root, fx.storeDir);
+  assert.equal(list.status, 0, list.stderr);
+  const parsed = JSON.parse(list.stdout) as Array<{ relPath: string }>;
+  // De-duped by resolved identity: Child appears exactly once, not twice.
+  assert.equal(parsed.length, 1, list.stdout);
+  assert.equal(parsed[0]?.relPath, "Child");
+});
+
+test("cli tree (default, no --project): renders a whole-graph cycle (no acyclic root) tagged + terminating", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.equal(run(["new", "Foo"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "Bar"], fx.root, fx.storeDir).status, 0);
+  // Foo owns Bar; Bar owns Foo — a 2-cycle where EVERY node is someone's child,
+  // so the old roots-only computation dropped the whole SCC. Hand-edit Bar's
+  // owns to bypass the add-time cycle guard.
+  assert.equal(run(["link", "add", "Bar", "--project", "Foo"], fx.root, fx.storeDir).status, 0);
+  fs.writeFileSync(
+    path.join(fx.root, "Bar", "_project", "project.toml"),
+    `[[owns]]\nref = "Foo"\nkind = "subproject"\n`,
+  );
+
+  const tree = run(["tree"], fx.root, fx.storeDir);
+  assert.equal(tree.status, 0, tree.stderr);
+  // Both cycle members must still appear (not silently dropped) ...
+  assert.match(tree.stdout, /Foo/);
+  assert.match(tree.stdout, /Bar/);
+  // ... and the cycle must be tagged (proves termination).
+  assert.match(tree.stdout, /\(cycle\)/);
+});
+
+test("cli tree (default): a self-loop (X owns X) renders once, tagged (cycle)", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.equal(run(["new", "Solo"], fx.root, fx.storeDir).status, 0);
+  // Hand-edit a self-owning edge (the add-time self-link guard would refuse it).
+  fs.writeFileSync(
+    path.join(fx.root, "Solo", "_project", "project.toml"),
+    `[[owns]]\nref = "Solo"\nkind = "subproject"\n`,
+  );
+
+  const tree = run(["tree"], fx.root, fx.storeDir);
+  assert.equal(tree.status, 0, tree.stderr);
+  // "Solo" appears: once as the rendered root, once as the cycle back-edge.
+  const occurrences = tree.stdout.split("\n").filter((l) => /Solo/.test(l));
+  assert.equal(occurrences.length, 2, tree.stdout);
+  assert.match(tree.stdout, /Solo \(cycle\)/);
+});
+
+test("cli tree: a child owned by two parents expands once; the second is a back-reference (no re-expansion)", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.equal(run(["new", "OwnerA"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "OwnerB"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "Shared"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "Grandchild"], fx.root, fx.storeDir).status, 0);
+  // Shared owns Grandchild; both OwnerA and OwnerB own Shared.
+  assert.equal(run(["link", "add", "Grandchild", "--project", "Shared"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["link", "add", "Shared", "--project", "OwnerA"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["link", "add", "Shared", "--project", "OwnerB"], fx.root, fx.storeDir).status, 0);
+
+  const tree = run(["tree"], fx.root, fx.storeDir);
+  assert.equal(tree.status, 0, tree.stderr);
+  const lines = tree.stdout.split("\n");
+  // Shared appears under both owners (twice) but Grandchild is expanded only ONCE
+  // (under the first owner); the second Shared is a back-reference (↗) and does
+  // NOT re-print Grandchild.
+  assert.equal(lines.filter((l) => /Shared/.test(l)).length, 2, tree.stdout);
+  assert.equal(lines.filter((l) => /Grandchild/.test(l)).length, 1, tree.stdout);
+  assert.match(tree.stdout, /Shared ↗/);
+  assert.match(tree.stdout, /also owned by/);
+});
+
+test("cli tree: a code child shared by two parents prints once + back-reference (legal sharing)", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  assert.equal(run(["new", "OwnerA"], fx.root, fx.storeDir).status, 0);
+  assert.equal(run(["new", "OwnerB"], fx.root, fx.storeDir).status, 0);
+  const bare = path.join(fx.root, "shared-repo");
+  fs.mkdirSync(bare);
+  assert.equal(
+    run(["link", "add", "shared-repo", "--project", "OwnerA", "--kind", "code"], fx.root, fx.storeDir).status,
+    0,
+  );
+  assert.equal(
+    run(["link", "add", "shared-repo", "--project", "OwnerB", "--kind", "code"], fx.root, fx.storeDir).status,
+    0,
+  );
+
+  const tree = run(["tree"], fx.root, fx.storeDir);
+  assert.equal(tree.status, 0, tree.stderr);
+  const lines = tree.stdout.split("\n");
+  // The code leaf line: one full "(not-a-project)" entry + one "↗ (also owned)".
+  const sharedLines = lines.filter((l) => /shared-repo \[code\]/.test(l));
+  assert.equal(sharedLines.length, 2, tree.stdout);
+  assert.equal(sharedLines.filter((l) => /↗/.test(l)).length, 1, tree.stdout);
+});
+
+test("cli link add: self-link is refused OUTSIDE a workspace (best-effort path guard)", (t) => {
+  // A standalone project with NO enclosing .openworkspace/ workspace.
+  const dir = makeTmpDir("ow-standalone-");
+  const storeDir = makeTmpDir("ow-standalone-store-");
+  t.after(() => {
+    rmrf(dir);
+    rmrf(storeDir);
+  });
+  const proj = path.join(dir, "Solo");
+  // `new` without a workspace: init the project directly via init then link.
+  assert.equal(run(["init", proj], dir, storeDir).status, 0, "init standalone project");
+
+  // Self-link by absolute path: child resolves to the owner itself.
+  const self = run(["link", "add", proj, "--project", proj, "--kind", "subproject"], dir, storeDir);
+  assert.equal(self.status, 1, self.stdout);
+  assert.match(self.stderr, /self-link/);
+
+  // Self-link by "." (resolves against owner root) is also refused.
+  const selfDot = run(["link", "add", ".", "--project", proj, "--kind", "subproject"], dir, storeDir);
+  assert.equal(selfDot.status, 1, selfDot.stdout);
+  assert.match(selfDot.stderr, /self-link/);
+});
+
 test("cli link: unknown subcommand fails with config error", (t) => {
   const fx = makeFixture();
   t.after(fx.cleanup);

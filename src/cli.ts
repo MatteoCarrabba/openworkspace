@@ -12,6 +12,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -57,6 +58,7 @@ import {
 import {
   ResolvedOwn,
   buildOwnershipGraph,
+  classifyRef,
   detectCycle,
   resolveOwnRef,
 } from "./lib/owns.js";
@@ -1070,6 +1072,16 @@ function parseEdgeLifecycle(value: unknown): DeclaredLifecycle | null {
   return value;
 }
 
+/** Canonicalize a path for identity comparison; falls back to resolve when the
+ *  path does not exist (so a missing ref still compares structurally). */
+function realpathOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
 /** Render one resolved owns edge for `link list` / errors. */
 function resolvedOwnLine(r: ResolvedOwn): string {
   const name = r.edge.name !== null ? ` "${r.edge.name}"` : "";
@@ -1106,7 +1118,23 @@ function cmdLink(argv: string[]): void {
 
       const newEdge: OwnEdge = { ref: childRef, kind, name, lifecycle };
 
-      // Self-link guard: resolve the child and reject if it IS the owner.
+      // Self-link guard (best-effort, workspace-independent): refuse a project
+      // owning itself. Compare the child's resolved path to the owner root by
+      // identity, so it fires even OUTSIDE a workspace (where the UID/cycle
+      // guards below are skipped). Remote refs can't be the local owner.
+      if (classifyRef(childRef) !== "remote" && kind !== "remote") {
+        const childAbs = childRef.startsWith("~")
+          ? path.join(os.homedir(), childRef.slice(1).replace(/^[/\\]/, ""))
+          : path.isAbsolute(childRef)
+            ? path.resolve(childRef)
+            : path.resolve(owner.root, childRef);
+        if (realpathOrSelf(childAbs) === realpathOrSelf(owner.root)) {
+          throw new ConfigError(`refusing self-link: ${childRef} resolves to the owner itself`);
+        }
+      }
+
+      // Self-link guard (in-workspace, UID-precise): resolve the child and
+      // reject if it IS the owner.
       const ws = (() => {
         try {
           return openWorkspaceRegistered(process.cwd());
@@ -1226,6 +1254,23 @@ function cmdTree(argv: string[]): void {
   const lifecycleByRelPath = new Map<string, DeclaredLifecycle>();
   for (const node of graph.nodes) lifecycleByRelPath.set(node.owner.relPath, node.owner.effectiveLifecycle);
 
+  // Owner relPath → set of OTHER owners that also declare this in-ws child, so a
+  // back-reference can name where the full subtree was already expanded.
+  const ownersOf = new Map<string, Set<string>>();
+  for (const node of graph.nodes) {
+    for (const e of node.edges) {
+      if (e.uid !== null && e.localPath !== null) {
+        const childRel = path.relative(ws.root, e.localPath);
+        let s = ownersOf.get(childRel);
+        if (s === undefined) {
+          s = new Set<string>();
+          ownersOf.set(childRel, s);
+        }
+        s.add(node.owner.relPath);
+      }
+    }
+  }
+
   // Determine the subtree root(s).
   let rootRelPaths: string[];
   if (values["project"] !== undefined) {
@@ -1244,6 +1289,16 @@ function cmdTree(argv: string[]): void {
     cycle: boolean;
   }
 
+  // A stable node identity for de-duplication across the WHOLE traversal: the
+  // resolved path for in-ws/path children, the URL ref for remote children. A
+  // child reached via multiple owners (legal for code/remote; flagged for
+  // subprojects) is expanded fully the FIRST time and shown as a non-expanded
+  // back-reference afterwards — never re-walked, so no duplicated subtree.
+  const seen = new Set<string>();
+
+  // `visiting` is the current DFS path (ancestors) — a re-encounter of an
+  // ancestor is a cycle. `seen` is global — a re-encounter of an already-fully-
+  // expanded node elsewhere is a shared-child back-reference. Both terminate.
   const buildNode = (relPath: string, visiting: Set<string>): TreeNode => {
     const lc = lifecycleByRelPath.get(relPath);
     const node: TreeNode = {
@@ -1257,19 +1312,41 @@ function cmdTree(argv: string[]): void {
       node.label = `${relPath} (cycle)`;
       return node;
     }
+    if (seen.has(relPath)) {
+      // Already expanded under another owner — show as a back-reference and do
+      // NOT re-walk its subtree (no duplication in the rendered tree).
+      const others = [...(ownersOf.get(relPath) ?? [])].filter((o) => o !== relPath);
+      const also = others.length > 0 ? ` (also owned by ${others.join(", ")})` : " (also owned)";
+      node.label = `${relPath} ↗${also}`;
+      return node;
+    }
+    seen.add(relPath);
     visiting.add(relPath);
     for (const e of byRelPath.get(relPath) ?? []) {
       if (e.uid !== null && e.localPath !== null) {
         node.children.push(buildNode(path.relative(ws.root, e.localPath), visiting));
       } else {
-        // code/remote/missing leaf
+        // code/remote/missing leaf. De-dup by resolved identity: a code child
+        // shared by multiple parents (legal) prints once; later occurrences are
+        // a back-reference, never a duplicate.
         const name = e.edge.name !== null ? ` "${e.edge.name}"` : "";
-        node.children.push({
-          label: `${e.edge.ref} [${e.edge.kind}] (${e.status})${name}`,
-          relPath: null,
-          children: [],
-          cycle: false,
-        });
+        const leafKey = e.localPath !== null ? path.resolve(e.localPath) : e.edge.ref;
+        if (seen.has(leafKey)) {
+          node.children.push({
+            label: `${e.edge.ref} [${e.edge.kind}] ↗ (also owned)${name}`,
+            relPath: null,
+            children: [],
+            cycle: false,
+          });
+        } else {
+          seen.add(leafKey);
+          node.children.push({
+            label: `${e.edge.ref} [${e.edge.kind}] (${e.status})${name}`,
+            relPath: null,
+            children: [],
+            cycle: false,
+          });
+        }
       }
     }
     visiting.delete(relPath);
@@ -1277,6 +1354,20 @@ function cmdTree(argv: string[]): void {
   };
 
   const roots = rootRelPaths.map((rp) => buildNode(rp, new Set<string>()));
+
+  // Whole-graph cycles / SCCs with no acyclic entry point have NO root (every
+  // member is someone's child), so the loop above never visits them. Without
+  // this pass `tree` (default, no --project) would silently drop them. Render
+  // each still-unvisited node as an additional root so EVERY node appears; the
+  // in-loop cycle tagging + the global `seen` set keep it terminating and
+  // duplicate-free. A self-loop (X owns X) renders once here, tagged.
+  if (values["project"] === undefined) {
+    for (const node of graph.nodes) {
+      if (!seen.has(node.owner.relPath)) {
+        roots.push(buildNode(node.owner.relPath, new Set<string>()));
+      }
+    }
+  }
 
   if (values["json"] === true) {
     printJson(roots);
