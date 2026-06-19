@@ -1,0 +1,4 @@
+# OpenWorkspace git posture — stamped by `projects init`; doctor checks it.
+forum/presence/
+automations/*/logs/
+/archive/
