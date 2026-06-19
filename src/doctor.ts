@@ -55,6 +55,7 @@ import {
   readDeclaredLifecycle,
   readProjectUid,
 } from "./lib/workspace.js";
+import { buildOwnershipGraph, detectCycle } from "./lib/owns.js";
 import { reconcilePlan } from "./reconcile.js";
 import { readActivationRecords, scanManifests, validateManifest } from "./primitives/automations.js";
 import { hasFinalSummary, nextOccurrenceDate, parseInterval } from "./primitives/tasks.js";
@@ -944,6 +945,145 @@ export interface DoctorWorkspaceOptions {
   claudeBinPath?: string;
 }
 
+/**
+ * Project-graph invariants over the `[[owns]]` edges (project-graph feature).
+ * All five are workspace-level (they need cross-project edge data):
+ *   a. dangling edge        — a subproject/path ref that resolves to nothing
+ *   b. cycle                — an ownership loop over in-ws projects
+ *   c. parent/child disagreement — physical FS nesting with no declared edge
+ *   d. duplicate ownership  — one child owned by >1 parent
+ *   e. ~/code name collision — two kind:"code" children sharing a bare name
+ * Plus: malformed-edge parse problems surface as warnings.
+ */
+function ownsGraphIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
+  const issues: DoctorIssue[] = [];
+  const graph = buildOwnershipGraph(ws);
+
+  // malformed-edge parse problems → warn (already prefixed with owner relPath)
+  for (const p of graph.problems) {
+    issues.push({
+      severity: "warn",
+      project: null,
+      file: path.join("_project", "project.toml"),
+      message: `malformed owns edge: ${p}`,
+    });
+  }
+
+  // (a) dangling edge: missing always; not-a-project only for kind:"subproject"
+  //     (a bare repo for kind:"code" is the EXPECTED healthy state). Remote is
+  //     never flagged (no FS to check).
+  for (const node of graph.nodes) {
+    for (const e of node.edges) {
+      const dangling =
+        e.status === "missing" ||
+        (e.status === "not-a-project" && e.edge.kind === "subproject");
+      if (dangling) {
+        issues.push({
+          severity: "error",
+          project: node.owner.relPath,
+          file: path.join("_project", "project.toml"),
+          message: `${node.owner.relPath}: dangling owns edge — ${e.edge.ref} (${e.edge.kind}) resolves to ${e.status}`,
+        });
+      }
+    }
+  }
+
+  // (b) cycle: directed adjacency over in-ws nodes (owner relPath → child
+  //     relPaths where a UID is present). Emit once.
+  const adj = new Map<string, string[]>();
+  const ensure = (k: string): string[] => {
+    let l = adj.get(k);
+    if (l === undefined) {
+      l = [];
+      adj.set(k, l);
+    }
+    return l;
+  };
+  for (const node of graph.nodes) {
+    ensure(node.owner.relPath);
+    for (const e of node.edges) {
+      if (e.uid !== null && e.localPath !== null) {
+        ensure(node.owner.relPath).push(path.relative(ws.root, e.localPath));
+      }
+    }
+  }
+  const cycle = detectCycle(adj);
+  if (cycle !== null) {
+    issues.push({
+      severity: "error",
+      project: null,
+      file: null,
+      message: `ownership cycle: ${cycle.join(" -> ")}`,
+    });
+  }
+
+  // (c) parent/child disagreement: a project physically nested under another
+  //     (ProjectInfo.nestedUnder) where the enclosing project declares NO owns
+  //     edge to it. Nesting without a declared edge → warn.
+  const ownedRoots = new Map<string, Set<string>>(); // owner root → set of child roots (resolved)
+  for (const node of graph.nodes) {
+    const set = new Set<string>();
+    for (const e of node.edges) {
+      if (e.localPath !== null) set.add(path.resolve(e.localPath));
+    }
+    ownedRoots.set(path.resolve(node.owner.root), set);
+  }
+  for (const child of all) {
+    if (child.nestedUnder === null) continue;
+    const parentRoot = path.resolve(child.nestedUnder);
+    const declared = ownedRoots.get(parentRoot);
+    if (declared === undefined || !declared.has(path.resolve(child.root))) {
+      const parent = all.find((p) => path.resolve(p.root) === parentRoot);
+      const parentRel = parent !== undefined ? parent.relPath : child.nestedUnder;
+      issues.push({
+        severity: "warn",
+        project: child.relPath,
+        file: null,
+        message: `${child.relPath}: physically nested under ${parentRel} but no owns edge declares it`,
+      });
+    }
+  }
+
+  // (d) duplicate ownership: a child uid owned by more than one parent.
+  for (const [uid, owners] of graph.ownersByChildKey) {
+    if (owners.length > 1) {
+      // Resolve the child's relPath for the message.
+      const child = all.find((p) => p.uid === uid);
+      const childRel = child !== undefined ? child.relPath : uid;
+      issues.push({
+        severity: "error",
+        project: null,
+        file: null,
+        message: `${childRel}: owned by multiple parents (${owners.join(", ")})`,
+      });
+    }
+  }
+
+  // (e) ~/code name collision: two kind:"code" children sharing a bare name.
+  const codeNames = new Map<string, string[]>();
+  for (const node of graph.nodes) {
+    for (const e of node.edges) {
+      if (e.edge.kind !== "code") continue;
+      const bare = e.edge.name ?? path.basename(e.localPath ?? e.edge.ref);
+      const list = codeNames.get(bare);
+      if (list === undefined) codeNames.set(bare, [e.edge.ref]);
+      else list.push(e.edge.ref);
+    }
+  }
+  for (const [name, refs] of codeNames) {
+    if (refs.length > 1) {
+      issues.push({
+        severity: "error",
+        project: null,
+        file: null,
+        message: `code-child name collision: ${name} used by ${refs.join(", ")}`,
+      });
+    }
+  }
+
+  return issues;
+}
+
 /** Workspace-level checks only (no per-project recursion). */
 export function doctorWorkspaceOnly(
   ws: Workspace,
@@ -988,6 +1128,11 @@ export function doctorWorkspaceOnly(
       message: `duplicate project uid ${uid}: ${roots.join(", ")}`,
     });
   }
+
+  // ----- project graph: [[owns]] edge invariants (project-graph feature) -----
+  // The edge is canonical on the parent; the graph is built fresh from the live
+  // tree + declarations. Doctor proposes, never mutates.
+  issues.push(...ownsGraphIssues(ws, all));
 
   // decision-2: declared-lifecycle validity + location⟷metadata drift. The
   // metadata is the source of truth; location is a derived view. Doctor REPORTS
