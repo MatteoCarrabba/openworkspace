@@ -26,7 +26,8 @@ import { FORUM_README, PROJECT_README, initProject, updateMachineRegistry } from
 import { checkDocCurrency } from "../src/lib/clisurface.js";
 import { MachineStore, activationRecordPath, appendLifecycleIntent, writeRunnerNode } from "../src/lib/machine.js";
 import { writeToml } from "../src/lib/toml.js";
-import { writeDeclaredLifecycle } from "../src/lib/workspace.js";
+import { OwnEdge, writeDeclaredLifecycle, writeOwns } from "../src/lib/workspace.js";
+import { detectCycle } from "../src/lib/owns.js";
 import { makeTmpDir, makeTmpStore, makeTmpWorkspace, rmrf } from "./helpers.js";
 
 function gitAvailable(): boolean {
@@ -661,4 +662,263 @@ test("doctor: ambiguous drift surfaces as info with both fix commands", (t) => {
   assert.ok(amb !== undefined);
   assert.match(amb.message, /--to active/);
   assert.match(amb.message, /--revert/);
+});
+
+// ---------------------------------------------------------------------------
+// Project graph — [[owns]] edge invariants (a–e) (project-graph feature)
+// ---------------------------------------------------------------------------
+
+function subEdge(ref: string): OwnEdge {
+  return { ref, kind: "subproject", name: null, lifecycle: null };
+}
+
+// (a) dangling edge ----------------------------------------------------------
+
+test("owns doctor (a): a subproject edge to a nonexistent dir is an ERROR", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const p = tw.addProject("Parent");
+  writeOwns(p.root, [subEdge("Nope")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const dangling = issues.filter((i) => /dangling owns edge/.test(i.message));
+  assert.equal(dangling.length, 1);
+  assert.equal(dangling[0]?.severity, "error");
+  assert.match(dangling[0]?.message ?? "", /Nope \(subproject\) resolves to missing/);
+});
+
+test("owns doctor (a): a code edge to a bare repo is NOT flagged (healthy)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const p = tw.addProject("Parent");
+  fs.mkdirSync(path.join(tw.root, "bare"));
+  writeOwns(p.root, [{ ref: "bare", kind: "code", name: null, lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /dangling owns edge/.test(i.message)));
+});
+
+// (b) cycle ------------------------------------------------------------------
+
+test("owns doctor (b): Foo owns Bar, Bar owns Foo → one cycle ERROR naming both", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const foo = tw.addProject("Foo");
+  const bar = tw.addProject("Bar");
+  writeOwns(foo.root, [subEdge("Bar")]);
+  writeOwns(bar.root, [subEdge("Foo")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const cycles = issues.filter((i) => /ownership cycle/.test(i.message));
+  assert.equal(cycles.length, 1);
+  assert.equal(cycles[0]?.severity, "error");
+  assert.match(cycles[0]?.message ?? "", /Foo/);
+  assert.match(cycles[0]?.message ?? "", /Bar/);
+});
+
+test("owns doctor (b): a DAG (Foo owns Bar, Foo owns Baz) → no cycle", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const foo = tw.addProject("Foo");
+  tw.addProject("Bar");
+  tw.addProject("Baz");
+  writeOwns(foo.root, [subEdge("Bar"), subEdge("Baz")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /ownership cycle/.test(i.message)));
+});
+
+// (c) parent/child disagreement (physical nesting w/o declared edge) ---------
+
+test("owns doctor (c): a nested project with no owns edge from the enclosing project → WARN", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const parent = tw.addProject("Parent");
+  tw.addProject(path.join("Parent", "Nested"));
+  // parent declares nothing
+  void parent;
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const nesting = issues.filter((i) => /physically nested under/.test(i.message));
+  assert.equal(nesting.length, 1);
+  assert.equal(nesting[0]?.severity, "warn");
+  assert.match(nesting[0]?.message ?? "", /Parent\/Nested/);
+});
+
+test("owns doctor (c): a nested project WITH a declared owns edge → no warning", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const parent = tw.addProject("Parent");
+  tw.addProject(path.join("Parent", "Nested"));
+  writeOwns(parent.root, [subEdge(path.join("Parent", "Nested"))]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /physically nested under/.test(i.message)));
+});
+
+// (d) duplicate ownership ----------------------------------------------------
+
+test("owns doctor (d): Foo and Baz both own Bar → one ERROR naming Foo+Baz", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const foo = tw.addProject("Foo");
+  const baz = tw.addProject("Baz");
+  tw.addProject("Bar");
+  writeOwns(foo.root, [subEdge("Bar")]);
+  writeOwns(baz.root, [subEdge("Bar")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const dupes = issues.filter((i) => /owned by multiple parents/.test(i.message));
+  assert.equal(dupes.length, 1);
+  assert.equal(dupes[0]?.severity, "error");
+  assert.match(dupes[0]?.message ?? "", /Foo/);
+  assert.match(dupes[0]?.message ?? "", /Baz/);
+});
+
+test("owns doctor (d): a single owner per child → no duplicate-ownership finding", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const foo = tw.addProject("Foo");
+  tw.addProject("Bar");
+  writeOwns(foo.root, [subEdge("Bar")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /owned by multiple parents/.test(i.message)));
+});
+
+// (e) ~/code name collision --------------------------------------------------
+
+test("owns doctor (e): two kind:code edges both named firmware → one collision ERROR", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "repo1"));
+  fs.mkdirSync(path.join(tw.root, "repo2"));
+  writeOwns(a.root, [{ ref: "repo1", kind: "code", name: "firmware", lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "repo2", kind: "code", name: "firmware", lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const coll = issues.filter((i) => /code-child name collision/.test(i.message));
+  assert.equal(coll.length, 1);
+  assert.equal(coll[0]?.severity, "error");
+  assert.match(coll[0]?.message ?? "", /firmware/);
+});
+
+test("owns doctor (d): code/remote children MAY be shared — two parents owning the same code child is NOT flagged", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "shared-repo"));
+  // Both parents own the SAME code child (same resolved path). Legal sharing.
+  writeOwns(a.root, [{ ref: "shared-repo", kind: "code", name: null, lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "shared-repo", kind: "code", name: null, lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(
+    !issues.some((i) => /owned by multiple parents/.test(i.message)),
+    "code children are exempt from the single-owner rule",
+  );
+  assert.ok(
+    !issues.some((i) => /name collision/.test(i.message)),
+    "the SAME shared code child is not a name collision",
+  );
+});
+
+test("owns doctor (d): a SUBPROJECT child still cannot be multiply-owned (single-owner rule holds)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  tw.addProject("Sub");
+  writeOwns(a.root, [subEdge("Sub")]);
+  writeOwns(b.root, [subEdge("Sub")]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const dupes = issues.filter((i) => /owned by multiple parents/.test(i.message));
+  assert.equal(dupes.length, 1);
+  assert.equal(dupes[0]?.severity, "error");
+});
+
+test("owns doctor (e): the SAME code child referenced by two parents is NOT a collision (shared identity)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "firmware"));
+  // Same resolved path, same name, two parents → legal sharing, silent.
+  writeOwns(a.root, [{ ref: "firmware", kind: "code", name: "fw", lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "firmware", kind: "code", name: "fw", lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /code-child name collision/.test(i.message)));
+});
+
+test("owns doctor (e): TWO DISTINCT code children sharing a name → genuine collision (still flagged)", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  const b = tw.addProject("B");
+  fs.mkdirSync(path.join(tw.root, "repo1"));
+  fs.mkdirSync(path.join(tw.root, "repo2"));
+  // Different resolved paths, same display name → genuine collision.
+  writeOwns(a.root, [{ ref: "repo1", kind: "code", name: "firmware", lifecycle: null }]);
+  writeOwns(b.root, [{ ref: "repo2", kind: "code", name: "firmware", lifecycle: null }]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const coll = issues.filter((i) => /code-child name collision/.test(i.message));
+  assert.equal(coll.length, 1);
+  assert.equal(coll[0]?.severity, "error");
+  assert.match(coll[0]?.message ?? "", /firmware/);
+});
+
+test("owns doctor (e): distinct code names → no collision", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const a = tw.addProject("A");
+  fs.mkdirSync(path.join(tw.root, "repo1"));
+  fs.mkdirSync(path.join(tw.root, "repo2"));
+  writeOwns(a.root, [
+    { ref: "repo1", kind: "code", name: "fw-a", lifecycle: null },
+    { ref: "repo2", kind: "code", name: "fw-b", lifecycle: null },
+  ]);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  assert.ok(!issues.some((i) => /code-child name collision/.test(i.message)));
+});
+
+// malformed-edge warnings ----------------------------------------------------
+
+test("owns doctor: a malformed owns edge surfaces as a WARN", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const p = tw.addProject("Parent");
+  fs.mkdirSync(path.join(p.root, "_project"), { recursive: true });
+  fs.writeFileSync(path.join(p.root, "_project", "project.toml"), `[[owns]]\nref = "X"\nkind = "bogus"\n`);
+  const issues = doctorWorkspaceOnly(tw.ws);
+  const mal = issues.filter((i) => /malformed owns edge/.test(i.message));
+  assert.equal(mal.length, 1);
+  assert.equal(mal[0]?.severity, "warn");
+});
+
+// workspace-doctor propagation + exit code ----------------------------------
+
+test("owns doctor: an error-severity owns violation flows into doctorWorkspace counts", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const p = tw.addProject("Parent");
+  writeOwns(p.root, [subEdge("Nope")]); // dangling subproject → error
+  const rep = doctorWorkspace(tw.ws);
+  assert.ok(rep.issues.some((i) => /dangling owns edge/.test(i.message)));
+  assert.ok(rep.errors >= 1);
+});
+
+// detectCycle pure unit ------------------------------------------------------
+
+test("detectCycle: A→B→C→A returns a cycle; a DAG returns null", () => {
+  const cyclic = new Map<string, string[]>([
+    ["A", ["B"]],
+    ["B", ["C"]],
+    ["C", ["A"]],
+  ]);
+  const cycle = detectCycle(cyclic);
+  assert.ok(cycle !== null);
+  assert.equal(cycle?.[0], cycle?.[cycle.length - 1]);
+
+  assert.equal(
+    detectCycle(
+      new Map<string, string[]>([
+        ["A", ["B"]],
+        ["B", []],
+      ]),
+    ),
+    null,
+  );
 });

@@ -12,6 +12,7 @@
 
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
@@ -19,7 +20,7 @@ import { doctorProjectReport, doctorWorkspace, DoctorReport } from "./doctor.js"
 import { ImportPlan, applyLegacyImport, planLegacyImport, renderPlan } from "./importers.js";
 import { initProject, initWorkspace, updateMachineRegistry } from "./init.js";
 import { scanWorkspace, startDashboard } from "./dashboard/server.js";
-import { ConfigError, NotFoundError, OwError, ResolveError } from "./lib/errors.js";
+import { ConfigError, ConflictError, NotFoundError, OwError, ResolveError } from "./lib/errors.js";
 import {
   MachineStore,
   appendLifecycleIntent,
@@ -37,6 +38,8 @@ import { readToml } from "./lib/toml.js";
 import {
   DeclaredLifecycle,
   MARKER_DIR,
+  OwnEdge,
+  OwnKind,
   ProjectInfo,
   Workspace,
   discoverProjects,
@@ -47,9 +50,18 @@ import {
   locationOfDeclared,
   openWorkspace,
   readDeclaredLifecycle,
+  readOwns,
   readProjectUid,
   writeDeclaredLifecycle,
+  writeOwns,
 } from "./lib/workspace.js";
+import {
+  ResolvedOwn,
+  buildOwnershipGraph,
+  classifyRef,
+  detectCycle,
+  resolveOwnRef,
+} from "./lib/owns.js";
 import {
   adoptLocation,
   applyReconcile,
@@ -78,7 +90,7 @@ const USAGE = `projects — OpenWorkspace CLI
 
 Workspace
   projects home init                      initialize the workspace marker here
-  projects home list [--all] [--json]     discover projects (live scan; --all includes shelves)
+  projects home list [--all] [--owner <ref>] [--json]   discover projects (live scan; --all includes shelves; --owner filters to a parent's subproject children)
   projects home scan [--json]             full workspace scan (projects + tasks + attention)
   projects home doctor [--json]           workspace + every project's invariant checks
   projects home mint-suffix [<suffix>|--clear]   this machine's ID suffix (e.g. "mini" → task-7-mini)
@@ -87,7 +99,7 @@ Workspace
 
 Projects
   projects init [<path>]                  stamp the full _project/ skeleton (default: the cwd)
-  projects new <name>                     create ./<name>/ and stamp the skeleton
+  projects new <name> [--parent <ref>] [--kind subproject|code|remote]   create ./<name>/ and stamp the skeleton (--parent links it under a parent via [[owns]])
   projects show [--project <ref>] [--json]
   projects doctor [--project <ref>] [--json]
   projects rename <new-name> [--project <ref>]
@@ -114,6 +126,12 @@ Tasks (records ride the branch: writes are worktree-local)
 Decisions
   projects decision new "title" [--expected "..."] · accept <id> · list [--status S]
                        show <id> · supersede <id> --by <id>     (+ --project, --json)
+
+Project graph (typed [[owns]] edges, canonical on the parent)
+  projects link add <child-ref> [--project <owner>] [--kind subproject|code|remote] [--name <n>] [--lifecycle <l>]
+  projects link rm <child-ref> [--project <owner>]
+  projects link list [--project <owner>] [--json]
+  projects tree [--project <ref>] [--json]   show the ownership graph
 
 Plan
   projects plan show [--project <ref>] [--json] · plan open
@@ -408,9 +426,25 @@ function cmdHome(argv: string[]): void {
       return;
     }
     case "list": {
-      const { values } = parse(rest, { ...FLAG_JSON, all: { type: "boolean", default: false } });
+      const { values } = parse(rest, {
+        ...FLAG_JSON,
+        all: { type: "boolean", default: false },
+        owner: { type: "string" },
+      });
       const ws = openWorkspaceRegistered(process.cwd());
-      const projects = discoverProjects(ws, { all: values["all"] === true });
+      let projects = discoverProjects(ws, { all: values["all"] === true });
+      if (values["owner"] !== undefined) {
+        // Filter to the subproject children declared by the owner's [[owns]].
+        const owner = resolveProject(values["owner"] as string);
+        const result = readOwns(owner.root);
+        const childRoots = new Set(
+          result.owns
+            .map((e) => resolveOwnRef(ws, e))
+            .filter((r) => r.localPath !== null)
+            .map((r) => path.resolve(r.localPath as string)),
+        );
+        projects = projects.filter((p) => childRoots.has(path.resolve(p.root)));
+      }
       if (values["json"] === true) printJson(projects);
       else if (projects.length === 0) print("no projects found");
       else
@@ -519,12 +553,33 @@ function cmdInit(argv: string[]): void {
 }
 
 function cmdNew(argv: string[]): void {
-  const { values, positionals } = parse(argv, FLAG_JSON);
+  const { values, positionals } = parse(argv, {
+    ...FLAG_JSON,
+    parent: { type: "string" },
+    kind: { type: "string" },
+  });
   const name = positionals[0];
   if (name === undefined || name.trim() === "") throw new ConfigError('usage: projects new "Name"');
   const result = initProject(path.resolve(process.cwd(), name));
+
+  // --parent: write the [[owns]] edge ON THE PARENT (the edge is parent-
+  // canonical). The child's ref is its ws-relative path from ws.root, so it
+  // round-trips through resolveOwnRef.
+  let parentRoot: string | null = null;
+  if (values["parent"] !== undefined) {
+    const kind = parseOwnKind(values["kind"]);
+    const parent = resolveProject(values["parent"] as string);
+    parentRoot = parent.root;
+    const ws = findWorkspaceRoot(result.projectRoot);
+    const childRef =
+      ws !== null ? path.relative(ws, result.projectRoot) : result.projectRoot;
+    const owns = readOwns(parent.root).owns;
+    owns.push({ ref: childRef, kind, name: null, lifecycle: null });
+    writeOwns(parent.root, owns);
+  }
+
   seedProjectResolution(result.projectRoot, result.uid);
-  if (values["json"] === true) printJson(result);
+  if (values["json"] === true) printJson({ ...result, parent: parentRoot });
   else print(`created project ${name} at ${result.projectRoot} (uid ${result.uid})`);
 }
 
@@ -995,6 +1050,338 @@ function cmdDecision(argv: string[]): void {
         `unknown decision subcommand: ${sub ?? "(none)"} (expected new|accept|list|show|supersede)`,
       );
   }
+}
+
+// --- link (project graph: typed [[owns]] edges, canonical on the parent) ---
+
+const OWN_KIND_VALUES: ReadonlyArray<OwnKind> = ["subproject", "code", "remote"];
+
+function parseOwnKind(value: unknown): OwnKind {
+  if (value === undefined) return "subproject";
+  if (typeof value !== "string" || !(OWN_KIND_VALUES as readonly string[]).includes(value)) {
+    throw new ConfigError(`bad --kind "${String(value)}" (expected subproject|code|remote)`);
+  }
+  return value as OwnKind;
+}
+
+function parseEdgeLifecycle(value: unknown): DeclaredLifecycle | null {
+  if (value === undefined) return null;
+  if (value !== "active" && value !== "dormant" && value !== "archived") {
+    throw new ConfigError(`bad --lifecycle "${String(value)}" (expected active|dormant|archived)`);
+  }
+  return value;
+}
+
+/** Canonicalize a path for identity comparison; falls back to resolve when the
+ *  path does not exist (so a missing ref still compares structurally). */
+function realpathOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Render one resolved owns edge for `link list` / errors. */
+function resolvedOwnLine(r: ResolvedOwn): string {
+  const name = r.edge.name !== null ? ` "${r.edge.name}"` : "";
+  const lc = r.lifecycle !== null ? ` [${r.lifecycle}]` : "";
+  return `${r.edge.ref} (${r.edge.kind})${name} -> ${r.status}${lc}`;
+}
+
+function cmdLink(argv: string[]): void {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  const common: Spec = { ...FLAG_JSON, ...FLAG_PROJECT };
+
+  switch (sub) {
+    case "add": {
+      const { values, positionals } = parse(rest, {
+        ...common,
+        kind: { type: "string" },
+        name: { type: "string" },
+        lifecycle: { type: "string" },
+      });
+      const childRef = positionals[0];
+      if (childRef === undefined || childRef.trim() === "") {
+        throw new ConfigError("usage: projects link add <child-ref> [--project <owner>]");
+      }
+      const kind = parseOwnKind(values["kind"]);
+      const lifecycle = parseEdgeLifecycle(values["lifecycle"]);
+      const name = (values["name"] as string | undefined) ?? null;
+
+      const owner = resolveProject(values["project"] as string | undefined);
+      const result = readOwns(owner.root);
+      if (result.owns.some((o) => o.ref === childRef)) {
+        throw new ConflictError(`owns edge already exists: ${childRef} (owner ${owner.root})`);
+      }
+
+      const newEdge: OwnEdge = { ref: childRef, kind, name, lifecycle };
+
+      // Self-link guard (best-effort, workspace-independent): refuse a project
+      // owning itself. Compare the child's resolved path to the owner root by
+      // identity, so it fires even OUTSIDE a workspace (where the UID/cycle
+      // guards below are skipped). Remote refs can't be the local owner.
+      if (classifyRef(childRef) !== "remote" && kind !== "remote") {
+        const childAbs = childRef.startsWith("~")
+          ? path.join(os.homedir(), childRef.slice(1).replace(/^[/\\]/, ""))
+          : path.isAbsolute(childRef)
+            ? path.resolve(childRef)
+            : path.resolve(owner.root, childRef);
+        if (realpathOrSelf(childAbs) === realpathOrSelf(owner.root)) {
+          throw new ConfigError(`refusing self-link: ${childRef} resolves to the owner itself`);
+        }
+      }
+
+      // Self-link guard (in-workspace, UID-precise): resolve the child and
+      // reject if it IS the owner.
+      const ws = (() => {
+        try {
+          return openWorkspaceRegistered(process.cwd());
+        } catch {
+          return null;
+        }
+      })();
+      if (ws !== null) {
+        const resolved = resolveOwnRef(ws, newEdge);
+        if (resolved.uid !== null && resolved.uid === owner.uid) {
+          throw new ConfigError(`refusing self-link: ${childRef} resolves to the owner itself`);
+        }
+      }
+
+      // Cycle guard: would this edge create an ownership cycle? Build the graph
+      // as it WOULD be (with the new edge appended) and detect a cycle.
+      if (ws !== null) {
+        const graph = buildOwnershipGraph(ws);
+        const adj = new Map<string, string[]>();
+        const ensure = (k: string): string[] => {
+          let l = adj.get(k);
+          if (l === undefined) {
+            l = [];
+            adj.set(k, l);
+          }
+          return l;
+        };
+        for (const node of graph.nodes) {
+          ensure(node.owner.relPath);
+          for (const e of node.edges) {
+            if (e.uid !== null && e.localPath !== null) {
+              ensure(node.owner.relPath).push(path.relative(ws.root, e.localPath));
+            }
+          }
+        }
+        // Add the prospective edge.
+        const ownerRel = path.relative(ws.root, owner.root);
+        const resolved = resolveOwnRef(ws, newEdge);
+        if (resolved.uid !== null && resolved.localPath !== null) {
+          ensure(ownerRel).push(path.relative(ws.root, resolved.localPath));
+        }
+        const cycle = detectCycle(adj);
+        if (cycle !== null) {
+          throw new ConfigError(`refusing edge — would create an ownership cycle: ${cycle.join(" -> ")}`);
+        }
+      }
+
+      const owns = [...result.owns, newEdge];
+      writeOwns(owner.root, owns);
+      if (values["json"] === true) printJson({ owner: owner.root, edge: newEdge });
+      else print(`linked: ${owner.root} owns ${childRef} (${kind})`);
+      return;
+    }
+    case "rm": {
+      const { values, positionals } = parse(rest, common);
+      const childRef = positionals[0];
+      if (childRef === undefined) throw new ConfigError("usage: projects link rm <child-ref> [--project <owner>]");
+      const owner = resolveProject(values["project"] as string | undefined);
+      const result = readOwns(owner.root);
+      if (!result.owns.some((o) => o.ref === childRef)) {
+        throw new NotFoundError(`no owns edge with ref "${childRef}" on ${owner.root}`);
+      }
+      const owns = result.owns.filter((o) => o.ref !== childRef);
+      writeOwns(owner.root, owns);
+      if (values["json"] === true) printJson({ owner: owner.root, removed: childRef });
+      else print(`unlinked: ${owner.root} no longer owns ${childRef}`);
+      return;
+    }
+    case "list": {
+      const { values } = parse(rest, common);
+      const owner = resolveProject(values["project"] as string | undefined);
+      const result = readOwns(owner.root);
+      const ws = (() => {
+        try {
+          return openWorkspaceRegistered(process.cwd());
+        } catch {
+          return null;
+        }
+      })();
+      const resolved =
+        ws !== null ? result.owns.map((e) => resolveOwnRef(ws, e)) : [];
+      if (values["json"] === true) {
+        printJson(ws !== null ? resolved : result.owns);
+      } else if (result.owns.length === 0) {
+        print("no owns edges");
+      } else if (ws !== null) {
+        for (const r of resolved) print(resolvedOwnLine(r));
+      } else {
+        for (const e of result.owns) print(`${e.ref} (${e.kind})`);
+      }
+      return;
+    }
+    default:
+      throw new ConfigError(`unknown link subcommand: ${sub ?? "(none)"} (expected add|rm|list)`);
+  }
+}
+
+// --- tree (project graph: render the ownership graph) ---
+
+function cmdTree(argv: string[]): void {
+  const { values } = parse(argv, { ...FLAG_JSON, ...FLAG_PROJECT });
+  const ws = openWorkspaceRegistered(process.cwd());
+  const graph = buildOwnershipGraph(ws);
+
+  // Adjacency: owner relPath → its resolved edges. Also track which relPaths
+  // are someone's child (in-ws), to compute the roots.
+  const byRelPath = new Map<string, ResolvedOwn[]>();
+  const childRelPaths = new Set<string>();
+  for (const node of graph.nodes) {
+    byRelPath.set(node.owner.relPath, node.edges);
+    for (const e of node.edges) {
+      if (e.uid !== null && e.localPath !== null) {
+        childRelPaths.add(path.relative(ws.root, e.localPath));
+      }
+    }
+  }
+  const lifecycleByRelPath = new Map<string, DeclaredLifecycle>();
+  for (const node of graph.nodes) lifecycleByRelPath.set(node.owner.relPath, node.owner.effectiveLifecycle);
+
+  // Owner relPath → set of OTHER owners that also declare this in-ws child, so a
+  // back-reference can name where the full subtree was already expanded.
+  const ownersOf = new Map<string, Set<string>>();
+  for (const node of graph.nodes) {
+    for (const e of node.edges) {
+      if (e.uid !== null && e.localPath !== null) {
+        const childRel = path.relative(ws.root, e.localPath);
+        let s = ownersOf.get(childRel);
+        if (s === undefined) {
+          s = new Set<string>();
+          ownersOf.set(childRel, s);
+        }
+        s.add(node.owner.relPath);
+      }
+    }
+  }
+
+  // Determine the subtree root(s).
+  let rootRelPaths: string[];
+  if (values["project"] !== undefined) {
+    const proj = resolveProject(values["project"] as string);
+    rootRelPaths = [path.relative(ws.root, proj.root)];
+  } else {
+    rootRelPaths = graph.nodes
+      .filter((n) => !childRelPaths.has(n.owner.relPath))
+      .map((n) => n.owner.relPath);
+  }
+
+  interface TreeNode {
+    label: string;
+    relPath: string | null; // in-ws project relPath, or null for code/remote leaves
+    children: TreeNode[];
+    cycle: boolean;
+  }
+
+  // A stable node identity for de-duplication across the WHOLE traversal: the
+  // resolved path for in-ws/path children, the URL ref for remote children. A
+  // child reached via multiple owners (legal for code/remote; flagged for
+  // subprojects) is expanded fully the FIRST time and shown as a non-expanded
+  // back-reference afterwards — never re-walked, so no duplicated subtree.
+  const seen = new Set<string>();
+
+  // `visiting` is the current DFS path (ancestors) — a re-encounter of an
+  // ancestor is a cycle. `seen` is global — a re-encounter of an already-fully-
+  // expanded node elsewhere is a shared-child back-reference. Both terminate.
+  const buildNode = (relPath: string, visiting: Set<string>): TreeNode => {
+    const lc = lifecycleByRelPath.get(relPath);
+    const node: TreeNode = {
+      label: `${relPath} (${lc ?? "?"})`,
+      relPath,
+      children: [],
+      cycle: false,
+    };
+    if (visiting.has(relPath)) {
+      node.cycle = true;
+      node.label = `${relPath} (cycle)`;
+      return node;
+    }
+    if (seen.has(relPath)) {
+      // Already expanded under another owner — show as a back-reference and do
+      // NOT re-walk its subtree (no duplication in the rendered tree).
+      const others = [...(ownersOf.get(relPath) ?? [])].filter((o) => o !== relPath);
+      const also = others.length > 0 ? ` (also owned by ${others.join(", ")})` : " (also owned)";
+      node.label = `${relPath} ↗${also}`;
+      return node;
+    }
+    seen.add(relPath);
+    visiting.add(relPath);
+    for (const e of byRelPath.get(relPath) ?? []) {
+      if (e.uid !== null && e.localPath !== null) {
+        node.children.push(buildNode(path.relative(ws.root, e.localPath), visiting));
+      } else {
+        // code/remote/missing leaf. De-dup by resolved identity: a code child
+        // shared by multiple parents (legal) prints once; later occurrences are
+        // a back-reference, never a duplicate.
+        const name = e.edge.name !== null ? ` "${e.edge.name}"` : "";
+        const leafKey = e.localPath !== null ? path.resolve(e.localPath) : e.edge.ref;
+        if (seen.has(leafKey)) {
+          node.children.push({
+            label: `${e.edge.ref} [${e.edge.kind}] ↗ (also owned)${name}`,
+            relPath: null,
+            children: [],
+            cycle: false,
+          });
+        } else {
+          seen.add(leafKey);
+          node.children.push({
+            label: `${e.edge.ref} [${e.edge.kind}] (${e.status})${name}`,
+            relPath: null,
+            children: [],
+            cycle: false,
+          });
+        }
+      }
+    }
+    visiting.delete(relPath);
+    return node;
+  };
+
+  const roots = rootRelPaths.map((rp) => buildNode(rp, new Set<string>()));
+
+  // Whole-graph cycles / SCCs with no acyclic entry point have NO root (every
+  // member is someone's child), so the loop above never visits them. Without
+  // this pass `tree` (default, no --project) would silently drop them. Render
+  // each still-unvisited node as an additional root so EVERY node appears; the
+  // in-loop cycle tagging + the global `seen` set keep it terminating and
+  // duplicate-free. A self-loop (X owns X) renders once here, tagged.
+  if (values["project"] === undefined) {
+    for (const node of graph.nodes) {
+      if (!seen.has(node.owner.relPath)) {
+        roots.push(buildNode(node.owner.relPath, new Set<string>()));
+      }
+    }
+  }
+
+  if (values["json"] === true) {
+    printJson(roots);
+    return;
+  }
+  if (roots.length === 0) {
+    print("no projects found");
+    return;
+  }
+  const render = (node: TreeNode, depth: number): void => {
+    print(`${"  ".repeat(depth)}${node.label}`);
+    for (const c of node.children) render(c, depth + 1);
+  };
+  for (const r of roots) render(r, 0);
 }
 
 // --- plan ---
@@ -1691,6 +2078,12 @@ export function main(argv: string[]): void {
       return;
     case "decision":
       cmdDecision(rest);
+      return;
+    case "link":
+      cmdLink(rest);
+      return;
+    case "tree":
+      cmdTree(rest);
       return;
     case "plan":
       cmdPlan(rest);

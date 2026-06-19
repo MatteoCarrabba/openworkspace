@@ -49,6 +49,134 @@ const DECLARED_LIFECYCLES = new Set<DeclaredLifecycle>([
   "archived",
 ]);
 
+// ---------------------------------------------------------------------------
+// Project graph — typed `[[owns]]` edges (project-graph feature).
+//
+// The ownership edge is CANONICAL ON THE PARENT: a parent's
+// `_project/project.toml` carries an additive `[[owns]]` array, one table per
+// child. There is NO child-side `parent` key — a subproject "is" a subproject
+// purely because some parent's `[[owns]]` points at it. Edge identity is by
+// `ref` (a string the human wrote), not by UID, because a code/remote child
+// may have no UID. The reader is forgiving (mirrors readDeclaredLifecycle): a
+// malformed entry is collected as a non-fatal `problem`, never a throw — so a
+// bad edge never blocks discovery.
+//
+// Backward-compat: smol-toml's parse() returns the whole document and every
+// typed reader picks only its own named keys (readDeclaredLifecycle reads only
+// `lifecycle`/`lifecycle_set`), so the currently-shipped dist/ tolerates a
+// project.toml that ALSO carries `[[owns]]` — old code reads its lifecycle and
+// ignores owns. (Accepted caveat: smol-toml's whole-doc rewrite drops comments;
+// project.toml is a tool-owned declared-facts file, so `[[owns]]` inherits that
+// posture, the same as `lifecycle`.)
+
+export type OwnKind = "subproject" | "code" | "remote";
+
+const OWN_KINDS = new Set<OwnKind>(["subproject", "code", "remote"]);
+
+export interface OwnEdge {
+  /** ws-relative path | absolute/~ path | remote URL — the human-written ref. */
+  ref: string;
+  kind: OwnKind;
+  /** Optional display name. */
+  name: string | null;
+  /** Edge-resident lifecycle for code/remote children (metadata-only). */
+  lifecycle: DeclaredLifecycle | null;
+}
+
+export interface OwnsResult {
+  owns: OwnEdge[];
+  /** Non-fatal; surfaced by doctor, never blocks discovery. */
+  problems: string[];
+}
+
+/**
+ * Read the `[[owns]]` edges from a project's `_project/project.toml`.
+ *
+ * Forgiving, like readDeclaredLifecycle: absent file / absent `owns` → empty;
+ * an unparseable file or a malformed entry becomes a `problem` string, never a
+ * throw. Each surviving entry must have a non-empty string `ref` and a `kind`
+ * in {subproject, code, remote}; `name` and `lifecycle` are optional.
+ */
+export function readOwns(projectRoot: string): OwnsResult {
+  const tomlPath = path.join(projectRoot, "_project", "project.toml");
+  let raw: TomlTable;
+  try {
+    raw = readTomlIfExists(tomlPath);
+  } catch (err) {
+    return { owns: [], problems: [`unparseable project.toml: ${(err as Error).message}`] };
+  }
+  const rawOwns = raw["owns"];
+  if (rawOwns === undefined) return { owns: [], problems: [] };
+  if (!Array.isArray(rawOwns)) return { owns: [], problems: ["owns must be an array of tables"] };
+  const owns: OwnEdge[] = [];
+  const problems: string[] = [];
+  for (const [i, entry] of rawOwns.entries()) {
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      problems.push(`owns[${i}] is not a table`);
+      continue;
+    }
+    const e = entry as Record<string, unknown>;
+    const ref = e["ref"];
+    if (typeof ref !== "string" || ref === "") {
+      problems.push(`owns[${i}] missing string ref`);
+      continue;
+    }
+    const kind = e["kind"];
+    if (typeof kind !== "string" || !OWN_KINDS.has(kind as OwnKind)) {
+      problems.push(`owns[${i}] (${ref}) bad kind "${String(kind)}" (subproject|code|remote)`);
+      continue;
+    }
+    const nm = e["name"];
+    const lc = e["lifecycle"];
+    const lifecycle =
+      typeof lc === "string" && DECLARED_LIFECYCLES.has(lc as DeclaredLifecycle)
+        ? (lc as DeclaredLifecycle)
+        : null;
+    if (lc !== undefined && lifecycle === null) {
+      problems.push(`owns[${i}] (${ref}) bad lifecycle "${String(lc)}"`);
+    }
+    owns.push({
+      ref,
+      kind: kind as OwnKind,
+      name: typeof nm === "string" && nm !== "" ? nm : null,
+      lifecycle,
+    });
+  }
+  return { owns, problems };
+}
+
+/**
+ * Write the `[[owns]]` edges into `_project/project.toml`, read-modify-write to
+ * PRESERVE every other key (lifecycle/lifecycle_set, P12 lossless). An empty
+ * array SHEDS the key; if that leaves the document empty the file is removed —
+ * exactly like writeDeclaredLifecycle's empty-doc branch.
+ */
+export function writeOwns(projectRoot: string, owns: OwnEdge[]): void {
+  const tomlPath = path.join(projectRoot, "_project", "project.toml");
+  const raw: TomlTable = readTomlIfExists(tomlPath);
+
+  if (owns.length === 0) {
+    delete raw["owns"];
+  } else {
+    raw["owns"] = owns.map((o) => ({
+      ref: o.ref,
+      kind: o.kind,
+      ...(o.name ? { name: o.name } : {}),
+      ...(o.lifecycle ? { lifecycle: o.lifecycle } : {}),
+    }));
+  }
+
+  if (Object.keys(raw).length === 0) {
+    try {
+      fs.unlinkSync(tomlPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    return;
+  }
+  writeToml(tomlPath, raw);
+}
+
 /** Map a declared lifecycle to the location-comparable `Lifecycle` (identity). */
 export function locationOfDeclared(declared: DeclaredLifecycle): Lifecycle {
   return declared;
