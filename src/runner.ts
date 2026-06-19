@@ -152,7 +152,12 @@ function execute(
     env,
     encoding: "utf8",
     ...(manifest.run.timeoutSeconds !== null ? { timeout: manifest.run.timeoutSeconds * 1000 } : {}),
-    killSignal: "SIGTERM",
+    // SIGKILL, not SIGTERM: the timeout is a last-resort runaway killer, and our
+    // canonical leaf (`claude --print`) ignores SIGTERM — with SIGTERM the timeout
+    // fires but the child survives and spawnSync blocks forever on the open pipe
+    // (observed: a briefing-cycle run hung ~13h past its 30-min timeout, silently
+    // blocking every subsequent hourly fire). SIGKILL cannot be caught or ignored.
+    killSignal: "SIGKILL",
   });
   if (result.error !== undefined && (result.error as NodeJS.ErrnoException).code !== "ETIMEDOUT") {
     throw new ConfigError(`failed to start ${manifest.run.command[0] ?? "?"}: ${result.error.message}`);

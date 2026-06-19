@@ -273,6 +273,28 @@ test("runner: timeout_seconds terminates the child and reports failed/timed out"
   assert.match(fs.readFileSync(outcome.logPath as string, "utf8"), /timed out/);
 });
 
+test("runner: timeout kills a child that IGNORES SIGTERM (regression: claude-hang)", { timeout: 15000 }, (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  // A child that traps SIGTERM and keeps running — like `claude --print`, which
+  // ignored SIGTERM and hung a briefing-cycle run ~13h past its timeout. The
+  // timeout MUST escalate to SIGKILL; otherwise this test hangs (caught by the
+  // 15s test timeout) instead of completing.
+  writeManifest(
+    fx.project.root,
+    "stubborn",
+    nodeCommandToml(`process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)`) + `timeout_seconds = 1\n`,
+  );
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "stubborn",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(outcome.status, "failed");
+  assert.match(fs.readFileSync(outcome.logPath as string, "utf8"), /timed out/);
+});
+
 test("runner: on_dormant_project — stop skips (movement signals lifecycle); continue runs", (t) => {
   const fx = makeFixture({ projectRel: path.join("Dormant Projects", "Sleeper") });
   t.after(fx.cleanup);
