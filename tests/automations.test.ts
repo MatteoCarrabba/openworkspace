@@ -185,13 +185,48 @@ brief = { type = "api", endpoint = "https://example.com" }
   assert.deepEqual(manifest.machines, ["mini", MACHINE]);
   assert.equal(manifest.schedule.cron, "0 6 * * *");
   assert.equal(manifest.schedule.missPolicy, "catch-up");
+  assert.equal(manifest.schedule.misfireGraceSeconds, 300);
+  assert.equal(manifest.schedule.maxCatchUp, 3);
   assert.equal(manifest.schedule.timezone, null);
+  assert.equal(manifest.run.kind, "other");
   assert.equal(manifest.run.directExec, false);
   assert.equal(manifest.run.timeoutSeconds, 600);
+  assert.equal(manifest.run.overlapPolicy, "skip");
+  assert.equal(manifest.run.maxConcurrency, 1);
   assert.deepEqual(manifest.secrets, { PLAID_SECRET: "op://AI Secrets/Plaid/secret" });
   assert.equal(manifest.onDormantProject, "stop");
   assert.equal(manifest.signature.inputs[0]?.path, "Finance/ledger.beancount");
   assert.equal(manifest.signature.outputs[0]?.type, "api");
+});
+
+test("manifest: Runtime v2 provider-neutral fields parse with defaults and validation", () => {
+  const parsed = validateManifest(
+    parseToml(`machines=["m"]\n[schedule]\ncron="0 9 * * *"\nmiss_policy="coalesce"\nmisfire_grace_seconds=60\nmax_catch_up=5\n[run]\nkind="codex"\ncommand=["codex", "exec"]\noverlap_policy="allow"\nmax_concurrency=2\n`),
+    { dirName: "auto" },
+  );
+  assert.deepEqual(parsed.problems, []);
+  assert.equal(parsed.manifest?.schedule.missPolicy, "coalesce");
+  assert.equal(parsed.manifest?.schedule.misfireGraceSeconds, 60);
+  assert.equal(parsed.manifest?.schedule.maxCatchUp, 5);
+  assert.equal(parsed.manifest?.run.kind, "codex");
+  assert.equal(parsed.manifest?.run.overlapPolicy, "allow");
+  assert.equal(parsed.manifest?.run.maxConcurrency, 2);
+
+  const codes = validateManifest(
+    parseToml(`machines=["m"]\n[schedule]\ncron="0 9 * * *"\nmisfire_grace_seconds=0\nmax_catch_up=-1\n[run]\nkind="llama"\ncommand=["/bin/true"]\noverlap_policy="mystery"\nmax_concurrency=0\n`),
+    { dirName: "auto" },
+  ).problems.map((p) => p.code);
+  assert.ok(codes.includes("misfire_grace_seconds"));
+  assert.ok(codes.includes("max_catch_up"));
+  assert.ok(codes.includes("run-kind"));
+  assert.ok(codes.includes("overlap_policy"));
+  assert.ok(codes.includes("max_concurrency"));
+
+  const allowWithoutConcurrency = validateManifest(
+    parseToml(`machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\noverlap_policy="allow"\n`),
+    { dirName: "auto" },
+  );
+  assert.ok(allowWithoutConcurrency.problems.some((p) => p.code === "overlap_policy" && /max_concurrency/.test(p.message)));
 });
 
 test("manifest: calendar_interval (table and array) normalizes to launchd entries", () => {
@@ -305,7 +340,7 @@ test("manifest: [run] env validation — non-string values, pointer-shaped value
 test("manifest: run.env under direct_exec is a WARNING, not an error (plists carry no env)", () => {
   const { manifest, problems, warnings } = validateManifest(
     parseToml(
-      `machines=["m"]\n[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\ndirect_exec=true\nenv = { FOO = "bar" }\n`,
+      `machines=["m"]\n[schedule]\ncron="0 9 * * *"\nmiss_policy="catch-up"\n[run]\ncommand=["/bin/true"]\ndirect_exec=true\ntimeout_seconds=60\noverlap_policy="allow"\nmax_concurrency=2\nenv = { FOO = "bar" }\n`,
     ),
     { dirName: "auto" },
   );
@@ -314,6 +349,9 @@ test("manifest: run.env under direct_exec is a WARNING, not an error (plists car
   assert.ok(
     warnings.some((w) => w.code === "direct-exec-env" && /launchd login environment/.test(w.message)),
   );
+  assert.ok(warnings.some((w) => w.code === "direct-exec-miss-policy"));
+  assert.ok(warnings.some((w) => w.code === "direct-exec-overlap-policy"));
+  assert.ok(warnings.some((w) => w.code === "direct-exec-timeout"));
 });
 
 // ---------------------------------------------------------------------------
@@ -850,17 +888,52 @@ test("status: active-but-INVALID manifest is VISIBLE — locally and via a remot
   assert.ok(!status(fx.ctx).some((f) => f.kind === "remote-activated-undeclared" && f.name === "cal-shape"));
 });
 
-test("doctor: miss_policy beyond 'skip' warns that fire-time enforcement is not implemented", (t) => {
+test("doctor: Runtime v2 policy warnings match current support", (t) => {
   const fx = makeFixture();
   t.after(fx.cleanup);
-  writeManifest(fx.project.root, "nightly", GOOD_MANIFEST.replace('miss_policy = "skip"', 'miss_policy = "fail-loud"'));
-  const issues = doctorProject(fx.project.root);
-  const warns = issues.filter((i) => /miss_policy = "fail-loud" is recorded/.test(i.message));
-  assert.equal(warns.length, 1);
-  assert.equal(warns[0]?.severity, "warn");
-  // the default stays quiet
-  writeManifest(fx.project.root, "nightly", GOOD_MANIFEST);
-  assert.ok(!doctorProject(fx.project.root).some((i) => /miss_policy/.test(i.message)));
+  const warningsFor = (toml: string): string[] => {
+    writeManifest(fx.project.root, "nightly", toml);
+    return doctorProject(fx.project.root)
+      .filter((i) => i.severity === "warn")
+      .map((i) => i.message);
+  };
+
+  assert.ok(
+    warningsFor(GOOD_MANIFEST.replace('miss_policy = "skip"', 'miss_policy = "fail-loud"')).some((m) =>
+      /miss_policy = "fail-loud".*reserved/.test(m),
+    ),
+  );
+  assert.ok(
+    warningsFor(GOOD_MANIFEST.replace('miss_policy = "skip"', 'miss_policy = "coalesce"')).some((m) =>
+      /miss_policy = "coalesce".*reserved/.test(m),
+    ),
+  );
+  assert.ok(
+    !warningsFor(GOOD_MANIFEST.replace('miss_policy = "skip"', 'miss_policy = "catch-up"')).some((m) =>
+      /miss_policy/.test(m),
+    ),
+  );
+  assert.ok(!warningsFor(GOOD_MANIFEST).some((m) => /miss_policy/.test(m)));
+
+  assert.ok(
+    warningsFor(
+      GOOD_MANIFEST.replace("[run]\ncommand", '[run]\noverlap_policy = "queue"\ncommand'),
+    ).some((m) => /overlap_policy = "queue".*reserved/.test(m)),
+  );
+  assert.ok(
+    !warningsFor(
+      GOOD_MANIFEST.replace("[run]\ncommand", '[run]\noverlap_policy = "allow"\nmax_concurrency = 2\ncommand'),
+    ).some((m) => /overlap_policy/.test(m)),
+  );
+
+  const directExec = GOOD_MANIFEST
+    .replace('miss_policy = "skip"', 'miss_policy = "catch-up"\nmisfire_grace_seconds = 60\nmax_catch_up = 2')
+    .replace("[run]\ncommand", "[run]\ndirect_exec = true\nmax_concurrency = 2\ncommand");
+  const directWarnings = warningsFor(directExec);
+  assert.ok(directWarnings.some((m) => /miss_policy = "catch-up".*direct_exec = true/.test(m)));
+  assert.ok(directWarnings.some((m) => /misfire_grace_seconds.*direct_exec = true/.test(m)));
+  assert.ok(directWarnings.some((m) => /max_catch_up.*direct_exec = true/.test(m)));
+  assert.ok(directWarnings.some((m) => /max_concurrency.*direct_exec = true/.test(m)));
 });
 
 // ---------------------------------------------------------------------------
@@ -918,6 +991,10 @@ test("cli: automation apply/list/status/run-now/deactivate against the fake laun
   const st = runCli(["automation", "status", "--json"], fx.project.root, env);
   assert.equal(st.status, 0, st.stderr);
   assert.deepEqual(JSON.parse(st.stdout), []);
+  const stHuman = runCli(["automation", "status"], fx.project.root, env);
+  assert.equal(stHuman.status, 0, stHuman.stderr);
+  assert.match(stHuman.stdout, /no activation drift found/);
+  assert.match(stHuman.stdout, /runtime health not checked/);
 
   const run = runCli(["automation", "run-now", "nightly", "--json"], fx.project.root, env);
   assert.equal(run.status, 0, run.stderr);
@@ -926,6 +1003,29 @@ test("cli: automation apply/list/status/run-now/deactivate against the fake laun
   assert.ok(fs.existsSync(marker), "run-now must execute the command");
   assert.match(fs.readFileSync(marker, "utf8"), /ran via /);
   assert.ok(outcome.logPath.includes(path.join("logs", MACHINE)));
+
+  const supervised = runCli(["automation", "supervise", "--json"], fx.project.root, env);
+  assert.equal(supervised.status, 0, supervised.stderr);
+  const supervisorSummary = JSON.parse(supervised.stdout) as { checked: number; abandoned: number; findings: Array<{ kind: string }> };
+  assert.equal(supervisorSummary.checked, 1);
+  assert.equal(supervisorSummary.abandoned, 0);
+  assert.equal(supervisorSummary.findings[0]?.kind, "no-current-run");
+
+  const supervisorApply = runCli(["automation", "supervisor", "apply", "--interval", "60", "--json"], fx.project.root, env);
+  assert.equal(supervisorApply.status, 0, supervisorApply.stderr);
+  const supervisorApplyJson = JSON.parse(supervisorApply.stdout) as { action: string; label: string; intervalSeconds: number };
+  assert.equal(supervisorApplyJson.action, "installed");
+  assert.equal(supervisorApplyJson.label, "com.openworkspace.supervisor");
+  assert.equal(supervisorApplyJson.intervalSeconds, 60);
+  const supervisorStatus = runCli(["automation", "supervisor", "status", "--json"], fx.project.root, env);
+  assert.equal(supervisorStatus.status, 0, supervisorStatus.stderr);
+  assert.deepEqual(
+    (({ installed, loaded }) => ({ installed, loaded }))(JSON.parse(supervisorStatus.stdout) as { installed: boolean; loaded: boolean }),
+    { installed: true, loaded: true },
+  );
+  const supervisorOff = runCli(["automation", "supervisor", "deactivate"], fx.project.root, env);
+  assert.equal(supervisorOff.status, 0, supervisorOff.stderr);
+  assert.match(supervisorOff.stdout, /deactivated com\.openworkspace\.supervisor/);
 
   const off = runCli(["automation", "deactivate", "nightly"], fx.project.root, env);
   assert.equal(off.status, 0, off.stderr);

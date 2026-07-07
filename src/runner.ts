@@ -26,13 +26,14 @@
  * documented baked-path fallback. No real TCC work is attempted here.
  */
 
+import * as crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 
 import { recordRegistryRunOutcome } from "./init.js";
-import { ConfigError, OwError } from "./lib/errors.js";
+import { ConfigError, ConflictError, OwError } from "./lib/errors.js";
 import { ensureDir, writeFileAtomic } from "./lib/fsatomic.js";
 import { MachineStore, machineId, openMachineStore } from "./lib/machine.js";
 import { findWorkspaceRoot, lifecycleOf, loadWorkspaceConfig } from "./lib/workspace.js";
@@ -40,12 +41,22 @@ import {
   AutomationManifest,
   loadManifest,
   resolveUidToCanonical,
+  scheduleSummary,
 } from "./primitives/automations.js";
+import {
+  AttemptTrigger,
+  TerminalAttemptStatus,
+  acquireLease,
+  createAttempt,
+  finishAttempt,
+  releaseLease,
+  updateAttempt,
+} from "./primitives/automation-runs.js";
 
 /** Logs kept per machine per automation; older ones are reaped after a run. */
 export const LOG_RETENTION = 20;
 
-export type RunStatus = "ok" | "failed" | "skipped-dormant" | "error";
+export type RunStatus = "ok" | "failed" | "skipped-dormant" | "skipped" | "error";
 
 export interface RunOutcome {
   uid: string;
@@ -66,6 +77,7 @@ export interface RunnerOptions {
   env?: NodeJS.ProcessEnv;
   now?: () => Date;
   extraWorkspaceRoots?: string[];
+  trigger?: AttemptTrigger;
 }
 
 function stamp(d: Date): string {
@@ -74,6 +86,24 @@ function stamp(d: Date): string {
 
 function iso(d: Date): string {
   return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
+
+function argvHash(command: string[]): string {
+  return `sha256:${crypto.createHash("sha256").update(JSON.stringify(command)).digest("hex")}`;
+}
+
+function attemptStatusFor(status: RunStatus): TerminalAttemptStatus {
+  switch (status) {
+    case "ok":
+      return "succeeded";
+    case "skipped":
+    case "skipped-dormant":
+      return "skipped";
+    case "error":
+      return "error";
+    case "failed":
+      return "failed";
+  }
 }
 
 /**
@@ -177,115 +207,282 @@ export function runAutomation(options: RunnerOptions): RunOutcome {
   const nowFn = options.now ?? (() => new Date());
   const started = nowFn();
   const machine = machineId(store);
+  const attempt = createAttempt({
+    store,
+    uid,
+    name,
+    machine,
+    trigger: options.trigger ?? "calendar",
+    now: started,
+    startedAt: iso(started),
+    heartbeatAt: iso(started),
+    owner: { runner_pid: process.pid },
+    logs: { publish_status: "pending" },
+  });
+  let leaseToken: string | null = null;
+  let attemptOpen = true;
 
-  // 1. UID → canonical (loud ResolveError, exit 2 — never a guess)
-  const canonicalRoot = resolveUidToCanonical(uid, store, options.extraWorkspaceRoots ?? []);
-
-  const workspaceRoot = findWorkspaceRoot(canonicalRoot);
-  const config = workspaceRoot !== null ? loadWorkspaceConfig(workspaceRoot) : null;
-
-  const logDir = path.join(canonicalRoot, "_project", "automations", name, "logs", machine);
-  const logPath = path.join(logDir, `${stamp(started)}.log`);
-  // `header` must work BEFORE the manifest loads: a manifest-load failure is
-  // itself a logged + registry-recorded outcome (§7.1 pins the contract).
-  let loadedManifest: AutomationManifest | null = null;
-  const header = (status: string, extra: string[]): string =>
-    [
-      `# automation: ${name}`,
-      `# project_uid: ${uid}`,
-      `# machine: ${machine}`,
-      `# started: ${iso(started)}`,
-      `# command: ${loadedManifest !== null ? loadedManifest.run.command.join(" ") : "(manifest unavailable)"}`,
-      ...extra,
-      `# status: ${status}`,
-      ``,
-    ].join("\n");
-
-  const finish = (status: RunStatus, exitCode: number | null, body: string, extra: string[] = []): RunOutcome => {
-    const finished = nowFn();
-    ensureDir(logDir);
-    writeFileAtomic(logPath, header(status, extra) + body);
-    applyLogRetention(logDir);
-    if (workspaceRoot !== null) {
-      recordRegistryRunOutcome(
-        workspaceRoot,
-        machine,
-        {
-          project_uid: uid,
-          name,
-          started_at: iso(started),
-          finished_at: iso(finished),
-          status,
-          ...(exitCode !== null ? { exit_code: exitCode } : {}),
-          log: path.relative(workspaceRoot, logPath),
-        },
-        finished,
-      );
+  const closeAttempt = (
+    status: TerminalAttemptStatus,
+    finished: Date,
+    extra: {
+      reason?: string;
+      exitCode?: number | null;
+      logPath?: string | null;
+      workspaceRoot?: string | null;
+    } = {},
+  ): void => {
+    const outcome: Record<string, unknown> = {};
+    if (extra.exitCode !== undefined && extra.exitCode !== null) outcome["exit_code"] = extra.exitCode;
+    if (extra.reason !== undefined) outcome["reason"] = extra.reason;
+    finishAttempt({
+      store,
+      uid,
+      name,
+      runId: attempt.run_id,
+      status,
+      now: finished,
+      ...(extra.reason !== undefined ? { reason: extra.reason } : {}),
+      ...(Object.keys(outcome).length > 0 ? { outcome } : {}),
+      logs: {
+        ...(extra.logPath !== undefined && extra.logPath !== null
+          ? {
+              published_path:
+                extra.workspaceRoot !== undefined && extra.workspaceRoot !== null
+                  ? path.relative(extra.workspaceRoot, extra.logPath)
+                  : extra.logPath,
+              publish_status: "published",
+            }
+          : { publish_status: "skipped" }),
+      },
+    });
+    attemptOpen = false;
+    if (leaseToken !== null) {
+      releaseLease({ store, uid, name, token: leaseToken });
+      leaseToken = null;
     }
+  };
+
+  try {
+    const lease = acquireLease({
+      store,
+      uid,
+      name,
+      machine,
+      runId: attempt.run_id,
+      runnerPid: process.pid,
+      now: started,
+      ttlSeconds: 6 * 60 * 60,
+    });
+    leaseToken = lease.lease_token;
+  } catch (err) {
+    if (!(err instanceof ConflictError)) throw err;
+    const finished = nowFn();
+    closeAttempt("skipped", finished, { reason: err.message });
     return {
       uid,
       name,
       machine,
-      status,
-      exitCode,
-      logPath,
+      status: "skipped",
+      exitCode: null,
+      logPath: null,
       startedAt: iso(started),
       finishedAt: iso(finished),
     };
-  };
+  }
 
-  // 2. the manifest, read fresh from the live tree. A missing/invalid
-  // manifest still honors the runner's contract: the failure is written to
-  // the machine-partitioned log and recorded as an error outcome in the
-  // registry BEFORE the error propagates — otherwise a corrupted manifest
-  // silently kills a scheduled automation behind a fresh heartbeat and a
-  // registry forever showing the last successful run.
-  let manifest: AutomationManifest;
   try {
-    manifest = loadManifest(canonicalRoot, name);
-    loadedManifest = manifest;
+    updateAttempt(
+      store,
+      uid,
+      name,
+      attempt.run_id,
+      { phase: "resolving", owner: { lease_token: leaseToken ?? undefined, runner_pid: process.pid } },
+      nowFn(),
+    );
+
+    // 1. UID → canonical (loud ResolveError, exit 2 — never a guess)
+    const canonicalRoot = resolveUidToCanonical(uid, store, options.extraWorkspaceRoots ?? []);
+
+    const workspaceRoot = findWorkspaceRoot(canonicalRoot);
+    const config = workspaceRoot !== null ? loadWorkspaceConfig(workspaceRoot) : null;
+
+    const logDir = path.join(canonicalRoot, "_project", "automations", name, "logs", machine);
+    const logPath = path.join(logDir, `${stamp(started)}.log`);
+    // `header` must work BEFORE the manifest loads: a manifest-load failure is
+    // itself a logged + registry-recorded outcome (§7.1 pins the contract).
+    let loadedManifest: AutomationManifest | null = null;
+    const header = (status: string, extra: string[]): string =>
+      [
+        `# automation: ${name}`,
+        `# project_uid: ${uid}`,
+        `# machine: ${machine}`,
+        `# started: ${iso(started)}`,
+        `# run_id: ${attempt.run_id}`,
+        `# command: ${loadedManifest !== null ? loadedManifest.run.command.join(" ") : "(manifest unavailable)"}`,
+        ...extra,
+        `# status: ${status}`,
+        ``,
+      ].join("\n");
+
+    const finish = (
+      status: RunStatus,
+      exitCode: number | null,
+      body: string,
+      extra: string[] = [],
+      terminalStatus: TerminalAttemptStatus = attemptStatusFor(status),
+      reason?: string,
+    ): RunOutcome => {
+      const finished = nowFn();
+      ensureDir(logDir);
+      writeFileAtomic(logPath, header(status, extra) + body);
+      applyLogRetention(logDir);
+      if (workspaceRoot !== null) {
+        recordRegistryRunOutcome(
+          workspaceRoot,
+          machine,
+          {
+            project_uid: uid,
+            name,
+            run_id: attempt.run_id,
+            started_at: iso(started),
+            finished_at: iso(finished),
+            status,
+            ...(exitCode !== null ? { exit_code: exitCode } : {}),
+            log: path.relative(workspaceRoot, logPath),
+          },
+          finished,
+        );
+      }
+      closeAttempt(terminalStatus, finished, {
+        reason,
+        exitCode,
+        logPath,
+        workspaceRoot,
+      });
+      return {
+        uid,
+        name,
+        machine,
+        status,
+        exitCode,
+        logPath,
+        startedAt: iso(started),
+        finishedAt: iso(finished),
+      };
+    };
+
+    // 2. the manifest, read fresh from the live tree. A missing/invalid
+    // manifest still honors the runner's contract: the failure is written to
+    // the machine-partitioned log and recorded as an error outcome in the
+    // registry BEFORE the error propagates — otherwise a corrupted manifest
+    // silently kills a scheduled automation behind a fresh heartbeat and a
+    // registry forever showing the last successful run.
+    let manifest: AutomationManifest;
+    updateAttempt(store, uid, name, attempt.run_id, { phase: "loading-manifest" }, nowFn());
+    try {
+      manifest = loadManifest(canonicalRoot, name);
+      loadedManifest = manifest;
+      const deadline =
+        manifest.run.timeoutSeconds !== null
+          ? iso(new Date(started.getTime() + manifest.run.timeoutSeconds * 1000))
+          : undefined;
+      updateAttempt(
+        store,
+        uid,
+        name,
+        attempt.run_id,
+        {
+          schedule: scheduleSummary(manifest),
+          timeout_seconds: manifest.run.timeoutSeconds ?? undefined,
+          deadline_at: deadline,
+          command: {
+            kind: manifest.run.kind,
+            argv0: manifest.run.command[0] ?? "",
+            argv_hash: argvHash(manifest.run.command),
+            env_keys: Object.keys(manifest.run.env),
+            secret_keys: Object.keys(manifest.secrets),
+          },
+        },
+        nowFn(),
+      );
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      finish("error", null, `manifest load failed: ${message}\n`, [], "error", `manifest load failed: ${message}`);
+      throw err;
+    }
+
+    // 3. lifecycle: a non-active project with on_dormant_project = "stop" skips
+    if (workspaceRoot !== null && manifest.onDormantProject === "stop") {
+      const ws = { root: workspaceRoot, config: config ?? loadWorkspaceConfig(workspaceRoot) };
+      const lifecycle = lifecycleOf(ws, canonicalRoot);
+      if (lifecycle !== "active") {
+        return finish(
+          "skipped-dormant",
+          null,
+          `project is ${lifecycle}; on_dormant_project = "stop"\n`,
+          [],
+          "skipped",
+          `project is ${lifecycle}; on_dormant_project = "stop"`,
+        );
+      }
+    }
+
+    // 4. secrets → child ENV only (§7.5); a resolution failure is logged +
+    // recorded as an error outcome, then thrown (the caller maps exit codes)
+    const secretEnv: Record<string, string> = {};
+    updateAttempt(store, uid, name, attempt.run_id, { phase: "resolving-secrets" }, nowFn());
+    try {
+      for (const [key, pointer] of Object.entries(manifest.secrets)) {
+        secretEnv[key] = resolveSecret(key, pointer, config?.secrets.resolvers ?? {}, env);
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      finish("error", null, `secret resolution failed: ${message}\n`, [], "error", `secret resolution failed: ${message}`);
+      throw err;
+    }
+    const secretKeys = Object.keys(secretEnv);
+    const staticEnvKeys = Object.keys(manifest.run.env);
+
+    // 5–7. execute (the §7.4 seam), log, retain, record. Child env precedence:
+    // runner base env < [run] env (static, non-secret) < resolved [secrets].
+    updateAttempt(
+      store,
+      uid,
+      name,
+      attempt.run_id,
+      { status: "running", phase: "executing", heartbeat_at: iso(nowFn()) },
+      nowFn(),
+    );
+    let result: { exitCode: number | null; stdout: string; stderr: string; timedOut: boolean };
+    try {
+      result = execute(manifest, canonicalRoot, { ...env, ...manifest.run.env, ...secretEnv });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      finish("error", null, `execution failed before child completion: ${message}\n`, [], "error", message);
+      throw err;
+    }
+    const ok = result.exitCode === 0;
+    const body =
+      `--- stdout ---\n${result.stdout}` +
+      `--- stderr ---\n${result.stderr}` +
+      `--- exit: ${result.exitCode ?? "none"}${result.timedOut ? " (timed out)" : ""} ---\n`;
+    return finish(ok ? "ok" : "failed", result.exitCode, body, [
+      `# secrets: ${secretKeys.length > 0 ? secretKeys.join(", ") : "(none)"} (env-only, values never logged)`,
+      `# env: ${staticEnvKeys.length > 0 ? staticEnvKeys.join(", ") : "(none)"} (static)`,
+    ], result.timedOut ? "timed_out" : undefined);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    finish("error", null, `manifest load failed: ${message}\n`);
+    if (attemptOpen) {
+      const finished = nowFn();
+      try {
+        closeAttempt("error", finished, { reason: err instanceof Error ? err.message : String(err) });
+      } catch {
+        // Preserve the original runner failure; a later ledger write problem
+        // is less useful to the caller than the automation error itself.
+      }
+    }
     throw err;
   }
-
-  // 3. lifecycle: a non-active project with on_dormant_project = "stop" skips
-  if (workspaceRoot !== null && manifest.onDormantProject === "stop") {
-    const ws = { root: workspaceRoot, config: config ?? loadWorkspaceConfig(workspaceRoot) };
-    const lifecycle = lifecycleOf(ws, canonicalRoot);
-    if (lifecycle !== "active") {
-      return finish("skipped-dormant", null, `project is ${lifecycle}; on_dormant_project = "stop"\n`);
-    }
-  }
-
-  // 4. secrets → child ENV only (§7.5); a resolution failure is logged +
-  // recorded as an error outcome, then thrown (the caller maps exit codes)
-  const secretEnv: Record<string, string> = {};
-  try {
-    for (const [key, pointer] of Object.entries(manifest.secrets)) {
-      secretEnv[key] = resolveSecret(key, pointer, config?.secrets.resolvers ?? {}, env);
-    }
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    finish("error", null, `secret resolution failed: ${message}\n`);
-    throw err;
-  }
-  const secretKeys = Object.keys(secretEnv);
-  const staticEnvKeys = Object.keys(manifest.run.env);
-
-  // 5–7. execute (the §7.4 seam), log, retain, record. Child env precedence:
-  // runner base env < [run] env (static, non-secret) < resolved [secrets].
-  const result = execute(manifest, canonicalRoot, { ...env, ...manifest.run.env, ...secretEnv });
-  const ok = result.exitCode === 0;
-  const body =
-    `--- stdout ---\n${result.stdout}` +
-    `--- stderr ---\n${result.stderr}` +
-    `--- exit: ${result.exitCode ?? "none"}${result.timedOut ? " (timed out)" : ""} ---\n`;
-  return finish(ok ? "ok" : "failed", result.exitCode, body, [
-    `# secrets: ${secretKeys.length > 0 ? secretKeys.join(", ") : "(none)"} (env-only, values never logged)`,
-    `# env: ${staticEnvKeys.length > 0 ? staticEnvKeys.join(", ") : "(none)"} (static)`,
-  ]);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +506,7 @@ export function main(argv: string[]): number {
       `${outcome.exitCode !== null ? ` (exit ${outcome.exitCode})` : ""}` +
       `${outcome.logPath !== null ? ` — ${outcome.logPath}` : ""}\n`,
   );
-  return outcome.status === "ok" || outcome.status === "skipped-dormant" ? 0 : 1;
+  return outcome.status === "ok" || outcome.status === "skipped-dormant" || outcome.status === "skipped" ? 0 : 1;
 }
 
 if (require.main === module) {

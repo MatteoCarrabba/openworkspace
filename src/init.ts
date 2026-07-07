@@ -351,6 +351,7 @@ export function removeRegistryActivation(
 export interface RegistryRunOutcome {
   project_uid: string;
   name: string;
+  run_id?: string;
   started_at: string;
   finished_at: string;
   status: string;
@@ -375,6 +376,7 @@ export function recordRegistryRunOutcome(
         finished_at: outcome.finished_at,
         status: outcome.status,
       };
+      if (outcome.run_id !== undefined) entry["run_id"] = outcome.run_id;
       if (outcome.exit_code !== undefined) entry["exit_code"] = outcome.exit_code;
       if (outcome.log !== undefined) entry["log"] = outcome.log;
       lastRuns[`${outcome.project_uid}--${outcome.name}`] = entry;

@@ -18,6 +18,7 @@ import { test } from "node:test";
 
 import { ConfigError, ResolveError } from "../src/lib/errors.js";
 import { readTomlIfExists } from "../src/lib/toml.js";
+import { acquireLease, readAttempt, readLease, readRunState } from "../src/primitives/automation-runs.js";
 import { LOG_RETENTION, applyLogRetention, runAutomation } from "../src/runner.js";
 import { makeTmpDir, makeTmpStore, makeTmpWorkspace, rmrf } from "./helpers.js";
 
@@ -131,9 +132,21 @@ test("runner: resolves UID → canonical, cds there, logs machine-partitioned, r
   const run = lastRun(fx.root, fx.project.uid, "hello");
   assert.equal(run["status"], "ok");
   assert.equal(run["exit_code"], 0);
+  assert.equal(typeof run["run_id"], "string");
   assert.match(String(run["log"]), /logs\/runmach\//);
   const machinesDir = path.join(fx.root, ".openworkspace", "machines");
   assert.deepEqual(fs.readdirSync(machinesDir), [`${MACHINE}.toml`]); // P15: one writer, one file
+
+  const state = readRunState(fx.store, fx.project.uid, "hello");
+  assert.equal(state?.latest_run_id, run["run_id"]);
+  assert.equal(state?.latest_status, "succeeded");
+  assert.equal(state?.last_terminal_run_id, state?.latest_run_id);
+  assert.equal(state?.current_run_id, undefined);
+  assert.equal(readLease(fx.store, fx.project.uid, "hello"), null);
+  const attempt = readAttempt(fx.store, fx.project.uid, "hello", state?.latest_run_id as string);
+  assert.equal(attempt?.command?.kind, "other");
+  assert.equal(attempt?.logs?.publish_status, "published");
+  assert.equal(attempt?.logs?.published_path, run["log"]);
 });
 
 test("runner §7.5: secrets resolve per-run into the child ENV — and NEVER land on disk", (t) => {
@@ -227,6 +240,11 @@ test("runner: a manifest-load failure still writes the log and records the error
   assert.match(content, /# command: \(manifest unavailable\)/);
   assert.ok(!content.includes("--- exit:"), "the command must never have executed");
   assert.equal(lastRun(fx.root, fx.project.uid, "corrupt")["status"], "error");
+  let state = readRunState(fx.store, fx.project.uid, "corrupt");
+  assert.equal(state?.latest_status, "error");
+  let attempt = readAttempt(fx.store, fx.project.uid, "corrupt", state?.latest_run_id as string);
+  assert.match(attempt?.reason ?? "", /manifest load failed/);
+  assert.equal(attempt?.logs?.publish_status, "published");
 
   // a MISSING manifest behaves the same (NotFoundError, still logged + recorded)
   writeManifest(fx.project.root, "ghostly", nodeCommandToml(`console.log('x')`));
@@ -236,6 +254,10 @@ test("runner: a manifest-load failure still writes the log and records the error
   );
   assert.equal(logFiles(fx.project.root, "ghostly").length, 1);
   assert.equal(lastRun(fx.root, fx.project.uid, "ghostly")["status"], "error");
+  state = readRunState(fx.store, fx.project.uid, "ghostly");
+  assert.equal(state?.latest_status, "error");
+  attempt = readAttempt(fx.store, fx.project.uid, "ghostly", state?.latest_run_id as string);
+  assert.match(attempt?.reason ?? "", /manifest load failed/);
 });
 
 test("runner: nonzero exit → failed outcome with the child's exit code", (t) => {
@@ -367,10 +389,11 @@ test("runner: log retention keeps the newest LOG_RETENTION files, own machine di
 test("runner: unresolvable UID is a LOUD ResolveError (exit-2 class) — never a guess", (t) => {
   const fx = makeFixture();
   t.after(fx.cleanup);
+  const missingUid = "33333333-3333-3333-3333-333333333333";
   assert.throws(
     () =>
       runAutomation({
-        uid: "33333333-3333-3333-3333-333333333333",
+        uid: missingUid,
         name: "anything",
         store: fx.store,
         extraWorkspaceRoots: [fx.root],
@@ -382,6 +405,49 @@ test("runner: unresolvable UID is a LOUD ResolveError (exit-2 class) — never a
       return true;
     },
   );
+  const state = readRunState(fx.store, missingUid, "anything");
+  assert.equal(state?.latest_status, "error");
+  assert.equal(state?.current_run_id, undefined);
+  assert.equal(readLease(fx.store, missingUid, "anything"), null);
+  const attempt = readAttempt(fx.store, missingUid, "anything", state?.latest_run_id as string);
+  assert.equal(attempt?.phase, "finished");
+  assert.match(attempt?.reason ?? "", /orphaned/);
+  assert.equal(attempt?.logs?.publish_status, "skipped");
+});
+
+test("runner: overlapping managed run records a skipped attempt and does not execute", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const marker = path.join(fx.project.root, "should-not-run.txt");
+  writeManifest(
+    fx.project.root,
+    "busy",
+    nodeCommandToml(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`),
+  );
+  acquireLease({
+    store: fx.store,
+    uid: fx.project.uid,
+    name: "busy",
+    machine: MACHINE,
+    now: new Date("2026-06-25T16:00:00Z"),
+    ttlSeconds: 60,
+    token: "held-by-other-run",
+  });
+  const outcome = runAutomation({
+    uid: fx.project.uid,
+    name: "busy",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+    now: () => new Date("2026-06-25T16:00:30Z"),
+  });
+  assert.equal(outcome.status, "skipped");
+  assert.equal(outcome.logPath, null);
+  assert.ok(!fs.existsSync(marker), "overlap skip must not execute the command");
+  const state = readRunState(fx.store, fx.project.uid, "busy");
+  assert.equal(state?.latest_status, "skipped");
+  const attempt = readAttempt(fx.store, fx.project.uid, "busy", state?.latest_run_id as string);
+  assert.match(attempt?.reason ?? "", /lease is already held/);
+  assert.equal(readLease(fx.store, fx.project.uid, "busy")?.lease_token, "held-by-other-run");
 });
 
 test("runner: project rename mid-flight is transparent (late binding re-resolves)", (t) => {

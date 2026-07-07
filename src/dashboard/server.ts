@@ -13,7 +13,10 @@
  *   set is still rejected — the DNS-rebinding defense is intact, just
  *   extensible.
  * - GET /api/scan returns a live workspace scan: projects with lifecycle,
- *   tasks (dotted hierarchy + truthful rollups), attention counts
+ *   tasks (dotted hierarchy + truthful rollups), attention counts. The HTTP
+ *   scan is body-light for survey speed; task bodies load through /api/task.
+ * - GET /api/task?project=<uid>&task=<id> returns one full task record for the
+ *   detail pane.
  *   (waiting / review / tasks-unhidden-today / doctor error count).
  * - Zero stored state, zero mutation endpoints: GET/HEAD only, 405 otherwise.
  *
@@ -26,12 +29,14 @@
  * `collectDoctorIssues` if full delegation is ever wanted.
  */
 
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
+import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
 import {
   Lifecycle,
@@ -44,6 +49,14 @@ import {
   openWorkspace,
 } from "../lib/workspace.js";
 import { scanManifests } from "../primitives/automations.js";
+import {
+  automationStatePath,
+  computeRunHealth,
+  computeRunState,
+  readAttempt,
+} from "../primitives/automation-runs.js";
+import type { MachineStore } from "../lib/machine.js";
+import type { ComputedRunHealth, ComputedRunState } from "../primitives/automation-runs.js";
 
 // ---------------------------------------------------------------------------
 // Scan model
@@ -69,7 +82,7 @@ export interface ScanTask {
   updated: string | null;
   parentId: string | null; // derived purely from the dotted ID
   depth: number; // 0 = top-level
-  body: string; // record body for the detail pane
+  body: string; // full in direct scans/detail endpoint; empty in body-light HTTP scans
   rollup: TaskRollup | null; // present only when the task has descendants
 }
 
@@ -104,12 +117,19 @@ export interface ScanResult {
   doctor: { errors: DoctorIssue[] };
 }
 
+export interface TaskDetailResult {
+  generatedAt: string;
+  workspace: { root: string; name: string; workspaceId: string | null };
+  project: { uid: string; relPath: string; name: string; lifecycle: Lifecycle };
+  task: ScanTask;
+}
+
 // ---------------------------------------------------------------------------
 // Automations scan model (§7.3 / §8.2 — "which automations exist, and WHICH
 // ARE ACTIVE AND WHERE"). Read-only: the synced per-machine registries
 // (.openworkspace/machines/<id>.toml) joined against each project's declared
-// automation manifests. No launchctl, no App Support store — this is the
-// cross-machine VIEW the dashboard can render from the synced tree alone.
+// automation manifests. The only machine-local read is a bounded state.toml →
+// single attempt lookup for this host's latest run, when that pointer exists.
 
 /** One machine's view of an automation, drawn from its synced registry. */
 export interface AutomationMachineState {
@@ -136,6 +156,28 @@ export interface AutomationDrift {
   detail: string;
 }
 
+export type AutomationLocalRunUnavailableReason =
+  | "state-file-missing"
+  | "state-file-invalid"
+  | "state-file-missing-run-id"
+  | "attempt-missing"
+  | "attempt-invalid"
+  | "direct-exec-unobservable";
+
+export interface AutomationLocalRun {
+  source: "state-file" | "attempt";
+  runId: string | null;
+  state: ComputedRunState;
+  health: ComputedRunHealth;
+  status: string | null;
+  phase: string | null;
+  startedAt: string | null;
+  updatedAt: string | null;
+  heartbeatAt: string | null;
+  finishedAt: string | null;
+  reason: string | null;
+}
+
 export interface ScanAutomation {
   /** Stable key: `<project relPath>/<name>`. */
   key: string;
@@ -144,9 +186,21 @@ export interface ScanAutomation {
   /** Declared placement intent (manifest `machines`); empty when invalid/absent. */
   declaredMachines: string[];
   schedule: string | null;
+  /** Manifest [run].kind, descriptive only. */
+  kind: string | null;
+  missPolicy: string | null;
+  misfireGraceSeconds: number | null;
+  maxCatchUp: number | null;
+  overlapPolicy: string | null;
+  maxConcurrency: number | null;
   /** Manifest validity — an invalid manifest hard-fails every fire. */
   valid: boolean;
   problems: string[];
+  /** Latest known local machine run state, if a single cheap state pointer exists. */
+  localRunState: ComputedRunState;
+  localRunHealth: ComputedRunHealth;
+  localRun: AutomationLocalRun | null;
+  localRunUnavailable: AutomationLocalRunUnavailableReason | null;
   /** Per-machine state, one entry per machine that declares OR activates it. */
   machines: AutomationMachineState[];
   /** Machine ids where this automation is actually activated (registry-observed). */
@@ -204,7 +258,13 @@ interface ParsedTaskFile {
   issues: DoctorIssue[];
 }
 
-function readTaskFile(projectRelPath: string, projectRoot: string, fileName: string, now: Date): ParsedTaskFile | null {
+function readTaskFile(
+  projectRelPath: string,
+  projectRoot: string,
+  fileName: string,
+  now: Date,
+  includeBody: boolean,
+): ParsedTaskFile | null {
   const filePath = path.join(projectRoot, "_project", "tasks", fileName);
   const relFile = path.join("_project", "tasks", fileName);
   let rec: FrontmatterRecord;
@@ -270,7 +330,7 @@ function readTaskFile(projectRelPath: string, projectRoot: string, fileName: str
     updated: asStringOrNull(data["updated"]),
     parentId,
     depth: parsed ? parsed.parts.length - 1 : 0,
-    body: rec.body,
+    body: includeBody ? rec.body : "",
     rollup: null,
   };
   return { task, parsed, issues };
@@ -328,7 +388,12 @@ function computeRollups(tasks: ScanTask[]): void {
   }
 }
 
-function scanProjectTasks(info: ProjectInfo, now: Date): { tasks: ScanTask[]; issues: DoctorIssue[] } {
+function scanProjectTasks(
+  info: ProjectInfo,
+  now: Date,
+  options: { includeBodies?: boolean } = {},
+): { tasks: ScanTask[]; issues: DoctorIssue[] } {
+  const includeBodies = options.includeBodies ?? true;
   const tasksDir = path.join(info.root, "_project", "tasks");
   let entries: fs.Dirent[];
   try {
@@ -341,7 +406,7 @@ function scanProjectTasks(info: ProjectInfo, now: Date): { tasks: ScanTask[]; is
   for (const entry of entries) {
     // archive/ is retention, not a live listing; subdirs are never scanned.
     if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
-    const result = readTaskFile(info.relPath, info.root, entry.name, now);
+    const result = readTaskFile(info.relPath, info.root, entry.name, now, includeBodies);
     if (result === null) continue;
     parsedFiles.push(result);
     issues.push(...result.issues);
@@ -377,13 +442,17 @@ export function collectDoctorIssues(projects: ProjectInfo[], perProjectIssues: D
 // ---------------------------------------------------------------------------
 // Workspace scan
 
-export function scanWorkspace(ws: Workspace, now: Date = new Date()): ScanResult {
+export function scanWorkspace(
+  ws: Workspace,
+  now: Date = new Date(),
+  options: { includeTaskBodies?: boolean } = {},
+): ScanResult {
   const infos = discoverProjects(ws, { all: true });
   const taskIssues: DoctorIssue[] = [];
   const projects: ScanProject[] = [];
 
   for (const info of infos) {
-    const { tasks, issues } = scanProjectTasks(info, now);
+    const { tasks, issues } = scanProjectTasks(info, now, { includeBodies: options.includeTaskBodies ?? true });
     taskIssues.push(...issues);
     projects.push({
       uid: info.uid,
@@ -434,6 +503,34 @@ export function scanWorkspace(ws: Workspace, now: Date = new Date()): ScanResult
   };
 }
 
+export function taskDetail(
+  ws: Workspace,
+  projectUid: string,
+  taskId: string,
+  now: Date = new Date(),
+): TaskDetailResult | null {
+  const info = discoverProjects(ws, { all: true }).find((p) => p.uid === projectUid);
+  if (info === undefined) return null;
+  const { tasks } = scanProjectTasks(info, now, { includeBodies: true });
+  const task = tasks.find((t) => t.id === taskId);
+  if (task === undefined) return null;
+  return {
+    generatedAt: now.toISOString(),
+    workspace: {
+      root: ws.root,
+      name: path.basename(ws.root),
+      workspaceId: ws.config.workspaceId,
+    },
+    project: {
+      uid: info.uid,
+      relPath: info.relPath,
+      name: path.basename(info.relPath),
+      lifecycle: info.lifecycle,
+    },
+    task,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Automations scan — synced registries × declared manifests (read-only).
 
@@ -460,6 +557,209 @@ interface ParsedRegistry {
 
 function activationKey(uid: string, name: string): string {
   return `${uid}--${name}`;
+}
+
+const COMPUTED_RUN_STATES: readonly ComputedRunState[] = [
+  "pending-first-run",
+  "running",
+  "overdue",
+  "stuck",
+  "missed",
+  "unknown",
+  "unobservable-direct-exec",
+  "succeeded",
+  "failed",
+  "timed_out",
+  "skipped",
+  "error",
+  "abandoned",
+];
+
+const COMPUTED_RUN_HEALTHS: readonly ComputedRunHealth[] = ["ok", "attention", "critical", "unknown"];
+
+export interface AutomationsScanOptions {
+  /** Injected in tests; production defaults to OPENWORKSPACE_STORE_DIR or the platform default. */
+  machineStore?: MachineStore;
+  machineStoreDir?: string;
+}
+
+interface LocalRunRead {
+  state: ComputedRunState;
+  health: ComputedRunHealth;
+  run: AutomationLocalRun | null;
+  unavailable: AutomationLocalRunUnavailableReason | null;
+}
+
+function isComputedRunState(value: unknown): value is ComputedRunState {
+  return typeof value === "string" && (COMPUTED_RUN_STATES as readonly string[]).includes(value);
+}
+
+function isComputedRunHealth(value: unknown): value is ComputedRunHealth {
+  return typeof value === "string" && (COMPUTED_RUN_HEALTHS as readonly string[]).includes(value);
+}
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+function machineStoreForScan(options: AutomationsScanOptions): MachineStore {
+  return options.machineStore ?? { dir: path.resolve(options.machineStoreDir ?? defaultStoreDir()) };
+}
+
+function firstString(raw: TomlTable, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = raw[key];
+    if (typeof value === "string" && value !== "") return value;
+  }
+  return null;
+}
+
+function nestedString(raw: TomlTable, tables: readonly string[], keys: readonly string[]): string | null {
+  for (const tableKey of tables) {
+    const table = raw[tableKey];
+    if (!isTable(table)) continue;
+    const value = firstString(table, keys);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function runIdFromState(raw: TomlTable): string | null {
+  return (
+    firstString(raw, ["run_id", "latest_run_id", "last_run_id", "current_run_id"]) ??
+    nestedString(raw, ["latest_run", "last_run", "current_run"], ["run_id", "id"])
+  );
+}
+
+function directRunStateFromState(raw: TomlTable): ComputedRunState | null {
+  for (const value of [raw["run_state"], raw["state"], raw["computed_state"]]) {
+    if (isComputedRunState(value)) return value;
+  }
+  for (const tableKey of ["latest_run", "last_run", "current_run"]) {
+    const table = raw[tableKey];
+    if (!isTable(table)) continue;
+    for (const value of [table["run_state"], table["state"], table["computed_state"]]) {
+      if (isComputedRunState(value)) return value;
+    }
+  }
+  return null;
+}
+
+function directRunHealthFromState(raw: TomlTable): ComputedRunHealth | null {
+  for (const value of [raw["run_health"], raw["health"], raw["computed_health"]]) {
+    if (isComputedRunHealth(value)) return value;
+  }
+  for (const tableKey of ["latest_run", "last_run", "current_run"]) {
+    const table = raw[tableKey];
+    if (!isTable(table)) continue;
+    for (const value of [table["run_health"], table["health"], table["computed_health"]]) {
+      if (isComputedRunHealth(value)) return value;
+    }
+  }
+  return null;
+}
+
+function localRunFromStateFile(raw: TomlTable, runId: string | null, state: ComputedRunState): AutomationLocalRun {
+  const health = directRunHealthFromState(raw) ?? computeRunHealth(state);
+  return {
+    source: "state-file",
+    runId,
+    state,
+    health,
+    status: asStringOrNull(raw["status"]),
+    phase: asStringOrNull(raw["phase"]),
+    startedAt: tomlString(raw["started_at"]),
+    updatedAt: tomlString(raw["updated_at"]),
+    heartbeatAt: tomlString(raw["heartbeat_at"]),
+    finishedAt: tomlString(raw["finished_at"]),
+    reason: asStringOrNull(raw["reason"]),
+  };
+}
+
+function unknownLocalRun(unavailable: AutomationLocalRunUnavailableReason): LocalRunRead {
+  return { state: "unknown", health: "unknown", run: null, unavailable };
+}
+
+function readLocalRun(
+  store: MachineStore,
+  uid: string,
+  name: string,
+  now: Date,
+  directExec: boolean,
+): LocalRunRead {
+  const statePath = automationStatePath(store, uid, name);
+  try {
+    if (!fs.statSync(statePath).isFile()) return unknownLocalRun("state-file-missing");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (directExec) {
+        const state: ComputedRunState = "unobservable-direct-exec";
+        return {
+          state,
+          health: computeRunHealth(state),
+          run: null,
+          unavailable: "direct-exec-unobservable",
+        };
+      }
+      return unknownLocalRun("state-file-missing");
+    }
+    return unknownLocalRun("state-file-invalid");
+  }
+
+  let raw: TomlTable;
+  try {
+    raw = readTomlIfExists(statePath);
+  } catch {
+    return unknownLocalRun("state-file-invalid");
+  }
+
+  const runId = runIdFromState(raw);
+  const directState = directRunStateFromState(raw);
+  if (runId === null) {
+    if (directState !== null) {
+      const run = localRunFromStateFile(raw, null, directState);
+      return { state: run.state, health: run.health, run, unavailable: null };
+    }
+    return unknownLocalRun("state-file-missing-run-id");
+  }
+
+  try {
+    const attempt = readAttempt(store, uid, name, runId);
+    if (attempt === null) {
+      if (directState !== null) {
+        const run = localRunFromStateFile(raw, runId, directState);
+        return { state: run.state, health: run.health, run, unavailable: null };
+      }
+      return unknownLocalRun("attempt-missing");
+    }
+    const state = computeRunState(attempt, now, pidAlive);
+    const health = computeRunHealth(state);
+    const run: AutomationLocalRun = {
+      source: "attempt",
+      runId: attempt.run_id,
+      state,
+      health,
+      status: attempt.status,
+      phase: attempt.phase,
+      startedAt: attempt.started_at ?? null,
+      updatedAt: attempt.updated_at,
+      heartbeatAt: attempt.heartbeat_at ?? null,
+      finishedAt: attempt.finished_at ?? null,
+      reason: attempt.reason ?? null,
+    };
+    return { state, health, run, unavailable: null };
+  } catch {
+    if (directState !== null) {
+      const run = localRunFromStateFile(raw, runId, directState);
+      return { state: run.state, health: run.health, run, unavailable: null };
+    }
+    return unknownLocalRun("attempt-invalid");
+  }
 }
 
 function readMachineRegistries(ws: Workspace, now: Date): ParsedRegistry[] {
@@ -522,19 +822,26 @@ function readMachineRegistries(ws: Workspace, now: Date): ParsedRegistry[] {
  * Placement drift (declared-but-not-activated / activated-but-undeclared) is
  * computed the way doctor surfaces it — a report, never a control plane.
  */
-export function scanAutomations(ws: Workspace, now: Date = new Date()): AutomationsScanResult {
+export function scanAutomations(
+  ws: Workspace,
+  now: Date = new Date(),
+  options: AutomationsScanOptions = {},
+): AutomationsScanResult {
   const registries = readMachineRegistries(ws, now);
   const byMachine = new Map(registries.map((r) => [r.machineId, r]));
   const infos = discoverProjects(ws, { all: true });
+  const localStore = machineStoreForScan(options);
 
   const automations: ScanAutomation[] = [];
   const flatDrift: AutomationsScanResult["drift"] = [];
 
   for (const info of infos) {
     for (const entry of scanManifests(info.root)) {
+      const manifest = entry.manifest;
       const declaredMachines = entry.manifest?.machines ?? [];
       const uid = info.uid;
       const key = activationKey(uid, entry.name);
+      const localRun = readLocalRun(localStore, uid, entry.name, now, manifest?.run.directExec ?? false);
 
       // Union of machines that DECLARE this automation and machines whose
       // registry ACTIVATES it — so the view shows placement everywhere it lives.
@@ -588,8 +895,18 @@ export function scanAutomations(ws: Workspace, now: Date = new Date()): Automati
         project: { uid, relPath: info.relPath, name: path.basename(info.relPath), lifecycle: info.lifecycle },
         declaredMachines,
         schedule: entry.manifest !== null ? scheduleSummaryOf(entry.manifest) : null,
+        kind: manifest?.run.kind ?? null,
+        missPolicy: manifest?.schedule.missPolicy ?? null,
+        misfireGraceSeconds: manifest?.schedule.misfireGraceSeconds ?? null,
+        maxCatchUp: manifest?.schedule.maxCatchUp ?? null,
+        overlapPolicy: manifest?.run.overlapPolicy ?? null,
+        maxConcurrency: manifest?.run.maxConcurrency ?? null,
         valid: entry.manifest !== null,
         problems: entry.problems.map((p) => p.message),
+        localRunState: localRun.state,
+        localRunHealth: localRun.health,
+        localRun: localRun.run,
+        localRunUnavailable: localRun.unavailable,
         machines: machineStates,
         activatedOn,
         drift,
@@ -720,6 +1037,16 @@ export interface DashboardOptions {
    * Mini) set a small positive TTL (~15000ms is the documented suggestion).
    */
   cacheTtlMs?: number;
+  /**
+   * Production dashboard scans run in a child process so a sync filesystem stall
+   * in a FileProvider-backed workspace cannot freeze the HTTP server itself.
+   * Tests that inject `now` default to in-process scans for deterministic clocks.
+   */
+  useScanWorker?: boolean;
+  /** Kill a scan child after this many milliseconds. Default: 20000. */
+  scanTimeoutMs?: number;
+  /** Optional machine-local store dir; read-only, and mainly injected by tests. */
+  machineStoreDir?: string;
 }
 
 /** A built scan plus the wall-clock instant it was built at. */
@@ -745,19 +1072,19 @@ class ScanCache<T> {
   private refreshing = false;
 
   constructor(
-    private readonly build: () => T,
+    private readonly build: () => Promise<T>,
     private readonly nowMs: () => number,
     private readonly ttlMs: number,
   ) {}
 
-  get(): T {
+  async get(): Promise<T> {
     // Caching disabled: always fresh.
-    if (this.ttlMs <= 0) return this.build();
+    if (this.ttlMs <= 0) return await this.build();
 
     const now = this.nowMs();
     if (this.cached === null) {
       // Cold cache: build synchronously (the one unavoidable slow request).
-      this.cached = { result: this.build(), builtAt: now };
+      this.cached = { result: await this.build(), builtAt: now };
       return this.cached.result;
     }
 
@@ -776,16 +1103,82 @@ class ScanCache<T> {
     // the triggering request, defeating stale-while-revalidate.
     setImmediate(() => {
       try {
-        const built = this.build();
-        this.cached = { result: built, builtAt: this.nowMs() };
+        void this.build()
+          .then((built) => {
+            this.cached = { result: built, builtAt: this.nowMs() };
+          })
+          .catch(() => {
+            // Keep serving the last good scan; a transient build failure (e.g. a
+            // mid-walk file race) must not poison the cache. Next expiry retries.
+          })
+          .finally(() => {
+            this.refreshing = false;
+          });
       } catch {
         // Keep serving the last good scan; a transient build failure (e.g. a
         // mid-walk file race) must not poison the cache. Next expiry retries.
-      } finally {
         this.refreshing = false;
       }
     });
   }
+}
+
+class ScanTimeoutError extends Error {}
+
+function scanChildPath(): string {
+  return path.join(__dirname, "scan-child.js");
+}
+
+function runScanChild<T>(
+  kind: "scan" | "automations" | "task",
+  options: DashboardOptions,
+  now: Date,
+  extraArgs: string[] = [],
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const env =
+      options.machineStoreDir === undefined
+        ? process.env
+        : { ...process.env, [STORE_DIR_ENV]: options.machineStoreDir };
+    const child = spawn(process.execPath, [scanChildPath(), kind, options.workspaceRoot, now.toISOString(), ...extraArgs], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, options.scanTimeoutMs ?? 20_000);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      if (timedOut) {
+        reject(new ScanTimeoutError(`${kind} scan timed out after ${options.scanTimeoutMs ?? 20_000}ms`));
+        return;
+      }
+      let payload: { ok: boolean; result?: T; error?: string };
+      try {
+        payload = JSON.parse(stdout) as { ok: boolean; result?: T; error?: string };
+      } catch {
+        reject(new Error(`${kind} scan child produced invalid JSON${stderr ? `: ${stderr.trim()}` : ""}`));
+        return;
+      }
+      if (code !== 0 || !payload.ok) {
+        reject(new Error(payload.error ?? stderr.trim() ?? `${kind} scan child exited ${code ?? "by signal"}`));
+        return;
+      }
+      resolve(payload.result as T);
+    });
+  });
 }
 
 function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown): void {
@@ -802,20 +1195,23 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
   const now = options.now ?? (() => new Date());
   const allowed = buildAllowedHosts(options.allowedHosts ?? []);
   const ttlMs = options.cacheTtlMs ?? 0;
+  const useScanWorker = options.useScanWorker ?? options.now === undefined;
 
   // Build a scan against the LIVE tree, stamping generatedAt at build time. The
   // cache stores whatever this returns; it never rewrites the timestamp.
-  const buildScan = (): ScanResult => {
+  const buildScan = async (): Promise<ScanResult> => {
+    if (useScanWorker) return await runScanChild<ScanResult>("scan", options, now());
     const ws = openWorkspace(options.workspaceRoot); // live tree, every build
-    return scanWorkspace(ws, now());
+    return scanWorkspace(ws, now(), { includeTaskBodies: false });
   };
   const scanCache = new ScanCache<ScanResult>(buildScan, () => now().getTime(), ttlMs);
 
   // The automations view shares the same stale-while-revalidate posture: it is
   // another read-only scan over the live tree (synced registries × manifests).
-  const buildAutomations = (): AutomationsScanResult => {
+  const buildAutomations = async (): Promise<AutomationsScanResult> => {
+    if (useScanWorker) return await runScanChild<AutomationsScanResult>("automations", options, now());
     const ws = openWorkspace(options.workspaceRoot);
-    return scanAutomations(ws, now());
+    return scanAutomations(ws, now(), { machineStoreDir: options.machineStoreDir });
   };
   const automationsCache = new ScanCache<AutomationsScanResult>(
     buildAutomations,
@@ -836,7 +1232,8 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
       return;
     }
 
-    const pathname = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
+    const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    const pathname = url.pathname;
 
     if (pathname === "/" || pathname === "/index.html") {
       const htmlPath = options.indexHtmlPath ?? findIndexHtml();
@@ -855,23 +1252,60 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     }
 
     if (pathname === "/api/scan") {
-      try {
+      void (async () => {
+        try {
         // Cache-aware: cold/disabled ⇒ fresh synchronous build; warm-within-TTL
         // ⇒ cached scan; expired ⇒ stale-but-recent now + background rebuild.
-        sendJson(res, 200, scanCache.get());
-      } catch (err) {
-        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+          sendJson(res, 200, await scanCache.get());
+        } catch (err) {
+          sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return;
+    }
+
+    if (pathname === "/api/task") {
+      const project = url.searchParams.get("project");
+      const task = url.searchParams.get("task");
+      if (project === null || task === null || project === "" || task === "") {
+        sendJson(res, 400, { error: "missing project or task query parameter" });
+        return;
       }
+      void (async () => {
+        try {
+          const detail = useScanWorker
+            ? await runScanChild<TaskDetailResult | null>("task", options, now(), [project, task])
+            : (() => {
+                const ws = openWorkspace(options.workspaceRoot);
+                return taskDetail(ws, project, task, now());
+              })();
+        if (detail === null) {
+          sendJson(res, 404, { error: "task not found" });
+        } else {
+          sendJson(res, 200, detail);
+        }
+        } catch (err) {
+          sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
       return;
     }
 
     if (pathname === "/api/automations") {
-      try {
+      void (async () => {
+        try {
         // Same read-only, stale-while-revalidate posture as /api/scan.
-        sendJson(res, 200, automationsCache.get());
-      } catch (err) {
-        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
-      }
+          sendJson(res, 200, await automationsCache.get());
+        } catch (err) {
+          sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
       return;
     }
 

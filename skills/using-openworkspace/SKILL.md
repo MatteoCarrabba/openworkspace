@@ -21,11 +21,13 @@ The CLI is `projects`. Validate anything you're unsure about with
 
 ## The two rules that explain everything
 
-1. **Location encodes visibility and retention.** Live records sit directly in
-   their primitive's directory; archived records sit in its `archive/` subdir;
-   a *project's* lifecycle (active/dormant/archived) is encoded by where the
-   project folder sits in the workspace — never by a field. To change
-   lifecycle, move the folder (`projects lifecycle <ref> --to dormant`).
+1. **Location encodes visibility and retention for records; project lifecycle
+   is metadata-primary.** Live records sit directly in their primitive's
+   directory; archived records sit in its `archive/` subdir. A *project's*
+   lifecycle (active/dormant/archived) lives in `_project/project.toml`; folder
+   location is the reconciled Finder-readable view. Change lifecycle with
+   `projects lifecycle <ref> --to dormant`; if metadata and location disagree,
+   use `projects reconcile`.
 2. **Frontmatter encodes workflow state.** A task's `status:`, a decision's
    `status:`, a thread's `status:` live in YAML frontmatter, edited in place.
    Never encode state by moving a record between subdirectories; never
@@ -35,7 +37,8 @@ The CLI is `projects`. Validate anything you're unsure about with
 ## Orientation
 
 ```sh
-projects home list            # what projects exist (live scan; --all includes shelves)
+projects home list --all      # what projects exist (live scan; --all includes shelves)
+projects home scan --json     # task/planning view; plain scan is only a summary
 projects show                 # which project am I in (walk-up from cwd)
 projects doctor               # are this project's invariants intact
 cat _project/README.md        # every project carries its own orientation file

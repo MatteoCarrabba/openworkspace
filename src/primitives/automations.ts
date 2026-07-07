@@ -60,8 +60,10 @@ import {
 // Manifest schema (automation.toml) — forgiving read, strict write/apply
 // ---------------------------------------------------------------------------
 
-export type MissPolicy = "skip" | "catch-up" | "fail-loud";
+export type MissPolicy = "skip" | "catch-up" | "coalesce" | "fail-loud";
 export type OnDormantProject = "stop" | "continue";
+export type RunKind = "script" | "codex" | "claude" | "agent" | "shell" | "other";
+export type OverlapPolicy = "skip" | "queue" | "coalesce" | "fail-loud" | "allow";
 
 /** One launchd StartCalendarInterval entry; absent key = wildcard. */
 export interface CalendarEntry {
@@ -89,14 +91,24 @@ export interface AutomationManifest {
     calendar: CalendarEntry[];
     /** Always null: `timezone` is REJECTED at validation until implemented. */
     timezone: string | null;
-    /** Recorded for the supervise pass (§7.2); the runner behaves as "skip". */
+    /** Runtime v2 missed-run policy. skip/catch-up are implemented; others are reserved. */
     missPolicy: MissPolicy;
+    /** Runtime v2 scheduler default. */
+    misfireGraceSeconds: number;
+    /** Runtime v2 scheduler default. */
+    maxCatchUp: number;
   };
   run: {
     command: string[];
+    /** Descriptive provider-neutral payload kind; no runtime branching. */
+    kind: RunKind;
     /** §7.4 TCC fallback: plist ProgramArguments = the command itself. */
     directExec: boolean;
     timeoutSeconds: number | null;
+    /** Runtime v2 overlap policy, enforced by managed runner/supervisor. */
+    overlapPolicy: OverlapPolicy;
+    /** Runtime v2 per-machine concurrency cap. */
+    maxConcurrency: number;
     /** Static, NON-secret env injected into the child (secrets always win). */
     env: Record<string, string>;
   };
@@ -114,7 +126,9 @@ export interface ManifestProblem {
 }
 
 const SECRET_POINTER_RE = /^[a-z][a-z0-9+.-]*:\/\/.+/;
-const MISS_POLICIES = new Set<string>(["skip", "catch-up", "fail-loud"]);
+const MISS_POLICIES = new Set<string>(["skip", "catch-up", "coalesce", "fail-loud"]);
+const RUN_KINDS = new Set<string>(["script", "codex", "claude", "agent", "shell", "other"]);
+const OVERLAP_POLICIES = new Set<string>(["skip", "queue", "coalesce", "fail-loud", "allow"]);
 const NAME_RE = /^[a-z0-9][a-z0-9._-]*$/;
 
 function isTable(v: unknown): v is TomlTable {
@@ -124,6 +138,11 @@ function isTable(v: unknown): v is TomlTable {
 function stringArray(v: unknown): string[] | null {
   if (!Array.isArray(v)) return null;
   if (!v.every((x): x is string => typeof x === "string")) return null;
+  return v;
+}
+
+function positiveInteger(v: unknown): number | null {
+  if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) return null;
   return v;
 }
 
@@ -284,6 +303,8 @@ export function validateManifest(
   let calendar: CalendarEntry[] = [];
   let timezone: string | null = null;
   let missPolicy: MissPolicy = "skip";
+  let misfireGraceSeconds = 300;
+  let maxCatchUp = 3;
   const schedule = raw["schedule"];
   if (!isTable(schedule)) {
     prob("no-schedule", "missing [schedule] table (cron or calendar_interval)");
@@ -323,17 +344,36 @@ export function validateManifest(
     }
     if (schedule["miss_policy"] !== undefined) {
       if (typeof schedule["miss_policy"] !== "string" || !MISS_POLICIES.has(schedule["miss_policy"])) {
-        prob("miss_policy", `invalid miss_policy ${JSON.stringify(schedule["miss_policy"])} (expected skip|catch-up|fail-loud)`);
+        prob("miss_policy", `invalid miss_policy ${JSON.stringify(schedule["miss_policy"])} (expected skip|catch-up|coalesce|fail-loud)`);
       } else {
         missPolicy = schedule["miss_policy"] as MissPolicy;
+      }
+    }
+    if (schedule["misfire_grace_seconds"] !== undefined) {
+      const parsed = positiveInteger(schedule["misfire_grace_seconds"]);
+      if (parsed === null) {
+        prob("misfire_grace_seconds", "[schedule] misfire_grace_seconds must be a positive integer");
+      } else {
+        misfireGraceSeconds = parsed;
+      }
+    }
+    if (schedule["max_catch_up"] !== undefined) {
+      const parsed = positiveInteger(schedule["max_catch_up"]);
+      if (parsed === null) {
+        prob("max_catch_up", "[schedule] max_catch_up must be a positive integer");
+      } else {
+        maxCatchUp = parsed;
       }
     }
   }
 
   // [run]
   let command: string[] = [];
+  let kind: RunKind = "other";
   let directExec = false;
   let timeoutSeconds: number | null = null;
+  let overlapPolicy: OverlapPolicy = "skip";
+  let maxConcurrency = 1;
   const runEnv: Record<string, string> = {};
   const run = raw["run"];
   if (!isTable(run)) {
@@ -345,6 +385,13 @@ export function validateManifest(
     } else {
       command = cmd;
     }
+    if (run["kind"] !== undefined) {
+      if (typeof run["kind"] !== "string" || !RUN_KINDS.has(run["kind"])) {
+        prob("run-kind", `invalid [run] kind ${JSON.stringify(run["kind"])} (expected script|codex|claude|agent|shell|other)`);
+      } else {
+        kind = run["kind"] as RunKind;
+      }
+    }
     if (run["direct_exec"] !== undefined) {
       if (typeof run["direct_exec"] !== "boolean") prob("direct_exec", "[run] direct_exec must be a boolean");
       else directExec = run["direct_exec"];
@@ -355,6 +402,27 @@ export function validateManifest(
       } else {
         timeoutSeconds = run["timeout_seconds"];
       }
+    }
+    if (run["overlap_policy"] !== undefined) {
+      if (typeof run["overlap_policy"] !== "string" || !OVERLAP_POLICIES.has(run["overlap_policy"])) {
+        prob(
+          "overlap_policy",
+          `invalid [run] overlap_policy ${JSON.stringify(run["overlap_policy"])} (expected skip|queue|coalesce|fail-loud|allow)`,
+        );
+      } else {
+        overlapPolicy = run["overlap_policy"] as OverlapPolicy;
+      }
+    }
+    if (run["max_concurrency"] !== undefined) {
+      const parsed = positiveInteger(run["max_concurrency"]);
+      if (parsed === null) {
+        prob("max_concurrency", "[run] max_concurrency must be a positive integer");
+      } else {
+        maxConcurrency = parsed;
+      }
+    }
+    if (overlapPolicy === "allow" && maxConcurrency <= 1) {
+      prob("overlap_policy", '[run] overlap_policy = "allow" requires max_concurrency > 1');
     }
     // [run] env: static, NON-secret values injected into the child env.
     // Plain strings only; anything pointer-shaped belongs in [secrets].
@@ -438,6 +506,25 @@ export function validateManifest(
         "EnvironmentVariables; the env rides the launchd login environment",
     );
   }
+  if (directExec && missPolicy !== "skip") {
+    warn(
+      "direct-exec-miss-policy",
+      `[schedule] miss_policy = "${missPolicy}" is managed-runner semantics and has no effect with direct_exec = true`,
+    );
+  }
+  if (directExec && overlapPolicy !== "skip") {
+    warn(
+      "direct-exec-overlap-policy",
+      `[run] overlap_policy = "${overlapPolicy}" is managed-runner semantics and has no effect with direct_exec = true`,
+    );
+  }
+  if (directExec && timeoutSeconds !== null) {
+    warn(
+      "direct-exec-timeout",
+      "[run] timeout_seconds has no effect with direct_exec = true — launchd starts the command directly " +
+        "and no OpenWorkspace runner enforces the timeout",
+    );
+  }
 
   // [supervise]: pass-through table (the supervise pass is the consumer)
   let supervise: TomlTable = {};
@@ -483,8 +570,8 @@ export function validateManifest(
     manifest: {
       name,
       machines,
-      schedule: { cron, calendar, timezone, missPolicy },
-      run: { command, directExec, timeoutSeconds, env: runEnv },
+      schedule: { cron, calendar, timezone, missPolicy, misfireGraceSeconds, maxCatchUp },
+      run: { command, kind, directExec, timeoutSeconds, overlapPolicy, maxConcurrency, env: runEnv },
       secrets,
       supervise,
       signature,
@@ -1587,4 +1674,3 @@ export function logsFor(
         : null,
   };
 }
-

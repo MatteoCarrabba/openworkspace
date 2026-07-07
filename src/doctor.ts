@@ -16,8 +16,9 @@
  * hidden_until/recur validity, done-with-recur, recurrence lag,
  * superseded-without-pointer, forum structure, resolved-thread archive
  * proposals (>30d), unanswered-question aging, automation manifest
- * validation as findings (incl. the §7.5 bare-secret hard error and the
- * miss_policy-not-enforced-at-fire-time warn), [signature] path existence,
+ * validation as findings (incl. the §7.5 bare-secret hard error, reserved
+ * Runtime v2 policy warnings, and direct_exec managed-runner semantics
+ * warnings), [signature] path existence,
  * declared-vs-activated placement drift + orphaned activations (read from
  * the synced per-machine registries; a present-but-INVALID manifest is
  * reported as such, never misdiagnosed as a deleted definition),
@@ -107,6 +108,11 @@ function gitText(args: string[], cwd: string): string | null {
   } catch {
     return null;
   }
+}
+
+function tableHas(table: unknown, key: string): boolean {
+  return table !== null && typeof table === "object" && !Array.isArray(table) &&
+    Object.prototype.hasOwnProperty.call(table, key);
 }
 
 // Retention/aging thresholds. The PRD pins the 30-day resolved-thread archive
@@ -535,15 +541,43 @@ export function doctorProject(
     for (const prob of problems) err(manifestRel, prob.message);
     for (const w of manifestWarnings) warn(manifestRel, w.message);
     if (manifest !== null) {
-      // miss_policy beyond the default is recorded for the supervise pass
-      // (C3, per §7.2) but NOT yet enforced at fire time — the runner's
-      // behavior is "skip". Say so rather than silently no-op the key.
-      if (manifest.schedule.missPolicy !== "skip") {
+      // Runtime v2 distinguishes provider-neutral payload kind from scheduler
+      // semantics. skip/catch-up basics are managed-runner semantics; the
+      // reserved policies below are accepted in manifests but not supported by
+      // the current runner/scheduler.
+      if (manifest.schedule.missPolicy === "fail-loud" || manifest.schedule.missPolicy === "coalesce") {
         warn(
           manifestRel,
-          `miss_policy = "${manifest.schedule.missPolicy}" is recorded for the supervise pass but not yet ` +
-            `enforced at fire time (the runner behaves as "skip")`,
+          `miss_policy = "${manifest.schedule.missPolicy}" is reserved for Automation Runtime v2 ` +
+            `and is not currently enforced by the managed runner`,
         );
+      }
+      if (manifest.run.overlapPolicy === "queue" || manifest.run.overlapPolicy === "coalesce" || manifest.run.overlapPolicy === "fail-loud") {
+        warn(
+          manifestRel,
+          `[run] overlap_policy = "${manifest.run.overlapPolicy}" is reserved for Automation Runtime v2 ` +
+            `and is not currently enforced by the managed runner (current support is skip or allow with max_concurrency)`,
+        );
+      }
+      if (manifest.run.directExec) {
+        if (tableHas(raw["schedule"], "misfire_grace_seconds")) {
+          warn(
+            manifestRel,
+            "[schedule] misfire_grace_seconds is managed-runner catch-up semantics and has no effect with direct_exec = true",
+          );
+        }
+        if (tableHas(raw["schedule"], "max_catch_up")) {
+          warn(
+            manifestRel,
+            "[schedule] max_catch_up is managed-runner catch-up semantics and has no effect with direct_exec = true",
+          );
+        }
+        if (tableHas(raw["run"], "max_concurrency")) {
+          warn(
+            manifestRel,
+            "[run] max_concurrency is managed-runner overlap semantics and has no effect with direct_exec = true",
+          );
+        }
       }
       for (const sig of [...manifest.signature.inputs, ...manifest.signature.outputs]) {
         if ((sig.type === "file" || sig.type === "directory") && sig.path !== null) {
