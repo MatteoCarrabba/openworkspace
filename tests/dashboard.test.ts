@@ -435,17 +435,20 @@ test("http: DEFAULT behavior unchanged — no host/allow-host ⇒ loopback bind 
   assert.equal((await get(running.port, "/api/scan", { host: "127.0.0.1" })).status, 200);
 });
 
-test("http: zero mutation endpoints — non-GET/HEAD rejected everywhere", async (t) => {
+test("http: only the allowlisted mutation paths accept POST; everything else stays read-only", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());
   const running = await startFixtureDashboard(tmp);
   t.after(() => running.close());
 
+  // POST to a NON-mutation path, and PUT/DELETE/PATCH to anything, are rejected.
   for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
-    for (const reqPath of ["/api/scan", "/", "/api/task", "/anything"]) {
+    const paths =
+      method === "POST" ? ["/api/scan", "/", "/api/task", "/anything"] : ["/api/scan", "/api/task/status"];
+    for (const reqPath of paths) {
       const res = await get(running.port, reqPath, { method });
       assert.equal(res.status, 405, `${method} ${reqPath} must be 405`);
-      assert.equal(res.headers["allow"], "GET, HEAD");
+      assert.equal(res.headers["allow"], "GET, HEAD, POST");
     }
   }
 });
@@ -968,11 +971,11 @@ test("http: /api/automations honors the Host-header defense + GET/HEAD-only", as
   assert.equal((await get(running.port, "/api/automations", { host: "evil.example.com" })).status, 403);
   // good Host accepted
   assert.equal((await get(running.port, "/api/automations", { host: "127.0.0.1" })).status, 200);
-  // mutation methods rejected, Allow header set
+  // /api/automations is read-only (not a mutation path): any write method rejected
   for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
     const res = await get(running.port, "/api/automations", { method });
     assert.equal(res.status, 405, `${method} /api/automations must be 405`);
-    assert.equal(res.headers["allow"], "GET, HEAD");
+    assert.equal(res.headers["allow"], "GET, HEAD, POST");
   }
 });
 
@@ -1037,4 +1040,176 @@ test("automations cache: TTL stale-while-revalidate parity with /api/scan", asyn
   await flushBackground();
   const rebuilt = JSON.parse((await get(running.port, "/api/automations")).body) as AutomationsScanResult;
   assert.equal(driftN(rebuilt), 1, "after rebuild the resolved laptop drift is gone (only rogue remains)");
+});
+
+// ---------------------------------------------------------------------------
+// Write path (decision-1): loopback-gated mutations routed through the library.
+
+function post(
+  port: number,
+  reqPath: string,
+  bodyObj: unknown,
+  options: { host?: string | null; origin?: string; contentType?: string | null; secFetchSite?: string } = {}
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const payload = typeof bodyObj === "string" ? bodyObj : JSON.stringify(bodyObj);
+    const headers: Record<string, string> = {};
+    if (options.host !== null) headers["host"] = options.host ?? `127.0.0.1:${port}`;
+    if (options.contentType !== null) headers["content-type"] = options.contentType ?? "application/json";
+    if (options.origin !== undefined) headers["origin"] = options.origin;
+    if (options.secFetchSite !== undefined) headers["sec-fetch-site"] = options.secFetchSite;
+    headers["content-length"] = String(Buffer.byteLength(payload));
+    const req = http.request(
+      { host: "127.0.0.1", port, path: reqPath, method: "POST", headers, setHost: false },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (c) => (body += c));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+      }
+    );
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+function readTaskFile(projectRoot: string, glob: string): string {
+  const dir = path.join(projectRoot, "_project", "tasks");
+  const file = fs.readdirSync(dir).find((f) => f.startsWith(glob));
+  return file ? fs.readFileSync(path.join(dir, file), "utf8") : "";
+}
+
+test("write: status transition routes through the library and rewrites the file", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "doing" });
+  assert.equal(res.status, 200);
+  const detail = JSON.parse(res.body) as TaskDetailResult;
+  assert.equal(detail.task.status, "doing");
+  // The on-disk record actually changed (single-writer, not an in-memory echo).
+  assert.match(readTaskFile(alpha, "task-2 "), /status: doing/);
+});
+
+test("write: done WITHOUT a Final Summary is refused with 422 (library invariant)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "done" });
+  assert.equal(res.status, 422);
+  assert.match(JSON.parse(res.body).error, /Final Summary/);
+});
+
+test("write: done WITH a summary writes the section then closes the task", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const res = await post(running.port, "/api/task/done", {
+    project: "uid-alpha",
+    task: "task-2",
+    summary: "Verified end to end; shipped.",
+  });
+  assert.equal(res.status, 200);
+  assert.equal((JSON.parse(res.body) as TaskDetailResult).task.status, "done");
+  const file = readTaskFile(alpha, "task-2 ");
+  assert.match(file, /status: done/);
+  assert.match(file, /## Final Summary/);
+  assert.match(file, /Verified end to end; shipped\./);
+});
+
+test("write: empty done summary is a 400, no state change", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/task/done", { project: "uid-alpha", task: "task-2", summary: "   " });
+  assert.equal(res.status, 400);
+  assert.match(readTaskFile(path.join(tmp.root, "Alpha Project"), "task-2 "), /status: review/);
+});
+
+test("write: note appends to the ## Log section", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "a dashboard note" });
+  assert.equal(res.status, 200);
+  const file = readTaskFile(path.join(tmp.root, "Alpha Project"), "task-1 -");
+  assert.match(file, /## Log/);
+  assert.match(file, /a dashboard note \(dashboard\)/);
+});
+
+test("write: invalid status value is a 400", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "bogus" });
+  assert.equal(res.status, 400);
+});
+
+test("write: reads reach the tailnet but writes do not (loopback-Host gate)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    allowedHosts: ["ws.tailnet.ts.net"],
+  });
+  t.after(() => running.close());
+
+  // GET with the tailnet Host is allowed (read surface may be served widely).
+  const read = await get(running.port, "/api/scan", { host: "ws.tailnet.ts.net" });
+  assert.equal(read.status, 200);
+  // POST with the same tailnet Host is refused — writes are loopback-only.
+  const write = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "doing" }, { host: "ws.tailnet.ts.net" });
+  assert.equal(write.status, 403);
+  assert.match(readTaskFile(path.join(tmp.root, "Alpha Project"), "task-2 "), /status: review/);
+});
+
+test("write: a cross-site Origin is refused (CSRF defense)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "doing" }, { origin: "https://evil.example" });
+  assert.equal(res.status, 403);
+});
+
+test("write: readOnly:true hard-disables the mutation layer (405)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, readOnly: true });
+  t.after(() => running.close());
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "doing" });
+  assert.equal(res.status, 405);
+  assert.match(readTaskFile(path.join(tmp.root, "Alpha Project"), "task-2 "), /status: review/);
+});
+
+test("write: non-JSON content-type is a 415", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const res = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-2", status: "doing" }, { contentType: "text/plain" });
+  assert.equal(res.status, 415);
+});
+
+test("write: unknown project is a 404", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const res = await post(running.port, "/api/task/note", { project: "uid-nope", task: "task-1", text: "x" });
+  assert.equal(res.status, 404);
 });

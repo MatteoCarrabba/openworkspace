@@ -35,9 +35,11 @@ import * as http from "node:http";
 import * as path from "node:path";
 
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
+import { ConfigError, NotFoundError, OwError } from "../lib/errors.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
 import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
+import { TaskStateError, addNote, setFinalSummary, setStatus } from "../primitives/tasks.js";
 import {
   Lifecycle,
   MARKER_DIR,
@@ -1047,6 +1049,13 @@ export interface DashboardOptions {
   scanTimeoutMs?: number;
   /** Optional machine-local store dir; read-only, and mainly injected by tests. */
   machineStoreDir?: string;
+  /**
+   * Hard-disable the mutation layer (decision-1). When true the server behaves
+   * exactly like read-only v1: any POST is 405. Default: writes ENABLED, but
+   * still gated to loopback connections + loopback Host + same-origin, so a
+   * tailnet-served instance never accepts writes from a peer.
+   */
+  readOnly?: boolean;
 }
 
 /** A built scan plus the wall-clock instant it was built at. */
@@ -1076,6 +1085,12 @@ class ScanCache<T> {
     private readonly nowMs: () => number,
     private readonly ttlMs: number,
   ) {}
+
+  /** Drop the cached scan so the next get() rebuilds against the live tree.
+   *  Called after a mutation so a write is reflected immediately, not after TTL. */
+  invalidate(): void {
+    this.cached = null;
+  }
 
   async get(): Promise<T> {
     // Caching disabled: always fresh.
@@ -1191,6 +1206,147 @@ function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown
   res.end(body);
 }
 
+// ---------------------------------------------------------------------------
+// Write path (decision-1): a narrow, loopback-gated mutation layer. Every
+// mutation routes through the tasks library (single writer) so record
+// invariants — Final Summary for done, no done-with-open-children, valid
+// transitions — hold by construction; the server never hand-edits a file.
+
+/** POST paths the mutation layer serves, each 1:1 with a library verb. */
+export const MUTATION_PATHS: ReadonlySet<string> = new Set([
+  "/api/task/status",
+  "/api/task/done",
+  "/api/task/note",
+]);
+
+const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
+/**
+ * A write is served ONLY from a genuine loopback connection with a loopback
+ * Host header — independent of any `--allow-host` tailnet read config — plus a
+ * same-origin (CSRF) check. Tailnet peers get reads, never writes.
+ */
+export function writeConnectionAllowed(req: http.IncomingMessage): boolean {
+  const remote = req.socket.remoteAddress ?? "";
+  if (!LOOPBACK_ADDRS.has(remote)) return false;
+  if (!hostAllowed(req.headers.host, new Set(LOOPBACK_HOSTS))) return false;
+  const origin = req.headers.origin;
+  if (origin !== undefined && origin !== "" && origin !== "null") {
+    let host: string;
+    try {
+      host = new URL(origin).hostname.toLowerCase();
+    } catch {
+      return false;
+    }
+    if (!LOOPBACK_HOSTS.has(host)) return false;
+  }
+  const site = req.headers["sec-fetch-site"];
+  if (typeof site === "string" && site !== "same-origin" && site !== "same-site" && site !== "none") {
+    return false;
+  }
+  return true;
+}
+
+function readJsonBody(req: http.IncomingMessage, limitBytes = 64 * 1024): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks: Buffer[] = [];
+    req.on("data", (c: Buffer) => {
+      size += c.length;
+      if (size > limitBytes) {
+        reject(new ConfigError("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8").trim();
+      if (raw === "") {
+        resolve({});
+        return;
+      }
+      try {
+        const parsed = JSON.parse(raw);
+        resolve(parsed !== null && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {});
+      } catch {
+        reject(new ConfigError("invalid JSON body"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+/** uid → absolute project root, via the same discovery the read path uses. */
+function projectRootForUid(workspaceRoot: string, uid: string): string | null {
+  const ws = openWorkspace(workspaceRoot);
+  const info = discoverProjects(ws, { all: true }).find((p) => p.uid === uid);
+  return info === undefined ? null : path.join(ws.root, info.relPath);
+}
+
+/** Map a library error to the HTTP status. Order matters: the most specific
+ *  subclass first (TaskStateError/NotFoundError/ConfigError all extend OwError). */
+export function mutationStatus(err: unknown): number {
+  if (err instanceof TaskStateError) return 422; // invariant refused (e.g. no Final Summary)
+  if (err instanceof NotFoundError) return 404;
+  if (err instanceof ConfigError) return 400;
+  if (err instanceof OwError) return 400;
+  return 500;
+}
+
+/**
+ * Apply one mutation through the library, then return the updated task detail
+ * so the UI can repaint the row without a full refetch.
+ */
+export function applyMutation(
+  pathname: string,
+  body: Record<string, unknown>,
+  options: DashboardOptions,
+  now: () => Date,
+): TaskDetailResult {
+  const project = typeof body["project"] === "string" ? (body["project"] as string) : "";
+  const task = typeof body["task"] === "string" ? (body["task"] as string) : "";
+  if (project === "" || task === "") throw new ConfigError("missing project or task");
+  const root = projectRootForUid(options.workspaceRoot, project);
+  if (root === null) throw new NotFoundError(`project not found: ${project}`);
+  const nowD = now();
+  const force = body["force"] === true;
+
+  switch (pathname) {
+    case "/api/task/status": {
+      const status = typeof body["status"] === "string" ? (body["status"] as string) : "";
+      if (!TASK_STATUSES.includes(status as TaskStatus)) {
+        throw new ConfigError(`invalid status: ${status || "(none)"} (expected ${TASK_STATUSES.join("|")})`);
+      }
+      setStatus(root, task, status as TaskStatus, { force, now: nowD });
+      break;
+    }
+    case "/api/task/done": {
+      // "Check off" = write the required Final Summary, THEN close — one library
+      // pair so the done invariant is satisfied rather than tripping a 422.
+      const summary = typeof body["summary"] === "string" ? (body["summary"] as string) : "";
+      if (summary.trim() === "") throw new ConfigError("a Final Summary is required to mark a task done");
+      setFinalSummary(root, task, summary, { now: nowD });
+      setStatus(root, task, "done", { force, now: nowD });
+      break;
+    }
+    case "/api/task/note": {
+      const text = typeof body["text"] === "string" ? (body["text"] as string) : "";
+      const actor = typeof body["actor"] === "string" && body["actor"] !== "" ? (body["actor"] as string) : "dashboard";
+      addNote(root, task, text, { now: nowD, actor });
+      break;
+    }
+    default:
+      throw new NotFoundError(`unknown mutation: ${pathname}`);
+  }
+
+  const ws = openWorkspace(options.workspaceRoot);
+  const detail = taskDetail(ws, project, task, nowD);
+  if (detail === null) throw new NotFoundError("task not found after mutation");
+  return detail;
+}
+
 export function createDashboardServer(options: DashboardOptions): http.Server {
   const now = options.now ?? (() => new Date());
   const allowed = buildAllowedHosts(options.allowedHosts ?? []);
@@ -1224,16 +1380,48 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
       sendJson(res, 403, { error: "forbidden: host header not allowed" });
       return;
     }
-    // v1 is strictly read-only: no mutation endpoints exist, any non-read
-    // method is rejected outright.
-    if (req.method !== "GET" && req.method !== "HEAD") {
-      res.setHeader("allow", "GET, HEAD");
-      sendJson(res, 405, { error: "method not allowed: dashboard v1 is read-only" });
-      return;
-    }
 
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const pathname = url.pathname;
+
+    // Write path (decision-1): loopback-gated mutations, routed through the
+    // library. Read requests may come from the tailnet; writes may not.
+    if (req.method === "POST" && MUTATION_PATHS.has(pathname)) {
+      if (options.readOnly === true) {
+        res.setHeader("allow", "GET, HEAD");
+        sendJson(res, 405, { error: "method not allowed: dashboard is read-only" });
+        return;
+      }
+      if (!writeConnectionAllowed(req)) {
+        sendJson(res, 403, { error: "forbidden: writes are allowed from localhost only" });
+        return;
+      }
+      if (!/application\/json/i.test(req.headers["content-type"] ?? "")) {
+        sendJson(res, 415, { error: "content-type must be application/json" });
+        return;
+      }
+      void (async () => {
+        try {
+          const body = await readJsonBody(req);
+          const detail = applyMutation(pathname, body, options, now);
+          scanCache.invalidate();
+          sendJson(res, 200, detail);
+        } catch (err) {
+          sendJson(res, mutationStatus(err), {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return;
+    }
+
+    // Everything else is strictly read-only: any other non-read method is
+    // rejected outright.
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      res.setHeader("allow", "GET, HEAD, POST");
+      sendJson(res, 405, { error: "method not allowed" });
+      return;
+    }
 
     if (pathname === "/" || pathname === "/index.html") {
       const htmlPath = options.indexHtmlPath ?? findIndexHtml();
