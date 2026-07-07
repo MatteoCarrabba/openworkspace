@@ -1,7 +1,7 @@
 ---
 id: decision-1
 title: "Dashboard write path: mutations route through the library, doctor-clean by construction, localhost-gated"
-status: draft
+status: accepted
 date: 2026-07-07
 superseded_by: null
 ---
