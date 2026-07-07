@@ -623,6 +623,49 @@ export function editField(
   return touchAndWrite(tf, { [field]: value }, now);
 }
 
+/**
+ * Append `text` under the task's `## Final Summary` section (created on demand),
+ * so a subsequent `setStatus(…, "done")` satisfies the non-empty-summary
+ * invariant. Body-writing lives in the library (single writer) so the dashboard
+ * "check off" path never hand-edits the file. Appends a paragraph; never
+ * rewrites prior summary content.
+ */
+export function setFinalSummary(
+  projectRoot: string,
+  ref: string,
+  text: string,
+  options: { now?: Date } = {},
+): Task {
+  const summary = text.trim();
+  if (summary.length === 0) throw new ConfigError("final summary text must not be empty");
+  const tf = getTaskFile(projectRoot, ref);
+  const now = options.now ?? new Date();
+  appendFinalSummary(tf.rec, summary);
+  return touchAndWrite(tf, {}, now);
+}
+
+/** Append `text` under the `## Final Summary` heading (created on demand). */
+function appendFinalSummary(rec: FrontmatterRecord, text: string): void {
+  const eol = rec.eol;
+  const body = rec.body;
+  const h = findHeading(body, "Final Summary");
+  if (h === null) {
+    let prefix = body;
+    if (prefix.length > 0 && !prefix.endsWith("\n")) prefix += eol;
+    if (prefix.length > 0) prefix += eol; // blank line before the new heading
+    setBody(rec, `${prefix}## Final Summary${eol}${eol}${text}${eol}`);
+    return;
+  }
+  const rest = body.slice(h.contentStart);
+  const next = rest.search(/^#{1,6}[ \t]/m);
+  const sectionEnd = next === -1 ? body.length : h.contentStart + next;
+  const section = body.slice(h.contentStart, sectionEnd).replace(/\s+$/, "");
+  const after = body.slice(sectionEnd);
+  const newSection =
+    (section.length > 0 ? section + eol + eol : eol) + text + eol + (after.length > 0 ? eol : "");
+  setBody(rec, body.slice(0, h.contentStart) + newSection + after);
+}
+
 /** Append a timestamped note line to the `## Log` body section. */
 export function addNote(
   projectRoot: string,

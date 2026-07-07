@@ -114,6 +114,22 @@
   .cli-row button:hover { border-color: var(--accent); color: var(--accent); }
   #doctor-list { font-size: 12px; color: var(--error); }
   #doctor-list li { margin-bottom: 4px; }
+  .actions { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .actions h4 { margin: 0 0 8px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .act-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .actions button { border: 1px solid var(--line); background: var(--panel); border-radius: 5px; padding: 4px 10px;
+    font-size: 12px; cursor: pointer; color: var(--ink); }
+  .actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .actions button:disabled { opacity: .45; cursor: default; }
+  .act-done { font-weight: 600; }
+  .actions .act-summary, .actions .act-note { width: 100%; box-sizing: border-box; border: 1px solid var(--line);
+    border-radius: 5px; padding: 6px 8px; font: inherit; font-size: 12.5px; }
+  .actions .act-note { flex: 1; }
+  .act-summary:focus, .act-note:focus { outline: 2px solid #c8d7ff; border-color: var(--accent); }
+  .act-done-panel { margin-bottom: 8px; }
+  .act-msg { font-size: 12px; min-height: 16px; }
+  .act-msg.err { color: var(--error); }
+  .act-msg.ok { color: var(--muted); }
 
   /* top-level view switch (Projects / Automations) */
   .viewtabs { display: flex; gap: 4px; margin-right: 6px; }
@@ -282,6 +298,27 @@ async function loadTaskDetail(projectUid, taskId) {
     throw err;
   } finally {
     detailInflight.delete(key);
+  }
+}
+
+// Write path (decision-1): POST a mutation, then refresh scan + detail so the
+// UI reflects the new state. Returns {ok, error} — callers surface the message.
+async function mutate(path, payload) {
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: (data && data.error) || ("HTTP " + res.status) };
+    // Merge the returned fresh task record and re-pull the scan (counts change).
+    const hit = findTask(payload.project, payload.task);
+    if (hit && data.task) Object.assign(hit.t, data.task);
+    await load();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -593,17 +630,41 @@ function renderDetail(st) {
     ["hidden until", t.hiddenUntil], ["recur", t.recur],
     ["created", t.created], ["updated", t.updated], ["file", t.file],
   ].filter(r => r[1]);
+  // Actions (decision-1): status transitions + note + done-with-summary, all
+  // routed through the library. Served only to the local operator; on a
+  // tailnet-served instance these POSTs 403 and the message surfaces inline.
+  const transitions = ["todo", "doing", "waiting", "review"];
+  const statusBtns = transitions.map(s =>
+    '<button class="act-status" data-status="' + s + '"' + (t.status === s ? " disabled" : "") + ">" + s + "</button>"
+  ).join("");
+  const isDone = t.status === "done";
+  const actionsHtml =
+    '<div class="actions"><h4>Actions</h4>' +
+    '<div class="act-row">' + statusBtns +
+      '<button class="act-done"' + (isDone ? " disabled" : "") + '>' + (isDone ? "done ✓" : "complete…") + "</button>" +
+    "</div>" +
+    '<div class="act-done-panel" hidden>' +
+      '<textarea class="act-summary" rows="3" placeholder="Final Summary (required to mark done)"></textarea>' +
+      '<div class="act-row"><button class="act-done-confirm">Mark done</button>' +
+      '<button class="act-done-cancel">Cancel</button></div>' +
+    "</div>" +
+    '<div class="act-row"><input class="act-note" type="text" placeholder="Add a note…" />' +
+      '<button class="act-note-add">Add note</button></div>' +
+    '<div class="act-msg" role="status"></div>' +
+    "</div>";
   aside.innerHTML =
     "<h3>" + esc(t.id) + " — " + esc(t.title) + "</h3>" +
     '<span class="lifecycle-tag">' + esc(p.name) + "</span>" +
     '<table class="meta-table">' +
     rows.map(r => "<tr><td>" + esc(r[0]) + "</td><td>" + esc(r[1]) + "</td></tr>").join("") +
     "</table>" +
+    actionsHtml +
     '<div class="md">' + renderMarkdown(t.body) + "</div>" +
     '<div class="cli"><h4>CLI</h4>' +
     commands.map(c =>
       '<div class="cli-row"><code>' + esc(c) + '</code><button data-cmd="' + esc(c) + '">Copy</button></div>'
     ).join("") + "</div>";
+  wireDetailActions(aside, p, t);
   aside.querySelectorAll(".cli-row button").forEach(b =>
     b.addEventListener("click", () => {
       navigator.clipboard.writeText(b.dataset.cmd).then(() => {
@@ -611,6 +672,54 @@ function renderDetail(st) {
         setTimeout(() => { b.textContent = "Copy"; }, 1200);
       });
     }));
+}
+
+// Wire the detail-pane action controls to the write path. Kept out of
+// renderDetail for readability; render() re-runs this on every repaint.
+function wireDetailActions(aside, p, t) {
+  const msg = aside.querySelector(".act-msg");
+  const say = (text, isErr) => { msg.textContent = text; msg.className = "act-msg" + (isErr ? " err" : " ok"); };
+  const busy = (on) => aside.querySelectorAll(".actions button, .actions textarea, .actions input")
+    .forEach(el => { el.disabled = on || (el.classList.contains("act-status") && el.dataset.status === t.status); });
+
+  aside.querySelectorAll(".act-status").forEach(b =>
+    b.addEventListener("click", async () => {
+      busy(true); say("Setting " + b.dataset.status + "…");
+      const r = await mutate("/api/task/status", { project: p.uid, task: t.id, status: b.dataset.status });
+      if (r.ok) { setState({ sel: t.id, selProject: p.uid }); render(); }
+      else { busy(false); say(r.error, true); }
+    }));
+
+  const donePanel = aside.querySelector(".act-done-panel");
+  const doneBtn = aside.querySelector(".act-done");
+  if (doneBtn && !doneBtn.disabled) {
+    doneBtn.addEventListener("click", () => {
+      donePanel.hidden = !donePanel.hidden;
+      if (!donePanel.hidden) aside.querySelector(".act-summary").focus();
+    });
+    aside.querySelector(".act-done-cancel").addEventListener("click", () => { donePanel.hidden = true; });
+    aside.querySelector(".act-done-confirm").addEventListener("click", async () => {
+      const summary = aside.querySelector(".act-summary").value.trim();
+      if (!summary) { say("A Final Summary is required to mark done.", true); return; }
+      busy(true); say("Completing…");
+      const r = await mutate("/api/task/done", { project: p.uid, task: t.id, summary });
+      if (r.ok) { setState({ sel: t.id, selProject: p.uid }); render(); }
+      else { busy(false); say(r.error, true); }
+    });
+  }
+
+  const noteBtn = aside.querySelector(".act-note-add");
+  const noteInput = aside.querySelector(".act-note");
+  const addNote = async () => {
+    const text = noteInput.value.trim();
+    if (!text) { say("Note text is empty.", true); return; }
+    busy(true); say("Adding note…");
+    const r = await mutate("/api/task/note", { project: p.uid, task: t.id, text });
+    if (r.ok) { setState({ sel: t.id, selProject: p.uid }); render(); }
+    else { busy(false); say(r.error, true); }
+  };
+  noteBtn.addEventListener("click", addNote);
+  noteInput.addEventListener("keydown", e => { if (e.key === "Enter") addNote(); });
 }
 
 // --- automations view ----------------------------------------------------
