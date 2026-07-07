@@ -15,14 +15,17 @@ import {
   AutomationsScanResult,
   RunningDashboard,
   ScanResult,
+  TaskDetailResult,
   buildAllowedHosts,
   hostAllowed,
   scanAutomations,
   scanWorkspace,
   startDashboard,
 } from "../src/dashboard/server.js";
+import type { MachineStore } from "../src/lib/machine.js";
 import { MARKER_DIR, openWorkspace } from "../src/lib/workspace.js";
-import { makeTmpWorkspace, TmpWorkspace } from "./helpers.js";
+import { automationStatePath, createAttempt } from "../src/primitives/automation-runs.js";
+import { makeTmpStore, makeTmpWorkspace, TmpWorkspace } from "./helpers.js";
 
 const NOW = new Date("2026-06-10T15:00:00Z");
 
@@ -280,8 +283,27 @@ test("http: GET /api/scan returns the live scan as JSON", async (t) => {
   assert.equal(scan.attention.doctorErrors, 3);
   const alpha = scan.projects.find((p) => p.uid === "uid-alpha")!;
   assert.equal(alpha.tasks.find((t2) => t2.id === "task-1")?.rollup?.status, "waiting");
-  // body ships for the detail pane
-  assert.match(alpha.tasks.find((t2) => t2.id === "task-1")!.body, /Parent body/);
+  // /api/scan is body-light for fast survey; /api/task carries the detail body.
+  assert.equal(alpha.tasks.find((t2) => t2.id === "task-1")!.body, "");
+});
+
+test("http: GET /api/task returns one full task detail record", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startFixtureDashboard(tmp);
+  t.after(() => running.close());
+
+  const res = await get(running.port, "/api/task?project=uid-alpha&task=task-1");
+  assert.equal(res.status, 200);
+  const detail = JSON.parse(res.body) as TaskDetailResult;
+  assert.equal(detail.project.uid, "uid-alpha");
+  assert.equal(detail.task.id, "task-1");
+  assert.match(detail.task.body, /Parent body/);
+
+  const missing = await get(running.port, "/api/task?project=uid-alpha&task=task-404");
+  assert.equal(missing.status, 404);
+  const bad = await get(running.port, "/api/task?project=uid-alpha");
+  assert.equal(bad.status, 400);
 });
 
 test("http: scan is live — a task added after startup appears on the next request", async (t) => {
@@ -595,15 +617,34 @@ function writeRegistry(wsRoot: string, machineId: string, body: string): void {
  *    mini registry activates it — activated-but-undeclared drift + invalid.
  * The mini heartbeat is fresh; the laptop heartbeat is stale (2 days old).
  */
-function buildAutomationsWorkspace(): TmpWorkspace {
+interface TmpAutomationsWorkspace extends TmpWorkspace {
+  store: MachineStore;
+  storeDir: string;
+}
+
+function buildAutomationsWorkspace(): TmpAutomationsWorkspace {
   const tmp = makeTmpWorkspace('workspace_id = "ws-auto-test"\n');
+  const local = makeTmpStore();
   const alpha = tmp.addProject("Alpha Project", "uid-alpha");
   const beta = tmp.addProject("Beta: With Colon", "uid-beta");
 
   writeManifest(
     alpha.root,
     "brief-refresh",
-    'machines = ["mini", "laptop"]\n[schedule]\ncron = "0 7 * * *"\n[run]\ncommand = ["echo", "hi"]\n',
+    [
+      'machines = ["mini", "laptop"]',
+      "[schedule]",
+      'cron = "0 7 * * *"',
+      'miss_policy = "catch-up"',
+      "misfire_grace_seconds = 120",
+      "max_catch_up = 2",
+      "[run]",
+      'kind = "codex"',
+      'command = ["echo", "hi"]',
+      'overlap_policy = "allow"',
+      "max_concurrency = 2",
+      "",
+    ].join("\n"),
   );
   writeManifest(
     alpha.root,
@@ -668,13 +709,21 @@ function buildAutomationsWorkspace(): TmpWorkspace {
     ['machine_id = "laptop"', 'heartbeat = "2026-06-08T15:00:00Z"', ""].join("\n") + "\n",
   );
 
-  return tmp;
+  return {
+    ...tmp,
+    store: local.store,
+    storeDir: local.store.dir,
+    cleanup: () => {
+      tmp.cleanup();
+      local.cleanup();
+    },
+  };
 }
 
 test("automations scan: machine registry strip — ids, staleness, activation counts", () => {
   const tmp = buildAutomationsWorkspace();
   try {
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
     assert.equal(r.workspace.workspaceId, "ws-auto-test");
     assert.equal(r.generatedAt, NOW.toISOString());
     const byId = new Map(r.machines.map((m) => [m.machineId, m]));
@@ -690,12 +739,22 @@ test("automations scan: machine registry strip — ids, staleness, activation co
 test("automations scan: active-here joins last-run + schedule; declared-elsewhere flagged", () => {
   const tmp = buildAutomationsWorkspace();
   try {
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
     const br = r.automations.find((a) => a.name === "brief-refresh")!;
     assert.deepEqual(br.declaredMachines, ["mini", "laptop"]);
     assert.deepEqual(br.activatedOn, ["mini"]);
     assert.equal(br.valid, true);
     assert.equal(br.schedule, "cron 0 7 * * *");
+    assert.equal(br.kind, "codex");
+    assert.equal(br.missPolicy, "catch-up");
+    assert.equal(br.misfireGraceSeconds, 120);
+    assert.equal(br.maxCatchUp, 2);
+    assert.equal(br.overlapPolicy, "allow");
+    assert.equal(br.maxConcurrency, 2);
+    assert.equal(br.localRunState, "unknown");
+    assert.equal(br.localRunHealth, "unknown");
+    assert.equal(br.localRun, null);
+    assert.equal(br.localRunUnavailable, "state-file-missing");
 
     const mini = br.machines.find((m) => m.machineId === "mini")!;
     assert.equal(mini.activated, true);
@@ -721,10 +780,13 @@ test("automations scan: active-here joins last-run + schedule; declared-elsewher
 test("automations scan: clean automation has no drift; fail last-run surfaced", () => {
   const tmp = buildAutomationsWorkspace();
   try {
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
     const fs2 = r.automations.find((a) => a.name === "finance-sync")!;
     assert.deepEqual(fs2.activatedOn, ["mini"]);
     assert.equal(fs2.drift.length, 0);
+    assert.equal(fs2.kind, "other");
+    assert.equal(fs2.missPolicy, "skip");
+    assert.equal(fs2.overlapPolicy, "skip");
     const mini = fs2.machines.find((m) => m.machineId === "mini")!;
     assert.equal(mini.lastRun?.status, "fail");
     assert.equal(mini.lastRun?.exitCode, 1);
@@ -736,10 +798,13 @@ test("automations scan: clean automation has no drift; fail last-run surfaced", 
 test("automations scan: activated-but-undeclared drift on an invalid manifest", () => {
   const tmp = buildAutomationsWorkspace();
   try {
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
     const rogue = r.automations.find((a) => a.name === "rogue")!;
     assert.equal(rogue.valid, false);
     assert.ok(rogue.problems.length >= 1, "invalid manifest carries problems");
+    assert.equal(rogue.kind, null);
+    assert.equal(rogue.missPolicy, null);
+    assert.equal(rogue.overlapPolicy, null);
     // declaredMachines empty (manifest invalid), but mini's registry activates it
     assert.deepEqual(rogue.declaredMachines, []);
     assert.deepEqual(rogue.activatedOn, ["mini"]);
@@ -754,10 +819,68 @@ test("automations scan: activated-but-undeclared drift on an invalid manifest", 
   }
 });
 
+test("automations scan: local run reads a single state-file attempt pointer", () => {
+  const tmp = buildAutomationsWorkspace();
+  try {
+    const attempt = createAttempt({
+      store: tmp.store,
+      uid: "uid-alpha",
+      name: "brief-refresh",
+      machine: "mini",
+      trigger: "calendar",
+      now: new Date("2026-06-10T14:58:00Z"),
+      status: "running",
+      phase: "executing",
+      startedAt: "2026-06-10T14:58:01Z",
+      heartbeatAt: "2026-06-10T14:59:30Z",
+      timeoutSeconds: 1800,
+      deadlineAt: "2026-06-10T15:28:01Z",
+    });
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
+    const br = r.automations.find((a) => a.name === "brief-refresh")!;
+    assert.equal(br.localRunState, "running");
+    assert.equal(br.localRunHealth, "ok");
+    assert.equal(br.localRunUnavailable, null);
+    assert.equal(br.localRun?.source, "attempt");
+    assert.equal(br.localRun?.runId, attempt.run_id);
+    assert.equal(br.localRun?.status, "running");
+    assert.equal(br.localRun?.heartbeatAt, "2026-06-10T14:59:30Z");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("automations scan: attempts are not scanned without a cheap state pointer", () => {
+  const tmp = buildAutomationsWorkspace();
+  try {
+    createAttempt({
+      store: tmp.store,
+      uid: "uid-alpha",
+      name: "finance-sync",
+      machine: "mini",
+      trigger: "calendar",
+      now: new Date("2026-06-10T14:45:00Z"),
+      status: "running",
+      phase: "executing",
+      heartbeatAt: "2026-06-10T14:45:30Z",
+    });
+    fs.unlinkSync(automationStatePath(tmp.store, "uid-alpha", "finance-sync"));
+
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
+    const fs2 = r.automations.find((a) => a.name === "finance-sync")!;
+    assert.equal(fs2.localRunState, "unknown");
+    assert.equal(fs2.localRunHealth, "unknown");
+    assert.equal(fs2.localRun, null);
+    assert.equal(fs2.localRunUnavailable, "state-file-missing");
+  } finally {
+    tmp.cleanup();
+  }
+});
+
 test("automations scan: flattened drift carries automation + project context", () => {
   const tmp = buildAutomationsWorkspace();
   try {
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: tmp.store });
     // two drift items total: laptop declared-not-activated, mini activated-undeclared
     assert.equal(r.drift.length, 2);
     const kinds = r.drift.map((d) => d.kind).sort();
@@ -773,21 +896,23 @@ test("automations scan: flattened drift carries automation + project context", (
 
 test("automations scan: empty workspace — no machines, no automations, no drift", () => {
   const tmp = makeTmpWorkspace();
+  const local = makeTmpStore();
   try {
     tmp.addProject("Bare", "uid-bare");
-    const r = scanAutomations(openWorkspace(tmp.root), NOW);
+    const r = scanAutomations(openWorkspace(tmp.root), NOW, { machineStore: local.store });
     assert.deepEqual(r.machines, []);
     assert.deepEqual(r.automations, []);
     assert.deepEqual(r.drift, []);
   } finally {
     tmp.cleanup();
+    local.cleanup();
   }
 });
 
 test("http: GET /api/automations returns the expected shape as JSON", async (t) => {
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, machineStoreDir: tmp.storeDir });
   t.after(() => running.close());
 
   const res = await get(running.port, "/api/automations");
@@ -805,7 +930,7 @@ test("http: GET /api/automations returns the expected shape as JSON", async (t) 
 test("http: /api/automations is live — a new registry activation appears next request", async (t) => {
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, machineStoreDir: tmp.storeDir });
   t.after(() => running.close());
 
   const before = JSON.parse((await get(running.port, "/api/automations")).body) as AutomationsScanResult;
@@ -836,7 +961,7 @@ test("http: /api/automations is live — a new registry activation appears next 
 test("http: /api/automations honors the Host-header defense + GET/HEAD-only", async (t) => {
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, machineStoreDir: tmp.storeDir });
   t.after(() => running.close());
 
   // bad Host rejected
@@ -854,7 +979,7 @@ test("http: /api/automations honors the Host-header defense + GET/HEAD-only", as
 test("http: /api/automations writes nothing into the workspace", async (t) => {
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, machineStoreDir: tmp.storeDir });
   t.after(() => running.close());
 
   const snapshot = (): string[] => {
@@ -878,7 +1003,7 @@ test("automations cache: TTL stale-while-revalidate parity with /api/scan", asyn
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
   const clock = mutableClock(NOW);
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: clock.now, cacheTtlMs: TTL });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: clock.now, cacheTtlMs: TTL, machineStoreDir: tmp.storeDir });
   t.after(() => running.close());
 
   const driftN = (s: AutomationsScanResult) => s.drift.length;

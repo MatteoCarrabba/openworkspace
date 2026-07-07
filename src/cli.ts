@@ -73,6 +73,12 @@ import * as decisions from "./primitives/decisions.js";
 import * as forum from "./primitives/forum.js";
 import * as tasks from "./primitives/tasks.js";
 import * as automations from "./primitives/automations.js";
+import {
+  applySupervisor,
+  deactivateSupervisor,
+  superviseLocalAutomations,
+  supervisorInstallStatus,
+} from "./primitives/automation-supervisor.js";
 import { runAutomation } from "./runner.js";
 import {
   SkillsEnv,
@@ -148,7 +154,9 @@ Automations (intent in the tree; activation is an explicit machine-local act)
   projects automation apply [<name>|--all] [--force]   compile cadence → LaunchAgent on THIS machine
   projects automation deactivate <name>                unload + remove this machine's activation
   projects automation list [--all]                     definitions (+ --all: every machine's registry)
-  projects automation status                           activation records ↔ launchd ↔ tree drift report
+  projects automation status                           activation/placement drift report (not runtime health)
+  projects automation supervise                        one local supervisor tick (recover stuck managed runs)
+  projects automation supervisor apply|status|deactivate  manage the local supervisor LaunchAgent
   projects automation prune                            remove orphaned/undeclared activations here
   projects automation logs <name> [--machine M]        machine-partitioned run logs
   projects automation run-now <name>                   run once, through the runner path
@@ -1689,7 +1697,7 @@ function automationCtx(projectRef: string | undefined): automations.AutomationCo
 
 function printStatusFindings(findings: automations.StatusFinding[]): void {
   if (findings.length === 0) {
-    print("automation status: no drift");
+    print("automation status: no activation drift found (runtime health not checked)");
     return;
   }
   for (const f of findings) {
@@ -1792,6 +1800,77 @@ function cmdAutomation(argv: string[]): void {
       else printStatusFindings(findings);
       return;
     }
+    case "supervise": {
+      const { values } = parse(rest, common);
+      const summary = superviseLocalAutomations({ store: getStore() });
+      if (values["json"] === true) {
+        printJson(summary);
+        return;
+      }
+      print(
+        `automation supervisor: checked ${summary.checked} local activation(s), ` +
+          `abandoned ${summary.abandoned} stuck run(s) on ${summary.machine}`,
+      );
+      for (const f of summary.findings) print(`${f.name}: ${f.kind} — ${f.detail}`);
+      return;
+    }
+    case "supervisor": {
+      const action = rest[0];
+      const actionRest = rest.slice(1);
+      const launchCtx = (intervalSeconds?: number) => ({
+        store: getStore(),
+        launchd: automations.launchdFromEnv(process.env),
+        ...(intervalSeconds !== undefined ? { intervalSeconds } : {}),
+      });
+      switch (action) {
+        case "apply": {
+          const { values } = parse(actionRest, {
+            ...common,
+            interval: { type: "string" },
+          });
+          let intervalSeconds: number | undefined;
+          if (values["interval"] !== undefined) {
+            const parsed = Number(values["interval"]);
+            if (!Number.isInteger(parsed) || parsed <= 0) {
+              throw new ConfigError(`invalid --interval: ${String(values["interval"])} (expected positive seconds)`);
+            }
+            intervalSeconds = parsed;
+          }
+          const result = applySupervisor(launchCtx(intervalSeconds));
+          if (values["json"] === true) {
+            printJson(result);
+            return;
+          }
+          print(`${result.label}: ${result.action} (${result.intervalSeconds}s)`);
+          for (const w of result.warnings) print(`WARNING: ${w}`);
+          return;
+        }
+        case "status": {
+          const { values } = parse(actionRest, common);
+          const result = supervisorInstallStatus(launchCtx());
+          if (values["json"] === true) {
+            printJson(result);
+            return;
+          }
+          print(`${result.label}: ${result.installed ? "installed" : "not installed"}, ${result.loaded ? "loaded" : "not loaded"}`);
+          return;
+        }
+        case "deactivate": {
+          const { values } = parse(actionRest, common);
+          const result = deactivateSupervisor(launchCtx());
+          if (values["json"] === true) {
+            printJson(result);
+            return;
+          }
+          print(result.removedPlist || result.wasLoaded ? `deactivated ${result.label}` : `${result.label}: nothing to deactivate`);
+          return;
+        }
+        default:
+          throw new ConfigError(
+            `unknown automation supervisor subcommand: ${action ?? "(none)"} (expected apply|status|deactivate)`,
+          );
+      }
+    }
     case "prune": {
       const { values } = parse(rest, common);
       const result = automations.prune(automationCtx(values["project"] as string | undefined));
@@ -1842,12 +1921,12 @@ function cmdAutomation(argv: string[]): void {
             `${outcome.exitCode !== null ? ` (exit ${outcome.exitCode})` : ""}` +
             `${outcome.logPath !== null ? ` — ${outcome.logPath}` : ""}`,
         );
-      if (outcome.status !== "ok" && outcome.status !== "skipped-dormant") process.exit(1);
+      if (outcome.status !== "ok" && outcome.status !== "skipped-dormant" && outcome.status !== "skipped") process.exit(1);
       return;
     }
     default:
       throw new ConfigError(
-        `unknown automation subcommand: ${sub ?? "(none)"} (expected apply|deactivate|list|status|prune|logs|run-now)`,
+        `unknown automation subcommand: ${sub ?? "(none)"} (expected apply|deactivate|list|status|supervise|supervisor|prune|logs|run-now)`,
       );
   }
 }
@@ -1950,6 +2029,8 @@ function cmdSkills(argv: string[]): void {
 
 // --- dashboard ---
 
+let activeDashboard: Awaited<ReturnType<typeof startDashboard>> | null = null;
+
 function cmdDashboard(argv: string[]): void {
   const sub = argv[0];
   if (sub !== "dev" && sub !== "open") {
@@ -2007,7 +2088,12 @@ function cmdDashboard(argv: string[]): void {
       configCacheTtlMs = cfg["cache_ttl_ms"];
     }
   }
-  const ws = openWorkspaceRegistered(configWorkspace ?? process.cwd());
+  const workspaceRoot = findWorkspaceRoot(configWorkspace ?? process.cwd());
+  if (workspaceRoot === null) {
+    throw new NotFoundError(
+      `no workspace found: no .openworkspace/ marker above ${path.resolve(configWorkspace ?? process.cwd())}`,
+    );
+  }
   const port = values["port"] !== undefined ? Number(values["port"]) : configPort ?? 0;
   if (Number.isNaN(port)) throw new ConfigError(`invalid --port: ${String(values["port"])}`);
   const host = (values["host"] as string | undefined) ?? configHost ?? undefined;
@@ -2023,8 +2109,9 @@ function cmdDashboard(argv: string[]): void {
     }
     cacheTtlMs = t;
   }
-  void startDashboard({ workspaceRoot: ws.root, port, host, allowedHosts, cacheTtlMs })
+  void startDashboard({ workspaceRoot, port, host, allowedHosts, cacheTtlMs })
     .then((running) => {
+      activeDashboard = running;
       print(`dashboard: ${running.url} (read-only; Ctrl-C to stop)`);
       if (sub === "open") spawn("open", [running.url], { stdio: "ignore", detached: true }).unref();
     })

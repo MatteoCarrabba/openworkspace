@@ -10,7 +10,7 @@
      showing declared machines, where each is ACTIVATED, per-machine last-run
      status/time + heartbeat staleness, and placement drift (declared-but-not-
      activated / activated-but-undeclared) the way doctor surfaces it.
-  Data: GET /api/scan + GET /api/automations. PRD §9 / §8.2.
+  Data: GET /api/scan + GET /api/task + GET /api/automations. PRD §9 / §8.2.
 -->
 <!-- OpenWorkspace dashboard v1 marker retained for back-compat tests. -->
 <html lang="en">
@@ -20,15 +20,15 @@
 <title>OpenWorkspace</title>
 <style>
   :root {
-    --bg: #f6f5f2; --panel: #ffffff; --ink: #1d1d1f; --muted: #76757a;
-    --line: #e4e2dd; --accent: #3a5fcd; --chip: #efeeea;
+    --bg: #f7f8fa; --panel: #ffffff; --ink: #1d1d1f; --muted: #667085;
+    --line: #d9dde3; --accent: #2f5fb8; --chip: #eef1f4;
     --waiting: #c2410c; --review: #7c3aed; --doing: #2563eb; --todo: #6b7280; --done: #16a34a;
     --error: #b91c1c;
   }
   * { box-sizing: border-box; }
   body { margin: 0; font: 14px/1.45 -apple-system, "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--ink); }
   header {
-    display: flex; align-items: center; gap: 14px; padding: 10px 18px;
+    display: flex; align-items: center; gap: 14px; padding: 10px 18px; flex-wrap: wrap;
     background: var(--panel); border-bottom: 1px solid var(--line);
     position: sticky; top: 0; z-index: 2;
   }
@@ -43,8 +43,8 @@
   .chip.unhidden { background: #e8f0fe; color: var(--accent); }
   .chip.doctor { background: #fdebeb; color: var(--error); }
 
-  #layout { display: grid; grid-template-columns: 200px minmax(0, 1fr) 380px; gap: 0; min-height: calc(100vh - 46px); }
-  nav { border-right: 1px solid var(--line); padding: 14px 10px; }
+  #layout { display: grid; grid-template-columns: 220px minmax(0, 1fr) 390px; gap: 0; height: calc(100vh - 46px); min-height: 520px; }
+  nav { border-right: 1px solid var(--line); padding: 14px 10px; overflow-y: auto; }
   nav .scope { display: block; width: 100%; text-align: left; border: 0; background: none; font: inherit;
     padding: 6px 10px; border-radius: 6px; cursor: pointer; color: var(--ink); }
   nav .scope:hover { background: var(--chip); }
@@ -52,12 +52,25 @@
   nav .scope .n { float: right; color: inherit; opacity: .65; }
   nav .toggle-row { margin-top: 18px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
   nav .toggle-row label { cursor: pointer; user-select: none; }
+  nav .filter { margin-top: 16px; padding: 0 10px; }
+  nav .filter label { display: block; margin-bottom: 5px; font-size: 12px; color: var(--muted); }
+  nav input[type="search"], nav select {
+    width: 100%; border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+    color: var(--ink); font: inherit; padding: 6px 8px;
+  }
+  nav input[type="search"]:focus, nav select:focus { outline: 2px solid #c8d7ff; border-color: var(--accent); }
 
-  main { padding: 16px 20px; overflow-x: hidden; }
+  main { padding: 16px 20px; overflow: auto; }
   .project { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; margin-bottom: 14px; }
   .project > h2 { font-size: 14px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line);
-    display: flex; gap: 10px; align-items: baseline; }
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .project.collapsed > h2 { border-bottom: 0; }
+  .project-toggle { width: 24px; height: 24px; border: 1px solid transparent; background: transparent;
+    border-radius: 6px; cursor: pointer; color: var(--muted); font: inherit; line-height: 1; flex: none; }
+  .project-toggle:hover { border-color: var(--line); color: var(--accent); background: var(--chip); }
+  .project-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .project > h2 .meta { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .project-summary { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 400; }
   .lifecycle-tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-weight: 500; }
   ul.tasks { list-style: none; margin: 0; padding: 6px 0; }
   li.task { padding: 4px 14px; display: flex; gap: 8px; align-items: baseline; cursor: pointer; border-left: 3px solid transparent; }
@@ -81,7 +94,7 @@
   .indent { margin-left: 22px; border-left: 1px solid var(--line); }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
 
-  aside { border-left: 1px solid var(--line); background: var(--panel); padding: 16px; overflow-wrap: break-word; }
+  aside { border-left: 1px solid var(--line); background: var(--panel); padding: 16px; overflow: auto; overflow-wrap: break-word; }
   aside h3 { margin: 0 0 4px; font-size: 15px; }
   aside .meta-table { width: 100%; font-size: 12px; margin: 10px 0; border-collapse: collapse; }
   aside .meta-table td { padding: 2px 6px 2px 0; vertical-align: top; }
@@ -137,6 +150,7 @@
   .pill.run-ok { background: #e7f6ec; color: var(--done); }
   .pill.run-fail { background: #fdebeb; color: var(--error); }
   .pill.run-other { background: var(--chip); color: var(--muted); }
+  .pill.run-unknown { background: #f8fafc; color: var(--muted); border: 1px dashed var(--line); }
   .mrow .when { color: var(--muted); }
   .mrow .hbcol { color: var(--muted); text-align: right; }
   .mrow .hbcol.stale { color: var(--waiting); }
@@ -145,6 +159,28 @@
   .auto-problems li { margin-left: 14px; }
   #auto-drift-banner { margin-bottom: 14px; }
   #auto-drift-banner .drift-line { border: 1px solid #f3d9c4; border-radius: 8px; margin-bottom: 6px; }
+
+  @media (max-width: 980px) {
+    header { gap: 8px; padding: 10px 12px; }
+    #refresh { margin-left: 0; }
+    #layout { grid-template-columns: 1fr; height: auto; min-height: 0; }
+    nav { border-right: 0; border-bottom: 1px solid var(--line); display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+    nav .scope { text-align: center; padding: 7px 6px; }
+    nav .scope .n { float: none; margin-left: 4px; }
+    nav .toggle-row, nav .filter { margin-top: 0; padding: 0; }
+    main { padding: 12px; max-height: none; }
+    aside { border-left: 0; border-top: 1px solid var(--line); max-height: none; }
+    .mrow { grid-template-columns: 1fr; gap: 4px; }
+    .mrow .hbcol { text-align: left; }
+  }
+
+  @media (max-width: 620px) {
+    header h1 { width: 100%; }
+    .chips { width: 100%; overflow-x: auto; }
+    nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    li.task { align-items: flex-start; }
+    .ttl { white-space: normal; }
+  }
 </style>
 </head>
 <body>
@@ -171,6 +207,8 @@
 let scan = null;
 let autos = null;
 let autosLoaded = false;
+const detailInflight = new Map();
+const collapsedProjects = new Set(JSON.parse(localStorage.getItem("ow-collapsed-projects") || "[]"));
 
 // --- URL-persisted view state (view, scope, subtasks toggle, selection) -----
 function getState() {
@@ -178,6 +216,8 @@ function getState() {
   return {
     view: q.get("view") === "automations" ? "automations" : "projects",
     scope: q.get("scope") || "active",
+    status: q.get("status") || "open",
+    q: q.get("q") || "",
     subtasks: q.get("subtasks") === "1",
     sel: q.get("task") || null,
     selProject: q.get("project") || null,
@@ -189,6 +229,8 @@ function setState(patch) {
   const q = new URLSearchParams();
   if (s.view !== "projects") q.set("view", s.view);
   if (s.scope !== "active") q.set("scope", s.scope);
+  if (s.status !== "open") q.set("status", s.status);
+  if (s.q) q.set("q", s.q);
   if (s.subtasks) q.set("subtasks", "1");
   if (s.sel) q.set("task", s.sel);
   if (s.selProject) q.set("project", s.selProject);
@@ -218,6 +260,29 @@ async function loadAutos() {
   if (!res.ok) { autos = { error: res.status }; autosLoaded = true; return; }
   autos = await res.json();
   autosLoaded = true;
+}
+
+async function loadTaskDetail(projectUid, taskId) {
+  const key = projectUid + "\u0000" + taskId;
+  if (detailInflight.has(key)) return detailInflight.get(key);
+  const promise = (async () => {
+    const res = await fetch("/api/task?project=" + encodeURIComponent(projectUid) + "&task=" + encodeURIComponent(taskId));
+    if (!res.ok) throw new Error("detail failed: " + res.status);
+    const detail = await res.json();
+    const hit = findTask(projectUid, taskId);
+    if (hit) Object.assign(hit.t, detail.task);
+    return detail;
+  })();
+  detailInflight.set(key, promise);
+  try {
+    return await promise;
+  } catch (err) {
+    const hit = findTask(projectUid, taskId);
+    if (hit) hit.t.body = "Task detail failed: " + (err instanceof Error ? err.message : String(err));
+    throw err;
+  } finally {
+    detailInflight.delete(key);
+  }
 }
 
 function projectsInScope(scope) {
@@ -306,10 +371,20 @@ function renderRail(st) {
     scopes.map(([key, label, n]) =>
       '<button class="scope' + (st.scope === key ? " sel" : "") + '" data-scope="' + key + '">' +
       esc(label) + ' <span class="n">' + n + "</span></button>").join("") +
+    '<div class="filter"><label for="task-search">Search</label><input type="search" id="task-search" value="' +
+    esc(st.q) + '"></div>' +
+    '<div class="filter"><label for="status-filter">Status</label><select id="status-filter">' +
+    [["open", "Open"], ["all", "All"], ["todo", "Todo"], ["doing", "Doing"], ["waiting", "Waiting"], ["review", "Review"], ["done", "Done"]].map(([key, label]) =>
+      '<option value="' + key + '"' + (st.status === key ? " selected" : "") + ">" + label + "</option>"
+    ).join("") + "</select></div>" +
     '<div class="toggle-row"><label><input type="checkbox" id="subtasks-toggle"' +
     (st.subtasks ? " checked" : "") + "> Subtasks shown</label></div>";
   rail.querySelectorAll(".scope").forEach(b =>
     b.addEventListener("click", () => setState({ scope: b.dataset.scope })));
+  rail.querySelector("#task-search").addEventListener("input", e =>
+    setState({ q: e.target.value }));
+  rail.querySelector("#status-filter").addEventListener("change", e =>
+    setState({ status: e.target.value }));
   rail.querySelector("#subtasks-toggle").addEventListener("change", e =>
     setState({ subtasks: e.target.checked }));
 }
@@ -362,6 +437,26 @@ function renderTree(p, tasks, st) {
   return branch(roots);
 }
 
+function taskMatchesFilters(p, t, st) {
+  if (st.status === "open" && t.status === "done") return false;
+  if (!["open", "all"].includes(st.status) && t.status !== st.status) return false;
+  const q = st.q.trim().toLowerCase();
+  if (!q) return true;
+  const hay = [p.name, p.relPath, t.id, t.title, t.status, t.quadrant || "", t.labels.join(" ")].join(" ").toLowerCase();
+  return hay.includes(q);
+}
+
+function projectCollapsed(uid) {
+  return collapsedProjects.has(uid);
+}
+
+function setProjectCollapsed(uid, collapsed) {
+  if (collapsed) collapsedProjects.add(uid);
+  else collapsedProjects.delete(uid);
+  localStorage.setItem("ow-collapsed-projects", JSON.stringify([...collapsedProjects]));
+  render();
+}
+
 function renderMain(st) {
   const main = document.getElementById("main");
   const projects = projectsInScope(st.scope);
@@ -371,23 +466,39 @@ function renderMain(st) {
   }
   let html = "";
   for (const p of projects) {
-    const visible = p.tasks.filter(t => !t.hidden);
+    const visible = p.tasks.filter(t => !t.hidden && taskMatchesFilters(p, t, st));
     const open = visible.filter(t => t.status !== "done");
     const done = visible.filter(t => t.status === "done");
     const hiddenN = p.taskCounts.hidden;
-    html += '<section class="project">' +
-      "<h2>" + esc(p.name) +
+    const collapsed = projectCollapsed(p.uid);
+    const summary = visible.length
+      ? open.length + " open" + (done.length ? " · " + done.length + " done" : "")
+      : "0 visible";
+    html += '<section class="project' + (collapsed ? " collapsed" : "") + '" data-project="' + esc(p.uid) + '">' +
+      '<h2><button class="project-toggle" data-project="' + esc(p.uid) +
+      '" aria-expanded="' + (collapsed ? "false" : "true") +
+      '" title="' + (collapsed ? "Expand project" : "Collapse project") + '">' +
+      (collapsed ? "▸" : "▾") + "</button>" +
+      '<span class="project-name">' + esc(p.name) + "</span>" +
       '<span class="lifecycle-tag">' + esc(p.lifecycle) + "</span>" +
       '<span class="meta">' + esc(p.relPath) +
-      (hiddenN ? " · " + hiddenN + " hidden" : "") + "</span></h2>";
-    if (visible.length === 0) {
+      (hiddenN ? " · " + hiddenN + " hidden" : "") + "</span>" +
+      '<span class="project-summary">' + esc(summary) + "</span></h2>";
+    if (collapsed) {
+      // Header-only state: the project still participates in counts/search, but
+      // its task list stays out of the way while surveying.
+    } else if (visible.length === 0) {
       html += '<div class="empty">No visible tasks</div>';
     } else {
-      html += '<ul class="tasks">' + renderTree(p, open, st) + "</ul>";
+      if (open.length) html += '<ul class="tasks">' + renderTree(p, open, st) + "</ul>";
       if (done.length) {
-        // Done collapsed by default.
-        html += '<details class="done-group"><summary>Done (' + done.length + ")</summary>" +
-          '<ul class="tasks">' + renderTree(p, done, st) + "</ul></details>";
+        if (st.status === "done") {
+          html += '<ul class="tasks">' + renderTree(p, done, st) + "</ul>";
+        } else {
+          // Done collapsed by default.
+          html += '<details class="done-group"><summary>Done (' + done.length + ")</summary>" +
+            '<ul class="tasks">' + renderTree(p, done, st) + "</ul></details>";
+        }
       }
     }
     html += "</section>";
@@ -400,6 +511,11 @@ function renderMain(st) {
       "</ul></section>";
   }
   main.innerHTML = html;
+  main.querySelectorAll(".project-toggle").forEach(btn =>
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      setProjectCollapsed(btn.dataset.project, btn.getAttribute("aria-expanded") === "true");
+    }));
   main.querySelectorAll("li.task").forEach(li =>
     li.addEventListener("click", () =>
       setState({ sel: li.dataset.task, selProject: li.dataset.project })));
@@ -455,6 +571,14 @@ function renderDetail(st) {
     return;
   }
   const { p, t } = hit;
+  if (!t.body) {
+    aside.innerHTML =
+      "<h3>" + esc(t.id) + " — " + esc(t.title) + "</h3>" +
+      '<span class="lifecycle-tag">' + esc(p.name) + "</span>" +
+      '<div class="empty">Loading task…</div>';
+    loadTaskDetail(p.uid, t.id).then(render).catch(render);
+    return;
+  }
   const ref = shq(p.relPath);
   // Copyable CLI affordances instead of buttons (v1 is read-only; v3's
   // mutations become copy-button → real-button with no IA change).
@@ -509,9 +633,36 @@ const STALE_MIN = 60;
 
 function runPill(lr) {
   if (!lr) return '<span class="pill run-other">never run</span>';
-  const ok = lr.status === "ok" || lr.status === "success" || (lr.exitCode === 0 && lr.status !== "fail");
-  const cls = ok ? "run-ok" : (lr.status === "fail" || lr.status === "error" ? "run-fail" : "run-other");
+  const okStatuses = ["ok", "success", "succeeded", "skipped"];
+  const failStatuses = ["fail", "failed", "error", "timed_out", "abandoned"];
+  const ok = okStatuses.includes(lr.status) || (lr.exitCode === 0 && !failStatuses.includes(lr.status));
+  const cls = ok ? "run-ok" : (failStatuses.includes(lr.status) ? "run-fail" : "run-other");
   return '<span class="pill ' + cls + '">' + esc(lr.status) + "</span>";
+}
+
+function localRunPill(a) {
+  const state = a.localRunState || "unknown";
+  const health = a.localRunHealth || "unknown";
+  const cls = health === "ok" ? "run-ok" : (health === "critical" ? "run-fail" : (health === "unknown" ? "run-unknown" : "run-other"));
+  const run = a.localRun;
+  const when = run ? fmtWhen(run.finishedAt || run.updatedAt || run.startedAt || run.heartbeatAt) : "";
+  const reason = a.localRunUnavailable ? " · " + a.localRunUnavailable.replace(/-/g, " ") : "";
+  const title = "local run " + state + reason + (when && when !== "—" ? " · " + when : "");
+  return '<span class="pill ' + cls + '" title="' + esc(title) + '">local ' + esc(state) + "</span>";
+}
+
+function missBadge(a) {
+  if (!a.missPolicy) return "";
+  let extra = "";
+  if (a.missPolicy === "catch-up" && a.maxCatchUp) extra = " max " + a.maxCatchUp;
+  else if (a.misfireGraceSeconds) extra = " grace " + a.misfireGraceSeconds + "s";
+  return '<span class="sched">miss ' + esc(a.missPolicy + extra) + "</span>";
+}
+
+function overlapBadge(a) {
+  if (!a.overlapPolicy) return "";
+  const extra = a.maxConcurrency && a.maxConcurrency > 1 ? " x" + a.maxConcurrency : "";
+  return '<span class="sched">overlap ' + esc(a.overlapPolicy + extra) + "</span>";
 }
 
 function renderAutos(st) {
@@ -577,6 +728,8 @@ function renderAutos(st) {
     cards += '<div class="auto-card' + (a.valid ? "" : " invalid") + '">' +
       "<h3><span class=\"aname\">" + esc(a.name) + "</span>" +
       (a.schedule ? '<span class="sched">' + esc(a.schedule) + "</span>" : "") +
+      (a.kind ? '<span class="sched">kind ' + esc(a.kind) + "</span>" : "") +
+      missBadge(a) + overlapBadge(a) + localRunPill(a) +
       (a.valid ? "" : '<span class="sched" style="background:#fdebeb;color:var(--error)">invalid manifest</span>') +
       '<span class="ameta">' + esc(a.project.name) + " · " + esc(a.project.lifecycle) +
       " · active on " + activeWhere + " · declared " + declWhere + "</span></h3>" +
@@ -597,6 +750,7 @@ document.querySelectorAll("#viewtabs button").forEach(b =>
 document.getElementById("refresh").addEventListener("click", async () => {
   // Refresh re-fetches the scan and, if showing automations, the automations.
   autosLoaded = false;
+  detailInflight.clear();
   await load();
 });
 load();
