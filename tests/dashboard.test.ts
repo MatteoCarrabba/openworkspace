@@ -1667,3 +1667,42 @@ test("reveal: readOnly:true hard-disables the reveal endpoint too (405)", async 
   assert.equal(res.status, 405);
   assert.equal(calls.length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Automation logs viewer (GET /api/automation/logs)
+
+test("automation logs: returns the recorded per-run log, lists runs, and gates bad input", async (t) => {
+  const tmp = buildAutomationsWorkspace();
+  t.after(() => tmp.cleanup());
+  // A per-run log exactly as the runner writes it.
+  const alpha = path.join(tmp.root, "Alpha Project");
+  const logDir = path.join(alpha, "_project", "automations", "brief-refresh", "logs", "laptop");
+  fs.mkdirSync(logDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(logDir, "20260708T120000Z.log"),
+    "# automation: brief-refresh\n--- stdout ---\nhello from the run\n--- exit: 0 ---\n",
+  );
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW, machineStoreDir: tmp.storeDir });
+  t.after(() => running.close());
+
+  const res = await get(running.port, "/api/automation/logs?project=uid-alpha&name=brief-refresh");
+  assert.equal(res.status, 200);
+  const body = JSON.parse(res.body) as {
+    name: string;
+    runs: Array<{ machine: string; stamp: string }>;
+    selected: { machine: string; stamp: string; content: string; truncated: boolean } | null;
+  };
+  assert.equal(body.name, "brief-refresh");
+  assert.deepEqual(body.runs, [{ machine: "laptop", stamp: "20260708T120000Z" }]);
+  assert.equal(body.selected?.machine, "laptop");
+  assert.match(body.selected!.content, /hello from the run/);
+  assert.equal(body.selected!.truncated, false);
+
+  // A specific run (that logsFor enumerated) is readable; a made-up stamp is not (traversal-safe).
+  assert.equal((await get(running.port, "/api/automation/logs?project=uid-alpha&name=brief-refresh&machine=laptop&run=20260708T120000Z")).status, 200);
+  assert.equal((await get(running.port, "/api/automation/logs?project=uid-alpha&name=brief-refresh&run=..%2F..%2Fescape")).status, 404);
+
+  // Unknown project → 404; missing name → 400.
+  assert.equal((await get(running.port, "/api/automation/logs?project=nope&name=brief-refresh")).status, 404);
+  assert.equal((await get(running.port, "/api/automation/logs?project=uid-alpha")).status, 400);
+});

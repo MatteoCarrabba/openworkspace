@@ -43,7 +43,7 @@ import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
 import { ConfigError, ConflictError, NotFoundError, OwError } from "../lib/errors.js";
 import { sha256Hex } from "../lib/fsatomic.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
-import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
+import { STORE_DIR_ENV, defaultStoreDir, openMachineStore } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
 import {
   TaskStateError,
@@ -63,7 +63,7 @@ import {
   findWorkspaceRoot,
   openWorkspace,
 } from "../lib/workspace.js";
-import { scanManifests } from "../primitives/automations.js";
+import { scanManifests, logsFor, launchdFromEnv } from "../primitives/automations.js";
 import {
   automationStatePath,
   computeRunHealth,
@@ -1649,6 +1649,9 @@ function sendJson(res: http.ServerResponse, statusCode: number, payload: unknown
 // transitions — hold by construction; the server never hand-edits a file.
 
 /** POST paths the mutation layer serves, each 1:1 with a library verb. */
+/** Tail cap for /api/automation/logs — a claude run's stdout can be large. */
+const LOG_TAIL_BYTES = 128 * 1024;
+
 export const MUTATION_PATHS: ReadonlySet<string> = new Set([
   "/api/task/status",
   "/api/task/done",
@@ -2076,6 +2079,68 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
           sendJson(res, 200, await automationsCache.get());
         } catch (err) {
           sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      })();
+      return;
+    }
+
+    // Read-only: the machine-partitioned per-run logs the runner writes under
+    // _project/automations/<name>/logs/<machine>/<stamp>.log. Wraps the same
+    // logsFor() the CLI's `automation logs` uses. Path-traversal-safe by
+    // construction: a `run` is only served if it matches a file logsFor()
+    // itself enumerated; content is tail-capped so a huge claude stdout can't
+    // blow up the response. (Secret VALUES are never in these logs — the runner
+    // logs only secret KEYS.)
+    if (pathname === "/api/automation/logs") {
+      const project = url.searchParams.get("project");
+      const name = url.searchParams.get("name");
+      const machineFilter = url.searchParams.get("machine") ?? undefined;
+      const run = url.searchParams.get("run");
+      if (project === null || name === null || project === "" || name === "") {
+        sendJson(res, 400, { error: "missing project or name query parameter" });
+        return;
+      }
+      void (async () => {
+        try {
+          const root = projectRootForUid(options.workspaceRoot, project);
+          if (root === null) {
+            sendJson(res, 404, { error: "project not found" });
+            return;
+          }
+          const ctx = {
+            startDir: root,
+            store: openMachineStore(options.machineStoreDir, process.env),
+            launchd: launchdFromEnv(process.env),
+          };
+          const result = logsFor(ctx, name, machineFilter !== undefined ? { machine: machineFilter } : {});
+          const stampOf = (p: string): string => path.basename(p).replace(/\.log$/, "");
+          const runs = result.files.map((f) => ({ machine: f.machine, stamp: stampOf(f.path) }));
+          let selected: { machine: string; stamp: string; content: string; truncated: boolean } | null = null;
+          const cap = (content: string): { content: string; truncated: boolean } =>
+            Buffer.byteLength(content) <= LOG_TAIL_BYTES
+              ? { content, truncated: false }
+              : { content: content.slice(-LOG_TAIL_BYTES), truncated: true };
+          if (run !== null && run !== "") {
+            const match = result.files.find(
+              (f) => stampOf(f.path) === run && (machineFilter === undefined || f.machine === machineFilter),
+            );
+            if (match === undefined) {
+              sendJson(res, 404, { error: "run not found" });
+              return;
+            }
+            selected = { machine: match.machine, stamp: run, ...cap(fs.readFileSync(match.path, "utf8")) };
+          } else if (result.latest !== null) {
+            selected = {
+              machine: result.latest.machine,
+              stamp: stampOf(result.latest.path),
+              ...cap(result.latest.content),
+            };
+          }
+          sendJson(res, 200, { name: result.name, runs, selected });
+        } catch (err) {
+          sendJson(res, err instanceof NotFoundError ? 404 : 500, {
             error: err instanceof Error ? err.message : String(err),
           });
         }
