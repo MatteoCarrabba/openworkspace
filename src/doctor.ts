@@ -714,6 +714,13 @@ function unresolvedSecretSchemes(ws: Workspace, projects: ProjectInfo[]): Doctor
  * longer declares), plus orphans (a registry activation whose project UID
  * resolves nowhere in this workspace). Warnings: doctor proposes
  * (`apply` / `deactivate` / `prune`), never executes.
+ *
+ * VESTIGIAL-CANDIDATE (hub phase): this whole function is cross-machine
+ * drift-healing — it exists because N machines apply independently and
+ * nothing else guarantees their local truth agrees. A single-executor hub
+ * removes the second independent actor this reconciles against; see
+ * `_project/wiki/compute-plane-vestigial-catalog.md` §3. Not removed here —
+ * still functioning and depended on by the live laptop automations.
  */
 export function automationPlacementIssues(ws: Workspace, projects: ProjectInfo[]): DoctorIssue[] {
   const issues: DoctorIssue[] = [];
@@ -1261,6 +1268,10 @@ export function doctorWorkspaceOnly(
   }
 
   // machine-registry heartbeat staleness (.openworkspace/machines/<id>.toml)
+  // VESTIGIAL-CANDIDATE (hub phase): staleness answers "has that OTHER
+  // machine gone dark" — meaningless with one executor, whose liveness is a
+  // process-supervision question instead. See
+  // `_project/wiki/compute-plane-vestigial-catalog.md` §2. Not removed here.
   const machinesDir = path.join(ws.root, ".openworkspace", "machines");
   const nowMs = (options.now ?? new Date()).getTime();
   for (const ent of listDir(machinesDir)) {

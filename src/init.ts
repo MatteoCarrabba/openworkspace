@@ -250,6 +250,13 @@ export function initWorkspace(dir: string): InitWorkspaceResult {
  * machine, all through `patchMachineRegistry`, so the single-writer property
  * holds across machines while every write also refreshes the heartbeat
  * (a write IS a liveness proof). Reporting, never a control plane.
+ *
+ * VESTIGIAL-CANDIDATE (hub phase): the heartbeat stamp is peer-liveness
+ * machinery — it lets OTHER machines infer this one is alive by reading its
+ * synced file. A single-executor hub has no peers to prove liveness to this
+ * way; see `_project/wiki/compute-plane-vestigial-catalog.md` §1 before
+ * touching this. Not removed here — still functioning and depended on by the
+ * live laptop automations.
  */
 export function patchMachineRegistry(
   workspaceRoot: string,

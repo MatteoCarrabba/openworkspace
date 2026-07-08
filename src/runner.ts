@@ -8,8 +8,10 @@
  *      rescan of known workspaces; loud ResolveError when orphaned),
  *   2. loads + validates the manifest from the live tree (logic edits need
  *      no re-apply — the tree is read fresh on every run),
- *   3. honors on_dormant_project (movement signals lifecycle, extended into
- *      the automation layer),
+ *   3. honors on_dormant_project against the project's EFFECTIVE lifecycle
+ *      (decision-2: the declared `_project/project.toml` value, with folder
+ *      location as the fallback/seed when nothing is declared — never
+ *      location as the primary signal),
  *   4. resolves [secrets] pointers through the workspace-configured scheme
  *      resolvers (§7.5) — resolver stdout becomes an ENV value for the child;
  *      nothing is ever written to disk,
@@ -36,7 +38,7 @@ import { recordRegistryRunOutcome } from "./init.js";
 import { ConfigError, ConflictError, OwError } from "./lib/errors.js";
 import { ensureDir, writeFileAtomic } from "./lib/fsatomic.js";
 import { MachineStore, machineId, openMachineStore } from "./lib/machine.js";
-import { findWorkspaceRoot, lifecycleOf, loadWorkspaceConfig } from "./lib/workspace.js";
+import { effectiveLifecycle, findWorkspaceRoot, loadWorkspaceConfig } from "./lib/workspace.js";
 import {
   AutomationManifest,
   loadManifest,
@@ -412,10 +414,14 @@ export function runAutomation(options: RunnerOptions): RunOutcome {
       throw err;
     }
 
-    // 3. lifecycle: a non-active project with on_dormant_project = "stop" skips
+    // 3. lifecycle: a non-active project with on_dormant_project = "stop" skips.
+    // decision-2 (metadata-as-truth): the EFFECTIVE lifecycle is the declared
+    // project.toml value, falling back to folder location only when nothing
+    // is declared — never location as the primary signal, so a project
+    // declared dormant but not yet physically shelved still stops here.
     if (workspaceRoot !== null && manifest.onDormantProject === "stop") {
       const ws = { root: workspaceRoot, config: config ?? loadWorkspaceConfig(workspaceRoot) };
-      const lifecycle = lifecycleOf(ws, canonicalRoot);
+      const lifecycle = effectiveLifecycle(ws, canonicalRoot);
       if (lifecycle !== "active") {
         return finish(
           "skipped-dormant",

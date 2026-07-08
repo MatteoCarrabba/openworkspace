@@ -17,6 +17,16 @@ export function ensureDir(dirPath: string): void {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
+/**
+ * sha256 of the exact bytes given, hex-encoded. Used for optimistic
+ * concurrency: callers hash what they read and compare against a fresh hash
+ * immediately before an atomic write, so a concurrent writer's changes are
+ * detected instead of clobbered (PRD §5.1 write-race hole, Phase 1a).
+ */
+export function sha256Hex(data: string | Buffer): string {
+  return crypto.createHash("sha256").update(data).digest("hex");
+}
+
 function tempPathFor(filePath: string): string {
   const dir = path.dirname(filePath);
   const base = path.basename(filePath);

@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { ConfigError, NotFoundError } from "./errors.js";
+import { configuredWorkspaceRoot } from "./locations.js";
 import { TomlTable, readTomlIfExists, writeToml } from "./toml.js";
 
 export const MARKER_DIR = ".openworkspace";
@@ -384,8 +385,39 @@ export function loadWorkspaceConfig(rootDir: string): WorkspaceConfig {
   return config;
 }
 
-/** Open the workspace containing `startDir`; throws NotFoundError if none. */
-export function openWorkspace(startDir: string): Workspace {
+/**
+ * Open the workspace containing `startDir`; throws NotFoundError if none.
+ *
+ * Resolution order (phase 2 — location externalized from config):
+ *  1. `~/.config/openworkspace/locations.toml` (or `OPENWORKSPACE_CONFIG_DIR`):
+ *     if it exists and names a `localfs` store, that store's `path` IS the
+ *     workspace root — `startDir` is not consulted at all. This is what lets
+ *     `projects` run from anywhere, not only from inside the tree.
+ *  2. Otherwise, fall back to today's behavior unchanged: walk up from
+ *     `startDir` looking for `.openworkspace/`.
+ * An absent or malformed locations.toml is indistinguishable from "no
+ * config" (see `locations.ts`), so behavior with no config file is exactly
+ * today's — this is intentionally conservative on a core resolution path.
+ */
+export function openWorkspace(startDir: string, env: NodeJS.ProcessEnv = process.env): Workspace {
+  const configured = configuredWorkspaceRoot(env);
+  if (configured !== null) {
+    const marker = path.join(configured, MARKER_DIR);
+    let st: fs.Stats | null = null;
+    try {
+      st = fs.statSync(marker);
+    } catch {
+      st = null;
+    }
+    if (st === null || !st.isDirectory()) {
+      throw new NotFoundError(
+        `configured workspace store "${configured}" has no ${MARKER_DIR}/ marker ` +
+          `(check locations.toml — see \`projects locations list\`)`,
+      );
+    }
+    return { root: configured, config: loadWorkspaceConfig(configured) };
+  }
+
   const root = findWorkspaceRoot(startDir);
   if (root === null) {
     throw new NotFoundError(

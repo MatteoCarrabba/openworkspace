@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { ConfigError, ConflictError, NotFoundError, OwError } from "../lib/errors.js";
-import { createExclusive, ensureDir } from "../lib/fsatomic.js";
+import { createExclusive, ensureDir, sha256Hex } from "../lib/fsatomic.js";
 import {
   FrontmatterRecord,
   deleteFields,
@@ -220,6 +220,14 @@ interface TaskFile {
   path: string;
   filename: string;
   rec: FrontmatterRecord;
+  /**
+   * sha256 of the exact bytes read from disk for `rec` (optimistic
+   * concurrency, Phase 1a). touchAndWrite re-hashes the on-disk file
+   * immediately before its atomic write and throws ConflictError on mismatch
+   * rather than clobbering a concurrent writer (the CLI and Obsidian both
+   * write task files).
+   */
+  contentHash: string;
 }
 
 function scanTaskFiles(projectRoot: string): TaskFile[] {
@@ -238,12 +246,14 @@ function scanTaskFiles(projectRoot: string): TaskFile[] {
     const parsed = idFromFilename(entry.name);
     if (parsed === null || parsed.prefix !== "task") continue;
     const filePath = path.join(dir, entry.name);
+    const rec = readRecord(filePath);
     out.push({
       id: formatId("task", parsed.parts, parsed.machineSuffix),
       parsed,
       path: filePath,
       filename: entry.name,
-      rec: readRecord(filePath),
+      rec,
+      contentHash: sha256Hex(rec.originalText),
     });
   }
   return out;
@@ -519,12 +529,14 @@ export function createTask(
     },
   });
 
+  const createdRec = readRecord(createdPath);
   return toTask({
     id,
     parsed: parseId(id) as ParsedId,
     path: createdPath,
     filename: path.basename(createdPath),
-    rec: readRecord(createdPath),
+    rec: createdRec,
+    contentHash: sha256Hex(createdRec.originalText),
   });
 }
 
@@ -585,8 +597,32 @@ export function showTask(projectRoot: string, ref: string): TaskSubtree {
 // mutations
 // ---------------------------------------------------------------------------
 
+/**
+ * Optimistic-concurrency guard (Phase 1a): re-read the on-disk file right
+ * before the write and compare it against the hash captured when `tf` was
+ * read. A mismatch means another writer (the CLI, Obsidian, …) touched the
+ * file in the window between our read and our write; we must not clobber
+ * it, so this throws instead of proceeding. A file that vanished entirely
+ * counts as "changed underneath us" too.
+ */
+function assertUnchangedOnDisk(tf: TaskFile): void {
+  let current: string;
+  try {
+    current = fs.readFileSync(tf.path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new ConflictError(`${tf.id}: file changed on disk since it was read — retry`);
+    }
+    throw err;
+  }
+  if (sha256Hex(current) !== tf.contentHash) {
+    throw new ConflictError(`${tf.id}: file changed on disk since it was read — retry`);
+  }
+}
+
 function touchAndWrite(tf: TaskFile, updates: Record<string, unknown>, now: Date): Task {
   setFields(tf.rec, { ...updates, updated: isoSecond(now) });
+  assertUnchangedOnDisk(tf);
   writeRecord(tf.path, tf.rec);
   return toTask(tf);
 }

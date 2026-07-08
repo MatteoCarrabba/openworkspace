@@ -1,0 +1,24 @@
+<!doctype html>
+<!--
+  OpenWorkspace dashboard — React port (single-file build). Same IA as the
+  v1/v2 vanilla-JS dashboard this replaces (kept at ../index.html as a
+  reference fallback): a Projects view (left-rail lifecycle scope + search +
+  status filter + subtasks toggle, master list of collapsible per-project
+  task trees, right detail pane with markdown body + status/done/note
+  actions + copyable CLI commands) and an Automations view (machine
+  heartbeat strip + per-automation machine rows with run-health pills).
+  Data: GET /api/scan, GET /api/task, GET /api/automations; writes POST
+  /api/task/status|done|note. URL-persisted state: ?view=&scope=&status=&
+  q=&subtasks=&task=&project=&autofilter=. PRD §9 / §8.2.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OpenWorkspace</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

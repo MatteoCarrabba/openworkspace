@@ -11,7 +11,7 @@ the PRD wins.
 
   | Agent / concern | Owns (source) | Owns (tests) |
   |---|---|---|
-  | foundation (done) | `src/lib/*.ts`, `tests/helpers.ts`, `tests/fixtures/**` | `tests/{fsatomic,frontmatter,toml,workspace,machine,resolve,ids}.test.ts` |
+  | foundation (done) | `src/lib/*.ts`, `tests/helpers.ts`, `tests/fixtures/**` | `tests/{fsatomic,frontmatter,toml,workspace,machine,resolve,ids,locations}.test.ts` |
   | tasks | `src/primitives/tasks.ts` | `tests/tasks.test.ts` |
   | decisions | `src/primitives/decisions.ts` | `tests/decisions.test.ts` |
   | forum | `src/primitives/forum.ts` | `tests/forum.test.ts` |
@@ -153,7 +153,7 @@ interface ProjectInfo {
 }
 function findWorkspaceRoot(startDir: string): string | null    // walk-up for .openworkspace/
 function loadWorkspaceConfig(rootDir: string): WorkspaceConfig // all keys optional + defaults
-function openWorkspace(startDir: string): Workspace            // NotFoundError if no marker
+function openWorkspace(startDir: string, env?): Workspace       // config-first (locations.ts), else walk-up; NotFoundError if neither
 function readProjectUid(dir: string): string | null            // _project/id, trimmed
 function isProjectBoundary(dir: string): boolean
 function findProjectRoot(startDir: string): { root: string; uid: string } | null  // walk-up
@@ -175,6 +175,27 @@ scans (`all: true` includes them); lifecycle's SOURCE OF TRUTH is the declared
 derived view — `reconcile` aligns them (decision-2). Primitive scanners
 (tasks/forum/…) must NOT descend across a nested project boundary — use
 `isProjectBoundary` when walking project content.
+
+## `src/lib/locations.ts` — locations config (phase 2: identity/location/discovery split)
+
+```ts
+const CONFIG_DIR_ENV = "OPENWORKSPACE_CONFIG_DIR"
+const LOCATIONS_FILE = "locations.toml"
+type StoreDriver = "localfs"
+interface LocationStore { name: string; driver: StoreDriver; path: string }  // path absolute
+function defaultConfigDir(env?): string          // ~/.config/openworkspace (or CONFIG_DIR_ENV)
+function locationsFilePath(env?): string
+function loadLocationStores(env?): LocationStore[]     // forgiving: absent/malformed/invalid → []
+function configuredWorkspaceRoot(env?): string | null  // first localfs store's path, else null
+```
+
+`~/.config/openworkspace/locations.toml` is `[[stores]]` of `{ name, driver, path }`.
+Only `driver = "localfs"` exists today — a store IS a workspace root. This module owns
+LOCATION only ("where is the tree"); it never touches identity (`_project/id`) or
+discovery (the live walk in `workspace.ts`). `openWorkspace` consults
+`configuredWorkspaceRoot` first; when null (no file, malformed file, or no valid
+store) it falls back unchanged to walk-up-from-cwd. Never stamps the real
+`~/.config/openworkspace/` — that file is hand-authored (or by a future `locations add`).
 
 ## `src/lib/machine.ts` — machine identity + machine-local store
 
