@@ -83,7 +83,16 @@ export interface SignatureEntry {
 
 export interface AutomationManifest {
   name: string;
-  /** Declared placement intent (§7.1, terraform-style). */
+  /**
+   * Declared placement intent (§7.1, terraform-style): the set of "executors"
+   * — machine ids — this automation is declared to run on. `apply`/`status`/
+   * `prune` compare THIS machine's id against the set; nothing about the
+   * value implies a scheduler, a pool, or any coordination beyond that
+   * membership check. Parsed from `runs_on` (the forward name — see
+   * `validateManifest`'s runs_on/machines handling) or the legacy `machines`
+   * key; either spelling lands here identically, so every consumer of
+   * `AutomationManifest` reads this one field.
+   */
   machines: string[];
   schedule: {
     cron: string | null;
@@ -290,12 +299,48 @@ export function validateManifest(
     }
   }
 
-  // machines: declared placement intent — required (§7.1: part of the design)
-  const machines = stringArray(raw["machines"]) ?? [];
-  if (raw["machines"] === undefined || machines.length === 0) {
-    prob("no-machines", "no declared machines (machines = [...]) — placement intent is part of the automation's design (PRD §7.1)");
-  } else if (stringArray(raw["machines"]) === null) {
-    prob("machines", "machines must be an array of strings");
+  // runs_on: declared placement intent — required (§7.1: part of the design).
+  // `runs_on` is the forward name for the executor set (the machine ids this
+  // automation is declared to run on); `machines` is kept as a
+  // backward-compatible alias so every automation.toml written before this
+  // field existed continues to parse identically. Declaring both is only
+  // accepted when they agree — one placement, one meaning; a mismatch is an
+  // authoring error, not something to silently resolve.
+  const hasRunsOn = raw["runs_on"] !== undefined;
+  const hasMachines = raw["machines"] !== undefined;
+  let machines: string[] = [];
+  if (!hasRunsOn && !hasMachines) {
+    prob(
+      "no-machines",
+      "no declared placement (runs_on = [...], or legacy machines = [...]) — placement intent is part of the automation's design (PRD §7.1)",
+    );
+  } else {
+    const runsOnArr = hasRunsOn ? stringArray(raw["runs_on"]) : undefined;
+    const machinesArr = hasMachines ? stringArray(raw["machines"]) : undefined;
+    if (hasRunsOn && runsOnArr === null) prob("machines", "runs_on must be an array of strings");
+    if (hasMachines && machinesArr === null) prob("machines", "machines must be an array of strings");
+    if ((!hasRunsOn || runsOnArr !== null) && (!hasMachines || machinesArr !== null)) {
+      if (hasRunsOn && hasMachines) {
+        const a = runsOnArr as string[];
+        const b = machinesArr as string[];
+        if (a.length === b.length && a.every((x, i) => x === b[i])) {
+          machines = a;
+        } else {
+          prob(
+            "runs-on-machines-conflict",
+            `[runs_on] and legacy [machines] are both declared and disagree (runs_on = [${a.map((x) => JSON.stringify(x)).join(", ")}], machines = [${b.map((x) => JSON.stringify(x)).join(", ")}]) — declare placement once`,
+          );
+        }
+      } else {
+        machines = (runsOnArr ?? machinesArr) as string[];
+      }
+      if (machines.length === 0) {
+        prob(
+          "no-machines",
+          "declared placement is empty — placement intent is part of the automation's design (PRD §7.1)",
+        );
+      }
+    }
   }
 
   // [schedule]: exactly one of cron | calendar_interval
@@ -1239,6 +1284,13 @@ export function listAutomations(ctx: AutomationContext): AutomationListEntry[] {
   return out;
 }
 
+// VESTIGIAL-CANDIDATE (hub phase): MachineRegistryView (staleDays especially)
+// and its two readers below (listAllMachines, listAllMachinesAt) exist to let
+// one machine report on ANOTHER machine's independently-written registry —
+// peer coordination. A single-executor hub has no peer registries to survey.
+// See `_project/wiki/compute-plane-vestigial-catalog.md` §2 before touching
+// this. Not removed here — still functioning (`list --all`, `status`) and
+// depended on by the live laptop automations.
 export interface MachineRegistryView {
   machineId: string;
   heartbeat: string | null;
@@ -1315,6 +1367,12 @@ export type StatusKind =
   | "orphan" // activation whose UID no longer resolves anywhere
   | "activated-undeclared" // active here but the manifest no longer declares this machine
   | "manifest-invalid-active" // ACTIVE somewhere but the manifest is present-but-invalid (every fire fails)
+  // VESTIGIAL-CANDIDATE (hub phase): the two kinds below exist to reconcile
+  // THIS manifest's declared placement against ANOTHER machine's
+  // independently-written registry — cross-machine drift-healing. A
+  // single-executor hub has no second independent registry to drift from;
+  // see `_project/wiki/compute-plane-vestigial-catalog.md` §3. Not removed
+  // here — still functioning and depended on by the live laptop automations.
   | "remote-declared-inactive" // another declared machine's registry shows no activation
   | "remote-activated-undeclared"; // another machine's registry shows an undeclared activation
 

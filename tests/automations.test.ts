@@ -282,6 +282,54 @@ test("manifest: every malformed shape is a named problem (validation gates apply
   assert.ok(tzProblems.some((p) => p.code === "timezone" && /not implemented/.test(p.message)));
 });
 
+test("manifest: runs_on is the forward name for placement; machines is a backward-compatible alias", () => {
+  const base = `[schedule]\ncron="0 9 * * *"\n[run]\ncommand=["/bin/true"]\n`;
+
+  // runs_on alone parses identically to machines alone.
+  const viaRunsOn = validateManifest(parseToml(`runs_on=["mini", "laptop"]\n${base}`), { dirName: "auto" });
+  const viaMachines = validateManifest(parseToml(`machines=["mini", "laptop"]\n${base}`), { dirName: "auto" });
+  assert.deepEqual(viaRunsOn.problems, []);
+  assert.deepEqual(viaRunsOn.manifest?.machines, ["mini", "laptop"]);
+  assert.deepEqual(viaRunsOn.manifest?.machines, viaMachines.manifest?.machines);
+  // Every other field is unaffected by which spelling declared placement.
+  assert.deepEqual(
+    { ...viaRunsOn.manifest, raw: undefined },
+    { ...viaMachines.manifest, raw: undefined },
+  );
+
+  // Declaring both is fine when they agree (same list).
+  const agree = validateManifest(parseToml(`runs_on=["mini"]\nmachines=["mini"]\n${base}`), { dirName: "auto" });
+  assert.deepEqual(agree.problems, []);
+  assert.deepEqual(agree.manifest?.machines, ["mini"]);
+
+  // Declaring both is a named problem when they disagree.
+  const conflict = validateManifest(
+    parseToml(`runs_on=["mini"]\nmachines=["laptop"]\n${base}`),
+    { dirName: "auto" },
+  );
+  assert.equal(conflict.manifest, null);
+  assert.ok(conflict.problems.some((p) => p.code === "runs-on-machines-conflict"));
+
+  // Neither key present is still "no-machines" (unchanged behavior).
+  assert.ok(
+    validateManifest(parseToml(base), { dirName: "auto" }).problems.some((p) => p.code === "no-machines"),
+  );
+
+  // An empty runs_on is "no-machines" too (empty placement is not a placement).
+  assert.ok(
+    validateManifest(parseToml(`runs_on=[]\n${base}`), { dirName: "auto" }).problems.some(
+      (p) => p.code === "no-machines",
+    ),
+  );
+
+  // runs_on must be an array of strings, same shape rule as machines.
+  assert.ok(
+    validateManifest(parseToml(`runs_on="mini"\n${base}`), { dirName: "auto" }).problems.some(
+      (p) => p.code === "machines",
+    ),
+  );
+});
+
 test("manifest: [run] env parses static string values; defaults to {} when absent", () => {
   const withEnv = validateManifest(
     parseToml(

@@ -18,6 +18,7 @@ import { test } from "node:test";
 
 import { ConfigError, ResolveError } from "../src/lib/errors.js";
 import { readTomlIfExists } from "../src/lib/toml.js";
+import { writeDeclaredLifecycle } from "../src/lib/workspace.js";
 import { acquireLease, readAttempt, readLease, readRunState } from "../src/primitives/automation-runs.js";
 import { LOG_RETENTION, applyLogRetention, runAutomation } from "../src/runner.js";
 import { makeTmpDir, makeTmpStore, makeTmpWorkspace, rmrf } from "./helpers.js";
@@ -354,6 +355,31 @@ test("runner: on_dormant_project — stop skips (movement signals lifecycle); co
   });
   assert.equal(ran.status, "ok");
   assert.ok(fs.existsSync(marker));
+});
+
+test("runner: on_dormant_project honors DECLARED lifecycle (metadata), not just folder location (decision-2/phase-3)", (t) => {
+  // The project sits at an ACTIVE location (top-level, not under Dormant
+  // Projects/) but its project.toml DECLARES dormant — the runner must skip,
+  // proving on_dormant_project reads the EFFECTIVE (metadata-primary)
+  // lifecycle rather than lifecycleOf's location-only view.
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  writeDeclaredLifecycle(fx.project.root, "dormant", "2026-01-01T00:00:00Z");
+  const marker = path.join(fx.project.root, "should-not-exist.txt");
+  writeManifest(
+    fx.project.root,
+    "metawatch",
+    nodeCommandToml(`require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`),
+  );
+  const skipped = runAutomation({
+    uid: fx.project.uid,
+    name: "metawatch",
+    store: fx.store,
+    extraWorkspaceRoots: [fx.root],
+  });
+  assert.equal(skipped.status, "skipped-dormant");
+  assert.ok(!fs.existsSync(marker), "declared dormant must stop the run even at an active location");
+  assert.match(fs.readFileSync(skipped.logPath as string, "utf8"), /project is dormant/);
 });
 
 test("runner: log retention keeps the newest LOG_RETENTION files, own machine dir only", (t) => {
