@@ -13,6 +13,16 @@
  *
  * The `claim` callback runs while the lock is held and must create the record
  * file — otherwise two sequential minters would both probe the same max.
+ *
+ * VESTIGIAL-CANDIDATE (hub phase, PARTIAL — see the catalog before touching):
+ * the machine-suffix variant exists to keep two machines minting into the
+ * same synced tree from colliding before their filesystem views converge. A
+ * single-executor hub can't race itself for hub-originated records, but
+ * humans will keep hand-creating tasks/decisions from laptop AND mini
+ * regardless of where automations run, so this may outlive the hub. Do not
+ * remove without separately confirming human-driven creation has also
+ * collapsed onto one writer. Full reasoning:
+ * `_project/wiki/compute-plane-vestigial-catalog.md` §4.
  */
 
 import * as crypto from "node:crypto";

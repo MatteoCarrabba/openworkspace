@@ -92,11 +92,25 @@ export interface AttemptOutcome extends TomlTable {
   reason?: string;
 }
 
+/**
+ * Provenance (phase 3, compute-plane cleanup): `machine_id` + `created_at`
+ * ARE the origin_machine/origin_ts of this run — the executor that created
+ * the attempt and when. `machine_id` (with `run_id`/`project_uid`/`name`) is
+ * STRUCTURALLY pinned: `updateAttempt` always re-asserts it from the CURRENT
+ * on-disk record, never from the incoming patch, so no later write (heartbeat,
+ * phase transition, finish) can rewrite who ran this. `created_at` is pinned
+ * by convention rather than by the same explicit re-assignment: every caller's
+ * patch touches only its own concern (status/phase/updated_at/finished_at/…)
+ * and never includes `created_at`, so `mergeTomlTables` never has an incoming
+ * value to overwrite it with. Nothing further was needed here — this was
+ * already correct; this comment documents it so it isn't mistaken for a gap.
+ */
 export interface AutomationAttempt extends TomlTable {
   schema: 1;
   run_id: string;
   project_uid: string;
   name: string;
+  /** Origin machine (the executor that created this attempt). Immutable — see above. */
   machine_id: string;
   trigger: AttemptTrigger;
   status: AttemptStatus;
@@ -106,6 +120,7 @@ export interface AutomationAttempt extends TomlTable {
   scheduled_from?: string;
   scheduled_through?: string;
   scheduled_count?: number;
+  /** Origin timestamp (when this attempt was created). Immutable — see above. */
   created_at: string;
   started_at?: string;
   updated_at: string;
