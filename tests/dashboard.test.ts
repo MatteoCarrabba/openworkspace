@@ -116,7 +116,11 @@ function startFixtureDashboard(tmp: TmpWorkspace): Promise<RunningDashboard> {
  * on an out-of-band filesystem edit landing in the model poll instead of
  * asserting immediately, to stay robust to that (small, real) latency.
  */
-async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 2000, intervalMs = 20): Promise<void> {
+// Default ceiling is generous because fs.watch (FSEvents) reconcile latency can
+// exceed a couple seconds under full-suite CPU load; waitFor returns as soon as
+// the condition holds, so a high ceiling never slows a passing run. No caller
+// relies on a short timeout to assert absence (that path uses a fixed setTimeout).
+async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 10000, intervalMs = 20): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await check()) return;
@@ -600,11 +604,14 @@ test("warm model: an out-of-band file edit is reconciled by the fs.watch path", 
   // Hand-edit the file directly — no mutation API involved.
   writeTask(alpha, "task-2 - review me.md", "id: task-2\ntitle: Review me\nstatus: doing");
 
+  // Generous timeout: fs.watch (FSEvents) latency + the model's debounce can
+  // exceed the 2s default under full-suite CPU load. Returns as soon as the
+  // reconcile lands (~200ms in the common case), so this doesn't slow the run.
   await waitFor(async () => {
     const scan = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
     const t2 = scan.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((x) => x.id === "task-2");
     return t2?.status === "doing";
-  });
+  }, 10000);
 });
 
 test("warm model: self-echo suppression — a write-through doesn't re-trigger on its own fs.watch event", async (t) => {
