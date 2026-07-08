@@ -93,7 +93,82 @@ export function AutomationsView(): React.JSX.Element {
   );
 }
 
+interface LogsResponse {
+  name: string;
+  runs: Array<{ machine: string; stamp: string }>;
+  selected: { machine: string; stamp: string; content: string; truncated: boolean } | null;
+}
+
+/** Read-only viewer for an automation's per-run logs (GET /api/automation/logs). */
+function LogsPanel({ project, name }: { project: string; name: string }): React.JSX.Element {
+  const [data, setData] = React.useState<LogsResponse | null>(null);
+  const [error, setError] = React.useState<string | null>(null);
+  const [loading, setLoading] = React.useState(true);
+
+  const load = React.useCallback(
+    (run?: { machine: string; stamp: string }) => {
+      setLoading(true);
+      setError(null);
+      const qs = new URLSearchParams({ project, name });
+      if (run) {
+        qs.set("machine", run.machine);
+        qs.set("run", run.stamp);
+      }
+      fetch("/api/automation/logs?" + qs.toString())
+        .then((r) =>
+          r.ok ? r.json() : r.json().then((e: { error?: string }) => Promise.reject(new Error(e.error ?? String(r.status)))),
+        )
+        .then((d: LogsResponse) => {
+          setData(d);
+          setLoading(false);
+        })
+        .catch((e: unknown) => {
+          setError(e instanceof Error ? e.message : String(e));
+          setLoading(false);
+        });
+    },
+    [project, name],
+  );
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  if (loading && !data) return <div className="logs-panel empty">Loading logs…</div>;
+  if (error) return <div className="logs-panel empty">Log load failed: {error}</div>;
+  if (!data || data.runs.length === 0) return <div className="logs-panel empty">No run logs recorded yet.</div>;
+
+  const sel = data.selected;
+  return (
+    <div className="logs-panel">
+      <div className="logs-runs">
+        {data.runs
+          .slice()
+          .reverse()
+          .map((r) => (
+            <button
+              key={r.machine + "/" + r.stamp}
+              className={"logs-run" + (sel && sel.machine === r.machine && sel.stamp === r.stamp ? " sel" : "")}
+              onClick={() => load(r)}
+            >
+              {r.machine} · {r.stamp}
+            </button>
+          ))}
+      </div>
+      {sel ? (
+        <pre className="logview">
+          {sel.truncated ? "… (older lines truncated) …\n\n" : ""}
+          {sel.content}
+        </pre>
+      ) : (
+        <div className="empty">Select a run.</div>
+      )}
+    </div>
+  );
+}
+
 function AutomationCard({ a }: { a: ScanAutomation }): React.JSX.Element {
+  const [showLogs, setShowLogs] = React.useState(false);
   const activeWhere = a.activatedOn.length ? a.activatedOn.join(", ") : <span style={{ color: "var(--muted)" }}>nowhere</span>;
   const declWhere = a.declaredMachines.length ? a.declaredMachines.join(", ") : "(none declared)";
   const local = localRunPill(a);
@@ -162,6 +237,12 @@ function AutomationCard({ a }: { a: ScanAutomation }): React.JSX.Element {
           ))}
         </ul>
       ) : null}
+      <div className="auto-actions">
+        <button className="logs-toggle" onClick={() => setShowLogs((v) => !v)} aria-expanded={showLogs}>
+          {showLogs ? "▾ logs" : "▸ logs"}
+        </button>
+      </div>
+      {showLogs ? <LogsPanel project={a.project.uid} name={a.name} /> : null}
     </div>
   );
 }
