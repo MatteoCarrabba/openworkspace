@@ -860,11 +860,13 @@ export interface SetTaskBodyOptions {
 }
 
 /**
- * Replace a task's ENTIRE body, preserving frontmatter byte-for-byte (only
- * the body changes). Faithful: writes exactly what it's given — the caller
- * (the dashboard's plain-textarea editor) is responsible for seeding the
- * textarea with the full current body so a user's edit never silently drops
- * `## Final Summary` / `## Log` content.
+ * Replace a task's ENTIRE body, leaving frontmatter FIELDS untouched (only
+ * the body changes) apart from the `updated:` timestamp that every
+ * touchAndWrite call bumps — this is not a literal byte-for-byte write of
+ * the frontmatter block. Faithful otherwise: writes exactly the body it's
+ * given — the caller (the dashboard's plain-textarea editor) is responsible
+ * for seeding the textarea with the full current body so a user's edit never
+ * silently drops `## Final Summary` / `## Log` content.
  */
 export function setTaskBody(
   projectRoot: string,
@@ -919,7 +921,10 @@ export interface ToggleChecklistItemOptions {
  * Flip exactly one `- [ ]` <-> `- [x]` line in the body (surgical: only the
  * one marker character changes, every other byte of the body is untouched).
  * Identify the line by `index` (occurrence order) or `text` (trimmed line
- * content); exactly one of the two should be given.
+ * content); exactly one of the two should be given. If a caller ever passes
+ * BOTH, `index` wins and `text` is ignored — the dashboard client only ever
+ * sends `index`, so this hasn't mattered in practice, but it's explicit here
+ * in case `text`-keyed toggles are exposed to another caller later.
  */
 export function toggleChecklistItem(
   projectRoot: string,
@@ -932,6 +937,7 @@ export function toggleChecklistItem(
   const tf = getTaskFile(projectRoot, ref);
   assertExpectedHash(tf, options.expectedHash);
   const items = findChecklistItems(tf.rec.body);
+  // index takes precedence over text when both are given — see docstring.
   const target =
     options.index !== undefined ? items[options.index] : items.find((it) => it.text === options.text);
   if (target === undefined) {

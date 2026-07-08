@@ -53,7 +53,13 @@ export function renderMarkdown(src: string): string {
       out.push(`<h${n}>${inline(h[2]!)}</h${n}>`);
       continue;
     }
-    const li = line.match(/^\s*[-*]\s+(\[[ xX]\]\s+)?(.*)$/);
+    // Bracket-then-optional-whitespace (zero or more), matching the server's
+    // CHECKLIST_ITEM_RE / the client's own CHECKLIST_LINE_RE below EXACTLY —
+    // an empty `- [ ]` template bullet (no trailing space, no text) must
+    // still count as a checkbox line here, or checklistIndex drifts out of
+    // sync with the server's findChecklistItems and a click toggles the
+    // wrong line on disk (see DECISION-9 follow-up).
+    const li = line.match(/^\s*[-*]\s+(\[[ xX]\][ \t]*)?(.*)$/);
     if (li) {
       if (!inList) {
         out.push("<ul>");
