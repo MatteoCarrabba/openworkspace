@@ -36,6 +36,7 @@ import * as path from "node:path";
 
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
 import { ConfigError, NotFoundError, OwError } from "../lib/errors.js";
+import { sha256Hex } from "../lib/fsatomic.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
 import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
@@ -254,6 +255,23 @@ function utcDay(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * `hidden` / `unhiddenToday` are relative to the CURRENT instant, not to when
+ * a file was last parsed. The warm model parses a file once and holds it
+ * across many requests, so these two flags are re-derived from the stored
+ * `hiddenUntil` string at every read using the request's `now` — the same
+ * rule `readTaskFile` applies, just detached from disk I/O. An unparseable
+ * `hiddenUntil` was already recorded as a doctor issue at parse time; here it
+ * just leaves both flags false.
+ */
+function recomputeHiddenFlags(task: ScanTask, now: Date): void {
+  if (task.hiddenUntil === null) return;
+  const date = parseDate(task.hiddenUntil);
+  if (date === null) return;
+  task.hidden = date.getTime() > now.getTime();
+  task.unhiddenToday = !task.hidden && utcDay(date) === utcDay(now);
+}
+
 interface ParsedTaskFile {
   task: ScanTask;
   parsed: ParsedId | null;
@@ -338,7 +356,14 @@ function readTaskFile(
   return { task, parsed, issues };
 }
 
-function compareTasks(a: ParsedTaskFile, b: ParsedTaskFile): number {
+/** Narrow shape `compareTasks` actually needs — lets the warm model sort its
+ *  in-memory file entries (which carry more fields) without a repack. */
+interface SortableTaskFile {
+  task: Pick<ScanTask, "id">;
+  parsed: ParsedId | null;
+}
+
+function compareTasks(a: SortableTaskFile, b: SortableTaskFile): number {
   const pa = a.parsed?.parts ?? null;
   const pb = b.parsed?.parts ?? null;
   if (pa && pb) {
@@ -444,17 +469,26 @@ export function collectDoctorIssues(projects: ProjectInfo[], perProjectIssues: D
 // ---------------------------------------------------------------------------
 // Workspace scan
 
-export function scanWorkspace(
-  ws: Workspace,
-  now: Date = new Date(),
-  options: { includeTaskBodies?: boolean } = {},
-): ScanResult {
-  const infos = discoverProjects(ws, { all: true });
+/** Per-project scan output, the shared unit `assembleScanResult` folds into a
+ *  `ScanResult` — produced by a live disk walk (`scanWorkspace`) OR read
+ *  straight out of the warm in-memory model (`WarmModel.scan`). */
+interface ProjectScanData {
+  info: ProjectInfo;
+  tasks: ScanTask[];
+  issues: DoctorIssue[];
+}
+
+/**
+ * Assemble a `ScanResult` from already-computed per-project data. Pulled out
+ * of `scanWorkspace` so the warm model (Phase 1b) can produce the identical
+ * wire shape from in-memory tasks instead of a disk walk, with zero drift
+ * between the two code paths.
+ */
+function assembleScanResult(ws: Workspace, now: Date, projectData: readonly ProjectScanData[]): ScanResult {
   const taskIssues: DoctorIssue[] = [];
   const projects: ScanProject[] = [];
 
-  for (const info of infos) {
-    const { tasks, issues } = scanProjectTasks(info, now, { includeBodies: options.includeTaskBodies ?? true });
+  for (const { info, tasks, issues } of projectData) {
     taskIssues.push(...issues);
     projects.push({
       uid: info.uid,
@@ -471,7 +505,10 @@ export function scanWorkspace(
     });
   }
 
-  const errors = collectDoctorIssues(infos, taskIssues);
+  const errors = collectDoctorIssues(
+    projectData.map((p) => p.info),
+    taskIssues,
+  );
 
   let waiting = 0;
   let review = 0;
@@ -503,6 +540,19 @@ export function scanWorkspace(
     projects,
     doctor: { errors },
   };
+}
+
+export function scanWorkspace(
+  ws: Workspace,
+  now: Date = new Date(),
+  options: { includeTaskBodies?: boolean } = {},
+): ScanResult {
+  const infos = discoverProjects(ws, { all: true });
+  const projectData: ProjectScanData[] = infos.map((info) => {
+    const { tasks, issues } = scanProjectTasks(info, now, { includeBodies: options.includeTaskBodies ?? true });
+    return { info, tasks, issues };
+  });
+  return assembleScanResult(ws, now, projectData);
 }
 
 export function taskDetail(
@@ -940,6 +990,326 @@ function scheduleSummaryOf(manifest: { schedule: { cron: string | null; calendar
 }
 
 // ---------------------------------------------------------------------------
+// Warm read model (Phase 1b) — a task/scan cache that never goes cold.
+//
+// The old ScanCache invalidated its ENTIRE built ScanResult on every write and
+// re-walked the whole tree (synchronously at TTL 0, or on the next background
+// tick otherwise). This model instead:
+//   - builds once at server start (one unavoidable full disk walk, same cost
+//     as the old cold cache's first request);
+//   - is updated WRITE-THROUGH: a mutation re-reads only the ONE file it just
+//     changed and folds it back in — no invalidation, no re-walk;
+//   - is kept current for out-of-band edits (hand edits, another process, a
+//     sync client) by fs.watch on each project's tasks/ dir, reconciling only
+//     the touched file(s) by content hash;
+//   - self-heals with a slow, unref'd periodic full rebuild in case a watcher
+//     never started (FileProvider paths can throw) or drops an event — belt
+//     and suspenders, not the primary mechanism.
+//
+// Everything here is derived and in-memory: closing the server (or just
+// letting it die) leaves no state anywhere; the next start rebuilds the same
+// model from the same files. SQLite / persistence is explicitly deferred.
+
+/** One parsed task file, as held by the model. */
+interface ModelTaskFile {
+  task: ScanTask; // always carries the full body; readers strip it for /api/scan
+  parsed: ParsedId | null;
+  issues: DoctorIssue[]; // this file's own doctor issues (not the project-wide duplicate-id check)
+  hash: string; // sha256 of the raw file bytes — change detection AND self-echo suppression
+}
+
+interface ModelProject {
+  info: ProjectInfo;
+  tasksDir: string;
+  files: Map<string, ModelTaskFile>; // fileName -> parsed file
+  idToFile: Map<string, string>; // task id -> fileName (best-effort; duplicates keep the last-seen file)
+}
+
+/** Read + parse + hash exactly one task file. Null on a read race (deleted
+ *  between the caller's readdir and this read) — same "skip it" contract
+ *  `readTaskFile` already uses for that case. */
+function readModelTaskFile(info: ProjectInfo, fileName: string, now: Date): ModelTaskFile | null {
+  const filePath = path.join(info.root, "_project", "tasks", fileName);
+  let raw: Buffer;
+  try {
+    raw = fs.readFileSync(filePath);
+  } catch {
+    return null;
+  }
+  const parsedFile = readTaskFile(info.relPath, info.root, fileName, now, true);
+  if (parsedFile === null) return null;
+  return { task: parsedFile.task, parsed: parsedFile.parsed, issues: parsedFile.issues, hash: sha256Hex(raw) };
+}
+
+function buildModelProject(info: ProjectInfo, now: Date): ModelProject {
+  const tasksDir = path.join(info.root, "_project", "tasks");
+  const files = new Map<string, ModelTaskFile>();
+  const idToFile = new Map<string, string>();
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(tasksDir, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".md")) continue;
+    const file = readModelTaskFile(info, entry.name, now);
+    if (file === null) continue;
+    files.set(entry.name, file);
+    idToFile.set(file.task.id, entry.name);
+  }
+  return { info, tasksDir, files, idToFile };
+}
+
+/**
+ * Re-read exactly ONE task file and fold it into the project's model — the
+ * write-through / watcher-reconcile primitive. A file that no longer exists
+ * (deleted, or a transient read race) drops its entry. Returns false when the
+ * content hash is UNCHANGED from what the model already has: this is what
+ * makes self-echo suppression and duplicate-event debouncing "just happen" —
+ * the write-through call already stored the post-write hash, so the fs.watch
+ * event this same write provokes finds nothing new to do.
+ */
+function reconcileModelFile(mp: ModelProject, fileName: string, now: Date): boolean {
+  const prior = mp.files.get(fileName);
+  const filePath = path.join(mp.tasksDir, fileName);
+  let raw: Buffer;
+  try {
+    raw = fs.readFileSync(filePath);
+  } catch {
+    if (prior === undefined) return false;
+    mp.files.delete(fileName);
+    if (mp.idToFile.get(prior.task.id) === fileName) mp.idToFile.delete(prior.task.id);
+    return true;
+  }
+  const hash = sha256Hex(raw);
+  if (prior !== undefined && prior.hash === hash) return false; // unchanged — self-echo or a duplicate event
+  const parsedFile = readTaskFile(mp.info.relPath, mp.info.root, fileName, now, true);
+  if (parsedFile === null) return false; // raced with a deletion between the two reads above
+  if (prior !== undefined && mp.idToFile.get(prior.task.id) === fileName) mp.idToFile.delete(prior.task.id);
+  mp.files.set(fileName, { task: parsedFile.task, parsed: parsedFile.parsed, issues: parsedFile.issues, hash });
+  mp.idToFile.set(parsedFile.task.id, fileName);
+  return true;
+}
+
+/** One project's tasks, assembled from the model — no disk I/O. Clones every
+ *  task (never mutates the stored copy) so hidden-flag recompute and rollups
+ *  computed for THIS read never leak into what the model holds for the next
+ *  one. */
+function projectView(mp: ModelProject, includeBodies: boolean, now: Date): { tasks: ScanTask[]; issues: DoctorIssue[] } {
+  const entries = [...mp.files.values()];
+  entries.sort(compareTasks);
+
+  const tasks = entries.map((f): ScanTask => {
+    const clone: ScanTask = { ...f.task, body: includeBodies ? f.task.body : "" };
+    recomputeHiddenFlags(clone, now);
+    return clone;
+  });
+  computeRollups(tasks);
+
+  const issues: DoctorIssue[] = [];
+  for (const f of entries) issues.push(...f.issues);
+  const seen = new Map<string, string>();
+  for (const f of entries) {
+    const prior = seen.get(f.task.id);
+    if (prior !== undefined) {
+      issues.push({ project: mp.info.relPath, file: f.task.file, message: `duplicate task id ${f.task.id} (also in ${prior})` });
+    } else {
+      seen.set(f.task.id, f.task.file);
+    }
+  }
+  return { tasks, issues };
+}
+
+/** Debounce window: coalesce a burst of fs.watch events (e.g. temp-file
+ *  create + fsync + rename, all for ONE atomic write) into a single
+ *  reconcile pass per project. */
+const WATCH_DEBOUNCE_MS = 75;
+
+/** Self-heal interval: a slow, unref'd full rebuild that never blocks a
+ *  request and never crashes the process — the backstop for a watcher that
+ *  failed to start or silently dropped an event. */
+const PERIODIC_RECONCILE_MS = 30_000;
+
+/** OpenWorkspace's own atomic-write temp files (`fsatomic.ts`) — never real
+ *  task content, always ignore them in a watch callback. */
+function isOwnTempFile(fileName: string): boolean {
+  return /^\..*\.ow-tmp-\d+-[0-9a-f]{8}$/.test(fileName);
+}
+
+export class WarmModel {
+  private readonly ws: Workspace;
+  private readonly nowFn: () => Date;
+  private projects: ModelProject[] = [];
+  private byUid = new Map<string, ModelProject>();
+  private watchers: fs.FSWatcher[] = [];
+  private pendingByProject = new Map<string, Set<string>>(); // uid -> pending filenames
+  private debounceTimers = new Map<string, NodeJS.Timeout>(); // uid -> debounce timer
+  private periodicHandle: NodeJS.Timeout | null = null;
+  private closed = false;
+
+  constructor(ws: Workspace, nowFn: () => Date, options: { watch?: boolean } = {}) {
+    this.ws = ws;
+    this.nowFn = nowFn;
+    this.rebuildFull();
+    if (options.watch !== false) this.startWatching();
+    this.startPeriodicReconcile();
+  }
+
+  private rebuildFull(): void {
+    const now = this.nowFn();
+    const infos = discoverProjects(this.ws, { all: true });
+    this.projects = infos.map((info) => buildModelProject(info, now));
+    this.byUid = new Map(this.projects.map((p) => [p.info.uid, p]));
+  }
+
+  scan(includeBodies: boolean): ScanResult {
+    const now = this.nowFn();
+    const projectData: ProjectScanData[] = this.projects.map((mp) => {
+      const { tasks, issues } = projectView(mp, includeBodies, now);
+      return { info: mp.info, tasks, issues };
+    });
+    return assembleScanResult(this.ws, now, projectData);
+  }
+
+  taskDetail(projectUid: string, taskId: string): TaskDetailResult | null {
+    const mp = this.byUid.get(projectUid);
+    if (mp === undefined) return null;
+    const now = this.nowFn();
+    const { tasks } = projectView(mp, true, now);
+    const task = tasks.find((t) => t.id === taskId);
+    if (task === undefined) return null;
+    return {
+      generatedAt: now.toISOString(),
+      workspace: { root: this.ws.root, name: path.basename(this.ws.root), workspaceId: this.ws.config.workspaceId },
+      project: {
+        uid: mp.info.uid,
+        relPath: mp.info.relPath,
+        name: path.basename(mp.info.relPath),
+        lifecycle: mp.info.lifecycle,
+      },
+      task,
+    };
+  }
+
+  /**
+   * Write-through: call right after a mutation's library write has already
+   * landed on disk. Re-reads ONLY that one task file and records its new hash
+   * so the fs.watch event the write itself provokes is a no-op (self-echo
+   * suppression — see `reconcileModelFile`). Never touches any other file.
+   */
+  writeThrough(projectUid: string, taskId: string): void {
+    const mp = this.byUid.get(projectUid);
+    if (mp === undefined) return;
+    const now = this.nowFn();
+    const known = mp.idToFile.get(taskId);
+    if (known !== undefined) {
+      reconcileModelFile(mp, known, now);
+      return;
+    }
+    // Unknown task id (shouldn't happen for an existing-task mutation, but a
+    // stale idToFile after an out-of-band rename would land here) — a
+    // per-project rebuild is still bounded to this one project's tasks dir,
+    // never the whole workspace.
+    const rebuilt = buildModelProject(mp.info, now);
+    this.projects = this.projects.map((p) => (p.info.uid === projectUid ? rebuilt : p));
+    this.byUid.set(projectUid, rebuilt);
+  }
+
+  private startWatching(): void {
+    for (const mp of this.projects) {
+      this.watchProject(mp);
+    }
+  }
+
+  private watchProject(mp: ModelProject): void {
+    let watcher: fs.FSWatcher;
+    try {
+      watcher = fs.watch(mp.tasksDir, { persistent: false });
+    } catch {
+      // Missing tasks/ dir (no tasks yet) or a FileProvider path that refuses
+      // to be watched — the periodic reconcile is the fallback for this
+      // project; never crash the server over it.
+      return;
+    }
+    watcher.on("error", () => {
+      // FileProvider paths can throw mid-watch; drop this one watcher and let
+      // the periodic reconcile keep this project current.
+      try {
+        watcher.close();
+      } catch {
+        // already gone
+      }
+    });
+    watcher.on("change", (_eventType, filename) => {
+      if (filename === null) return; // platform didn't supply one — periodic reconcile covers it
+      const name = filename.toString();
+      if (!name.endsWith(".md") || isOwnTempFile(name)) return;
+      this.scheduleReconcile(mp.info.uid, name);
+    });
+    this.watchers.push(watcher);
+  }
+
+  private scheduleReconcile(uid: string, fileName: string): void {
+    let pending = this.pendingByProject.get(uid);
+    if (pending === undefined) this.pendingByProject.set(uid, (pending = new Set()));
+    pending.add(fileName);
+
+    const existing = this.debounceTimers.get(uid);
+    if (existing !== undefined) clearTimeout(existing);
+    const timer = setTimeout(() => this.flushReconcile(uid), WATCH_DEBOUNCE_MS);
+    timer.unref?.();
+    this.debounceTimers.set(uid, timer);
+  }
+
+  private flushReconcile(uid: string): void {
+    this.debounceTimers.delete(uid);
+    const pending = this.pendingByProject.get(uid);
+    this.pendingByProject.delete(uid);
+    if (pending === undefined || this.closed) return;
+    const mp = this.byUid.get(uid);
+    if (mp === undefined) return;
+    const now = this.nowFn();
+    for (const fileName of pending) {
+      reconcileModelFile(mp, fileName, now);
+    }
+  }
+
+  private startPeriodicReconcile(): void {
+    const timer = setInterval(() => {
+      try {
+        this.rebuildFull();
+      } catch {
+        // Never let a self-heal pass crash the server; the model just stays
+        // as it was until the next tick or the next watch event.
+      }
+    }, PERIODIC_RECONCILE_MS);
+    timer.unref?.();
+    this.periodicHandle = timer;
+  }
+
+  /** Stop every watcher and timer. Idempotent; safe to call on server close. */
+  close(): void {
+    this.closed = true;
+    for (const w of this.watchers) {
+      try {
+        w.close();
+      } catch {
+        // already closed
+      }
+    }
+    this.watchers = [];
+    for (const t of this.debounceTimers.values()) clearTimeout(t);
+    this.debounceTimers.clear();
+    this.pendingByProject.clear();
+    if (this.periodicHandle !== null) {
+      clearInterval(this.periodicHandle);
+      this.periodicHandle = null;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP server
 
 /** The secure default allowlist — always present, never removable. */
@@ -1021,8 +1391,11 @@ export interface DashboardOptions {
    */
   allowedHosts?: readonly string[];
   /**
-   * In-MEMORY scan cache TTL, in milliseconds. The first `/api/scan` builds the
-   * scan (slow on a large workspace), caches it in process with the timestamp it
+   * In-MEMORY scan cache TTL, in milliseconds, for `/api/automations` ONLY.
+   * (`/api/scan` and `/api/task` are served from the warm read model — see the
+   * "Warm read model" section above — which is always current and has no TTL
+   * to configure.) The first `/api/automations` request builds the scan
+   * (slow on a large workspace), caches it in process with the timestamp it
    * was actually built at, and serves that cached result for subsequent requests
    * within the TTL. When the TTL has elapsed, a request serves the still-recent
    * cached scan immediately and triggers a single background rebuild (so no
@@ -1353,17 +1726,21 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
   const ttlMs = options.cacheTtlMs ?? 0;
   const useScanWorker = options.useScanWorker ?? options.now === undefined;
 
-  // Build a scan against the LIVE tree, stamping generatedAt at build time. The
-  // cache stores whatever this returns; it never rewrites the timestamp.
-  const buildScan = async (): Promise<ScanResult> => {
-    if (useScanWorker) return await runScanChild<ScanResult>("scan", options, now());
-    const ws = openWorkspace(options.workspaceRoot); // live tree, every build
-    return scanWorkspace(ws, now(), { includeTaskBodies: false });
-  };
-  const scanCache = new ScanCache<ScanResult>(buildScan, () => now().getTime(), ttlMs);
+  // Phase 1b: /api/scan and /api/task are served from a warm, incrementally
+  // maintained in-memory model — see the "Warm read model" section above.
+  // This replaces the old invalidate-and-cold-rebuild ScanCache for tasks: the
+  // model is built once here (the one unavoidable full walk) and after that
+  // reads never re-walk the tree, and a write never invalidates more than the
+  // one file it touched. `useScanWorker`'s child-process isolation existed to
+  // keep a slow FileProvider walk off the main thread; the warm model makes
+  // that walk a one-time startup cost instead of a per-request one, so it is
+  // bypassed here (the worker path is retained for `/api/automations`, which
+  // this phase does not touch).
+  const model = new WarmModel(openWorkspace(options.workspaceRoot), now);
 
-  // The automations view shares the same stale-while-revalidate posture: it is
-  // another read-only scan over the live tree (synced registries × manifests).
+  // The automations view keeps the prior stale-while-revalidate posture: it is
+  // a separate, read-only scan over the live tree (synced registries ×
+  // manifests) that no mutation in this phase writes through to.
   const buildAutomations = async (): Promise<AutomationsScanResult> => {
     if (useScanWorker) return await runScanChild<AutomationsScanResult>("automations", options, now());
     const ws = openWorkspace(options.workspaceRoot);
@@ -1375,7 +1752,7 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     ttlMs,
   );
 
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     if (!hostAllowed(req.headers.host, allowed)) {
       sendJson(res, 403, { error: "forbidden: host header not allowed" });
       return;
@@ -1404,7 +1781,10 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
         try {
           const body = await readJsonBody(req);
           const detail = applyMutation(pathname, body, options, now);
-          scanCache.invalidate();
+          // Write-through (Phase 1b): fold ONLY the mutated task back into the
+          // warm model — no invalidation, no re-walk. Subsequent /api/scan and
+          // /api/task requests see the change immediately.
+          model.writeThrough(detail.project.uid, detail.task.id);
           sendJson(res, 200, detail);
         } catch (err) {
           sendJson(res, mutationStatus(err), {
@@ -1440,17 +1820,12 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     }
 
     if (pathname === "/api/scan") {
-      void (async () => {
-        try {
-        // Cache-aware: cold/disabled ⇒ fresh synchronous build; warm-within-TTL
-        // ⇒ cached scan; expired ⇒ stale-but-recent now + background rebuild.
-          sendJson(res, 200, await scanCache.get());
-        } catch (err) {
-          sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      })();
+      try {
+        // Warm model: an in-memory assembly, never a disk walk.
+        sendJson(res, 200, model.scan(false));
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
 
@@ -1461,32 +1836,24 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
         sendJson(res, 400, { error: "missing project or task query parameter" });
         return;
       }
-      void (async () => {
-        try {
-          const detail = useScanWorker
-            ? await runScanChild<TaskDetailResult | null>("task", options, now(), [project, task])
-            : (() => {
-                const ws = openWorkspace(options.workspaceRoot);
-                return taskDetail(ws, project, task, now());
-              })();
+      try {
+        const detail = model.taskDetail(project, task);
         if (detail === null) {
           sendJson(res, 404, { error: "task not found" });
         } else {
           sendJson(res, 200, detail);
         }
-        } catch (err) {
-          sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
-            error: err instanceof Error ? err.message : String(err),
-          });
-        }
-      })();
+      } catch (err) {
+        sendJson(res, 500, { error: err instanceof Error ? err.message : String(err) });
+      }
       return;
     }
 
     if (pathname === "/api/automations") {
       void (async () => {
         try {
-        // Same read-only, stale-while-revalidate posture as /api/scan.
+        // Unlike /api/scan, this view isn't backed by the warm model — it
+        // keeps the original stale-while-revalidate ScanCache.
           sendJson(res, 200, await automationsCache.get());
         } catch (err) {
           sendJson(res, err instanceof ScanTimeoutError ? 504 : 500, {
@@ -1499,6 +1866,11 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
 
     sendJson(res, 404, { error: "not found" });
   });
+
+  // Stop every watcher/timer the model owns once the HTTP server itself is
+  // done — no orphaned handles outliving a closed dashboard.
+  server.once("close", () => model.close());
+  return server;
 }
 
 export interface RunningDashboard {

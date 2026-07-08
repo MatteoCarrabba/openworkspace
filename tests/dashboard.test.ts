@@ -108,6 +108,22 @@ function startFixtureDashboard(tmp: TmpWorkspace): Promise<RunningDashboard> {
   return startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
 }
 
+/**
+ * Poll `check` until it returns true or `timeoutMs` elapses. The warm model's
+ * fs.watch reconciliation is real-async (real wall-clock, debounced) even
+ * when a test injects a fake `now` for scan timestamps — so tests that assert
+ * on an out-of-band filesystem edit landing in the model poll instead of
+ * asserting immediately, to stay robust to that (small, real) latency.
+ */
+async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 2000, intervalMs = 20): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await check()) return;
+    if (Date.now() >= deadline) throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // scanWorkspace (direct, no HTTP)
 
@@ -306,7 +322,7 @@ test("http: GET /api/task returns one full task detail record", async (t) => {
   assert.equal(bad.status, 400);
 });
 
-test("http: scan is live — a task added after startup appears on the next request", async (t) => {
+test("http: scan reflects an out-of-band task added after startup (watcher-reconciled)", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());
   const running = await startFixtureDashboard(tmp);
@@ -314,10 +330,14 @@ test("http: scan is live — a task added after startup appears on the next requ
 
   const before = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
   const alphaRoot = path.join(tmp.root, "Alpha Project");
-  writeTask(alphaRoot, "task-5 - fresh.md", "id: task-5\ntitle: Fresh\nstatus: todo");
-  const after = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
   const count = (s: ScanResult) => s.projects.find((p) => p.uid === "uid-alpha")!.tasks.length;
-  assert.equal(count(after), count(before) + 1);
+  writeTask(alphaRoot, "task-5 - fresh.md", "id: task-5\ntitle: Fresh\nstatus: todo");
+  // The write is out-of-band (bypasses the mutation API), so it reaches the
+  // warm model via fs.watch, not write-through — poll for it (see `waitFor`).
+  await waitFor(async () => {
+    const after = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
+    return count(after) === count(before) + 1;
+  });
 });
 
 test("http: Host header validated — DNS-rebinding defense", async (t) => {
@@ -505,10 +525,14 @@ test("http: scan endpoint writes nothing into the workspace", async (t) => {
 });
 
 // ---------------------------------------------------------------------------
-// In-memory scan cache (short-TTL, stale-while-revalidate). All against a temp
-// workspace with a MUTABLE injected clock so TTL behavior is deterministic.
+// Warm read model (Phase 1b) — /api/scan and /api/task are served from an
+// in-memory model that is write-through on mutation and fs.watch-reconciled
+// for out-of-band edits. No TTL, no cold rebuild: unlike the automations view
+// below (still the original stale-while-revalidate ScanCache), a plain
+// `startFixtureDashboard` (cacheTtlMs unset/0) already exercises it.
 
-/** A clock the test advances by hand; drives both `now()` and the cache age. */
+/** A clock the test advances by hand; drives both `now()` and the cache age
+ *  for the (automations-only) ScanCache tests further down. */
 function mutableClock(start: Date): { now: () => Date; advance: (ms: number) => void } {
   let cur = start.getTime();
   return { now: () => new Date(cur), advance: (ms: number) => (cur += ms) };
@@ -519,78 +543,83 @@ function flushBackground(): Promise<void> {
   return new Promise((resolve) => setImmediate(() => setImmediate(() => resolve())));
 }
 
-const TTL = 15_000;
-
-test("cache: serves a stale-but-recent result within the TTL, then rebuilds after it", async (t) => {
+test("warm model: a write is reflected in the next /api/scan with no cold rebuild", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());
-  const clock = mutableClock(NOW);
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: clock.now, cacheTtlMs: TTL });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
   t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
 
-  // 1) Cold request builds and caches.
-  const first = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  const alphaCount = (s: ScanResult) => s.projects.find((p) => p.uid === "uid-alpha")!.tasks.length;
-  const n0 = alphaCount(first);
-
-  // Mutate the live tree, then request again BEFORE the TTL elapses.
-  writeTask(path.join(tmp.root, "Alpha Project"), "task-5 - fresh.md", "id: task-5\ntitle: Fresh\nstatus: todo");
-  clock.advance(TTL - 1);
-  const cachedResp = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(alphaCount(cachedResp), n0, "within TTL ⇒ still the cached scan, new task NOT yet visible");
-  assert.equal(cachedResp.generatedAt, first.generatedAt, "cached scan keeps its original build time");
-
-  // Cross the TTL: this request serves stale-but-recent AND triggers a rebuild.
-  clock.advance(2);
-  const staleResp = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(alphaCount(staleResp), n0, "expired request still serves the prior (recent) scan synchronously");
-
-  // After the background rebuild lands, the next request reflects the live tree.
-  await flushBackground();
-  const rebuilt = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(alphaCount(rebuilt), n0 + 1, "after the background rebuild the new task appears");
-});
-
-test("cache: TTL 0 disables caching — every request is fresh against the live tree", async (t) => {
-  const tmp = buildFixtureWorkspace();
-  t.after(() => tmp.cleanup());
-  const clock = mutableClock(NOW);
-  // cacheTtlMs defaults to 0; pass it explicitly to be unambiguous.
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: clock.now, cacheTtlMs: 0 });
-  t.after(() => running.close());
-
-  const alphaCount = (s: ScanResult) => s.projects.find((p) => p.uid === "uid-alpha")!.tasks.length;
   const before = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  // No clock advance at all: a new task must appear on the very next request.
-  writeTask(path.join(tmp.root, "Alpha Project"), "task-5 - fresh.md", "id: task-5\ntitle: Fresh\nstatus: todo");
+  const rollupBefore = before.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((t2) => t2.id === "task-1")!.rollup;
+  assert.equal(rollupBefore?.status, "waiting", "task-1.2 (waiting) is the worst descendant, pre-write");
+
+  // Write through the mutation API: task-1.2 waiting -> todo.
+  const post1 = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-1.2", status: "todo" });
+  assert.equal(post1.status, 200);
+
+  // The VERY NEXT /api/scan (synchronous, no wait, no clock advance) already
+  // reflects it — write-through, not an invalidate-and-rebuild-on-next-read.
   const after = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(alphaCount(after), alphaCount(before) + 1, "TTL 0 ⇒ no cache ⇒ immediately fresh");
+  const alphaAfter = after.projects.find((p) => p.uid === "uid-alpha")!;
+  assert.equal(alphaAfter.tasks.find((t2) => t2.id === "task-1.2")!.status, "todo");
+  // task-1's rollup recomputed too: with task-1.2 no longer waiting, task-1's
+  // OWN status ("doing") is now the worst of self+descendants.
+  assert.equal(alphaAfter.tasks.find((t2) => t2.id === "task-1")!.rollup?.status, "doing");
+  // Untouched files were served straight out of memory: their content is
+  // byte-identical to the pre-write scan (nothing else was re-walked/re-parsed).
+  assert.deepEqual(
+    alphaAfter.tasks.find((t2) => t2.id === "task-2"),
+    before.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((t2) => t2.id === "task-2")
+  );
+
+  // And the on-disk file really changed (single writer, not an in-memory echo).
+  assert.match(readTaskFile(alpha, "task-1.2 "), /status: todo/);
 });
 
-test("cache: the scan timestamp reflects BUILD time, never request time (honest freshness)", async (t) => {
+test("warm model: an out-of-band file edit is reconciled by the fs.watch path", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());
-  const clock = mutableClock(NOW);
-  const running = await startDashboard({ workspaceRoot: tmp.root, now: clock.now, cacheTtlMs: TTL });
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
   t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
 
-  // Cold build stamps generatedAt at NOW.
-  const first = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(first.generatedAt, NOW.toISOString());
+  const before = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
+  assert.equal(before.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((t2) => t2.id === "task-2")!.status, "review");
 
-  // Advance the clock well within the TTL and request again: the served
-  // timestamp must NOT move to the (later) request time — it stays the build time.
-  clock.advance(TTL - 1);
-  const later = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(later.generatedAt, NOW.toISOString(), "cached scan never shows a fake-fresh time");
+  // Hand-edit the file directly — no mutation API involved.
+  writeTask(alpha, "task-2 - review me.md", "id: task-2\ntitle: Review me\nstatus: doing");
 
-  // Force a rebuild at a known later instant; the new scan stamps THAT instant.
-  clock.advance(2); // now NOW + TTL + 1 ⇒ expired
-  const rebuildInstant = clock.now();
-  await get(running.port, "/api/scan"); // serves stale, kicks off rebuild at rebuildInstant
-  await flushBackground();
-  const rebuilt = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
-  assert.equal(rebuilt.generatedAt, rebuildInstant.toISOString(), "rebuilt scan stamps its own build time");
+  await waitFor(async () => {
+    const scan = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
+    const t2 = scan.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((x) => x.id === "task-2");
+    return t2?.status === "doing";
+  });
+});
+
+test("warm model: self-echo suppression — a write-through doesn't re-trigger on its own fs.watch event", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const note = await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "note from the API" });
+  assert.equal(note.status, 200);
+  const afterFirst = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
+  const bodyAfterFirst = readTaskFile(alpha, "task-1 -");
+  assert.match(bodyAfterFirst, /note from the API \(dashboard\)/);
+
+  // Give the fs.watch event this write itself provoked plenty of time to
+  // arrive and be (correctly) suppressed as a self-echo (hash unchanged).
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  // Nothing reconciled a SECOND time: the file on disk and the model's view
+  // of it are both exactly what the write-through already produced — no
+  // reconcile loop duplicated the note or otherwise touched the record.
+  assert.equal(readTaskFile(alpha, "task-1 -"), bodyAfterFirst);
+  const afterWait = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
+  assert.deepEqual(afterWait, afterFirst);
 });
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1031,9 @@ test("http: /api/automations writes nothing into the workspace", async (t) => {
   assert.deepEqual(snapshot(), before);
 });
 
-test("automations cache: TTL stale-while-revalidate parity with /api/scan", async (t) => {
+const TTL = 15_000;
+
+test("automations cache: TTL stale-while-revalidate (the original ScanCache — /api/scan no longer uses it)", async (t) => {
   const tmp = buildAutomationsWorkspace();
   t.after(() => tmp.cleanup());
   const clock = mutableClock(NOW);
