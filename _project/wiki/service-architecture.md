@@ -64,7 +64,22 @@ together 2026-07-08):
   by write-through + `fs.watch` reconciliation, rather than a TTL cache.
   `/api/automations` is untouched (still the original `ScanCache<T>`).
 - **decision-8** — the dashboard client rebuilt as React + Vite, built to a
-  single self-contained HTML file.
+  single self-contained HTML file. Since then, still under the same
+  interface-plane umbrella: resizable panes, keyboard nav, and dark-mode
+  following the system preference; a loopback-gated `POST
+  /api/project/reveal` so the client can ask the server to open a project's
+  root in Finder or Obsidian (path always resolved server-side from the
+  project uid, never client-supplied); and **`GET /events`**, the first real
+  piece of the "thin clients over an HTTP+SSE API" interface-plane sketch
+  above — the warm model emits a change event on every write-through
+  mutation and `fs.watch` reconciliation, and the client refreshes on push
+  instead of polling Refresh.
+- **decision-9** — a narrow, library-mediated task-body editor
+  (`setTaskBody`) and interactive Acceptance-Criteria checkboxes
+  (`toggleChecklistItem`), both hash-guarded against the warm model's
+  per-file sha256 (`ConflictError` → 409 on a stale `expectedHash`, same
+  posture as the write-race guard in Phase 1a) and both deliberately fenced
+  short of a general Markdown/WYSIWYG editor — see the decision for why.
 - **Phase 2** — workspace root externalized to `~/.config/openworkspace/
   locations.toml` (`[[stores]]`, `driver = "localfs"`), with a forgiving
   loader (`OPENWORKSPACE_CONFIG_DIR` override), backward-compatible walk-up
