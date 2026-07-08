@@ -83,6 +83,11 @@ main { padding: 16px 20px; overflow: auto; }
 .project-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project > h2 .meta { font-size: 12px; color: var(--muted); font-weight: 400; }
 .project-summary { margin-left: auto; font-size: 12px; color: var(--muted); font-weight: 400; }
+.project-reveal { display: flex; gap: 4px; align-items: center; flex: none; }
+.reveal-btn { border: 1px solid var(--line); background: var(--panel); color: var(--muted); font: inherit;
+  font-size: 11px; padding: 2px 8px; border-radius: 999px; cursor: pointer; line-height: 1.4; }
+.reveal-btn:hover { border-color: var(--accent); color: var(--accent); }
+.reveal-err { color: var(--waiting); font-size: 12px; font-weight: 700; cursor: default; }
 .lifecycle-tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--chip); color: var(--muted); font-weight: 500; }
 ul.tasks { list-style: none; margin: 0; padding: 6px 0; }
 li.task { padding: 4px 14px; display: flex; gap: 8px; align-items: baseline; cursor: pointer; border-left: 3px solid transparent; }

@@ -1,5 +1,6 @@
-import React from "react";
+import React, { useState } from "react";
 import { useStore } from "../store";
+import { revealProject } from "../api";
 import { buildTaskTree, taskMatchesFilters } from "../taskTree";
 import { TaskBranch } from "./TaskBranch";
 import type { ScanProject, ViewState } from "../types";
@@ -7,6 +8,13 @@ import type { ScanProject, ViewState } from "../types";
 export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React.JSX.Element {
   const { collapsedProjects, toggleProjectCollapsed } = useStore();
   const collapsed = collapsedProjects.has(p.uid);
+  const [revealErr, setRevealErr] = useState<string | null>(null);
+
+  const reveal = async (target: "finder" | "obsidian"): Promise<void> => {
+    setRevealErr(null);
+    const r = await revealProject(p.uid, target);
+    if (!r.ok) setRevealErr(r.error);
+  };
 
   const visible = p.tasks.filter((t) => !t.hidden && taskMatchesFilters(p, t, st));
   const open = visible.filter((t) => t.status !== "done");
@@ -40,6 +48,35 @@ export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React
           {hiddenN ? " · " + hiddenN + " hidden" : ""}
         </span>
         <span className="project-summary">{summary}</span>
+        <span className="project-reveal">
+          <button
+            className="reveal-btn"
+            title="Reveal in Finder"
+            onClick={(e) => {
+              e.stopPropagation();
+              void reveal("finder");
+            }}
+          >
+            Reveal
+          </button>
+          {p.hasObsidianVault ? (
+            <button
+              className="reveal-btn"
+              title="Open in Obsidian"
+              onClick={(e) => {
+                e.stopPropagation();
+                void reveal("obsidian");
+              }}
+            >
+              Obsidian
+            </button>
+          ) : null}
+          {revealErr ? (
+            <span className="reveal-err" role="status" title={revealErr}>
+              !
+            </span>
+          ) : null}
+        </span>
       </h2>
       {collapsed ? null : visible.length === 0 ? (
         <div className="empty">No visible tasks</div>

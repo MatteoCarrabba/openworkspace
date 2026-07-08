@@ -19,6 +19,10 @@
  *   detail pane.
  *   (waiting / review / tasks-unhidden-today / doctor error count).
  * - Zero stored state, zero mutation endpoints: GET/HEAD only, 405 otherwise.
+ * - POST /api/project/reveal {project, target: "finder"|"obsidian"} opens the
+ *   project's root in Finder or its Obsidian vault. Loopback-gated exactly
+ *   like the task mutation endpoints (it spawns a process); the path is
+ *   always resolved server-side from the project uid, never client-supplied.
  *
  * Doctor note (integrator): src/doctor.ts is the authority for invariant
  * checks (`projects doctor` / `home doctor`). The scan keeps its own
@@ -109,6 +113,8 @@ export interface ScanProject {
   nestedUnder: string | null;
   tasks: ScanTask[];
   taskCounts: { total: number; done: number; hidden: number };
+  /** `<root>/.obsidian` exists — lets the client show an "Open in Obsidian" control. */
+  hasObsidianVault: boolean;
 }
 
 export interface ScanResult {
@@ -502,6 +508,8 @@ function assembleScanResult(ws: Workspace, now: Date, projectData: readonly Proj
         done: tasks.filter((t) => t.status === "done").length,
         hidden: tasks.filter((t) => t.hidden).length,
       },
+      // Cheap: one stat per project per scan, no directory walk.
+      hasObsidianVault: fs.existsSync(path.join(info.root, ".obsidian")),
     });
   }
 
@@ -1429,6 +1437,9 @@ export interface DashboardOptions {
    * tailnet-served instance never accepts writes from a peer.
    */
   readOnly?: boolean;
+  /** Injectable process launcher for /api/project/reveal (tests stub this so
+   *  they never actually spawn `open`). Default: `defaultProcessOpener`. */
+  processOpener?: ProcessOpener;
 }
 
 /** A built scan plus the wall-clock instant it was built at. */
@@ -1592,6 +1603,10 @@ export const MUTATION_PATHS: ReadonlySet<string> = new Set([
   "/api/task/note",
 ]);
 
+/** The reveal endpoint's path — spawns a process, so it rides the exact same
+ *  loopback write-gate as MUTATION_PATHS even though it isn't a task verb. */
+export const REVEAL_PATH = "/api/project/reveal";
+
 const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
 
@@ -1656,6 +1671,66 @@ function projectRootForUid(workspaceRoot: string, uid: string): string | null {
   const ws = openWorkspace(workspaceRoot);
   const info = discoverProjects(ws, { all: true }).find((p) => p.uid === uid);
   return info === undefined ? null : path.join(ws.root, info.relPath);
+}
+
+// ---------------------------------------------------------------------------
+// Reveal (Finder / Obsidian): the React client cannot spawn processes, so this
+// is a narrow, loopback-gated endpoint (reuses the mutation write-gate below)
+// that resolves a client-supplied uid to a project root SERVER-SIDE and shells
+// out to macOS `open` — never to a client-supplied path, and never to any
+// argv beyond a single resolved path or URI.
+
+export type RevealTarget = "finder" | "obsidian";
+
+/** Injectable process launcher — tests stub this so they never actually
+ *  launch Finder/Obsidian. Always called with exactly one argument: a
+ *  server-resolved absolute path or an `obsidian://` URI built from one. */
+export type ProcessOpener = (args: readonly string[]) => void;
+
+/** Default opener: macOS `open`, detached, output discarded. */
+export const defaultProcessOpener: ProcessOpener = (args) => {
+  spawn("open", args as string[], { stdio: "ignore", detached: true }).unref();
+};
+
+export interface RevealOutcome {
+  status: number;
+  body: { ok: true } | { error: string };
+}
+
+/**
+ * Resolve `uid` to an absolute project root and shell out to `open`.
+ * - "finder": `open <root>`.
+ * - "obsidian": only when `<root>/.obsidian` exists (else 422); percent-encodes
+ *   the root into an `obsidian://open?path=` URI.
+ * Non-macOS is a hard 501 — never spawns. Unknown uid is 404, never a path
+ * traversal risk since the path always comes from server-side discovery.
+ */
+export function revealProject(
+  workspaceRoot: string,
+  uid: string,
+  target: string,
+  opener: ProcessOpener,
+): RevealOutcome {
+  if (process.platform !== "darwin") {
+    return { status: 501, body: { error: "reveal is only supported on macOS" } };
+  }
+  if (target !== "finder" && target !== "obsidian") {
+    return { status: 400, body: { error: `invalid target: ${target || "(none)"} (expected finder|obsidian)` } };
+  }
+  const root = projectRootForUid(workspaceRoot, uid);
+  if (root === null) {
+    return { status: 404, body: { error: `project not found: ${uid}` } };
+  }
+  if (target === "finder") {
+    opener([root]);
+    return { status: 200, body: { ok: true } };
+  }
+  // target === "obsidian"
+  if (!fs.existsSync(path.join(root, ".obsidian"))) {
+    return { status: 422, body: { error: "not an Obsidian vault (no .obsidian directory)" } };
+  }
+  opener([`obsidian://open?path=${encodeURIComponent(root)}`]);
+  return { status: 200, body: { ok: true } };
 }
 
 /** Map a library error to the HTTP status. Order matters: the most specific
@@ -1762,8 +1837,11 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     const pathname = url.pathname;
 
     // Write path (decision-1): loopback-gated mutations, routed through the
-    // library. Read requests may come from the tailnet; writes may not.
-    if (req.method === "POST" && MUTATION_PATHS.has(pathname)) {
+    // library. Read requests may come from the tailnet; writes may not. The
+    // reveal endpoint spawns a process rather than writing a task, but shares
+    // the exact same gate — process-spawning is at least as sensitive as a
+    // file write.
+    if (req.method === "POST" && (MUTATION_PATHS.has(pathname) || pathname === REVEAL_PATH)) {
       if (options.readOnly === true) {
         res.setHeader("allow", "GET, HEAD");
         sendJson(res, 405, { error: "method not allowed: dashboard is read-only" });
@@ -1780,6 +1858,13 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
       void (async () => {
         try {
           const body = await readJsonBody(req);
+          if (pathname === REVEAL_PATH) {
+            const project = typeof body["project"] === "string" ? (body["project"] as string) : "";
+            const target = typeof body["target"] === "string" ? (body["target"] as string) : "";
+            const outcome = revealProject(options.workspaceRoot, project, target, options.processOpener ?? defaultProcessOpener);
+            sendJson(res, outcome.status, outcome.body);
+            return;
+          }
           const detail = applyMutation(pathname, body, options, now);
           // Write-through (Phase 1b): fold ONLY the mutated task back into the
           // warm model — no invalidation, no re-walk. Subsequent /api/scan and

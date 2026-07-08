@@ -18,6 +18,7 @@ import {
   TaskDetailResult,
   buildAllowedHosts,
   hostAllowed,
+  revealProject,
   scanAutomations,
   scanWorkspace,
   startDashboard,
@@ -1252,4 +1253,181 @@ test("write: unknown project is a 404", async (t) => {
   t.after(() => running.close());
   const res = await post(running.port, "/api/task/note", { project: "uid-nope", task: "task-1", text: "x" });
   assert.equal(res.status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// Reveal in Finder / Obsidian: uid -> path resolution, obsidian detection, and
+// the loopback gate. The opener is always stubbed — these tests never launch
+// Finder or Obsidian for real.
+
+test("scan: hasObsidianVault reflects the presence of <root>/.obsidian", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    fs.mkdirSync(path.join(tmp.root, "Alpha Project", ".obsidian"));
+    const scan = scanWorkspace(openWorkspace(tmp.root), NOW);
+    const byUid = new Map(scan.projects.map((p) => [p.uid, p]));
+    assert.equal(byUid.get("uid-alpha")?.hasObsidianVault, true);
+    assert.equal(byUid.get("uid-beta")?.hasObsidianVault, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: uid resolves to the project root and invokes the opener with it (finder)", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    const calls: (readonly string[])[] = [];
+    const result = revealProject(tmp.root, "uid-alpha", "finder", (args) => calls.push(args));
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, { ok: true });
+    assert.deepEqual(calls, [[path.join(tmp.root, "Alpha Project")]]);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: unknown uid is a 404, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-nope", "finder", () => {
+      called = true;
+    });
+    assert.equal(result.status, 404);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: obsidian target without a vault is a 422, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "obsidian", () => {
+      called = true;
+    });
+    assert.equal(result.status, 422);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: obsidian target with a vault percent-encodes the root into an obsidian:// URI", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    const alpha = path.join(tmp.root, "Alpha Project");
+    fs.mkdirSync(path.join(alpha, ".obsidian"));
+    const calls: (readonly string[])[] = [];
+    const result = revealProject(tmp.root, "uid-alpha", "obsidian", (args) => calls.push(args));
+    assert.equal(result.status, 200);
+    assert.deepEqual(calls, [[`obsidian://open?path=${encodeURIComponent(alpha)}`]]);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: invalid target is a 400, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "bogus", () => {
+      called = true;
+    });
+    assert.equal(result.status, 400);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: non-macOS is a hard 501, never spawns", () => {
+  const tmp = buildFixtureWorkspace();
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "finder", () => {
+      called = true;
+    });
+    assert.equal(result.status, 501);
+    assert.equal(called, false);
+  } finally {
+    Object.defineProperty(process, "platform", original);
+    tmp.cleanup();
+  }
+});
+
+test("reveal: HTTP endpoint resolves uid, calls the injected opener, and returns 200", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-alpha", target: "finder" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.body), { ok: true });
+  assert.deepEqual(calls, [[path.join(tmp.root, "Alpha Project")]]);
+});
+
+test("reveal: HTTP endpoint 404s on an unknown project uid", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-nope", target: "finder" });
+  assert.equal(res.status, 404);
+  assert.equal(calls.length, 0);
+});
+
+test("reveal: HTTP endpoint is loopback-gated exactly like task mutations", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    allowedHosts: ["ws.tailnet.ts.net"],
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  // A tailnet Host reaches reads, but the reveal write is refused.
+  const write = await post(
+    running.port,
+    "/api/project/reveal",
+    { project: "uid-alpha", target: "finder" },
+    { host: "ws.tailnet.ts.net" },
+  );
+  assert.equal(write.status, 403);
+  assert.equal(calls.length, 0);
+});
+
+test("reveal: readOnly:true hard-disables the reveal endpoint too (405)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    readOnly: true,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-alpha", target: "finder" });
+  assert.equal(res.status, 405);
+  assert.equal(calls.length, 0);
 });

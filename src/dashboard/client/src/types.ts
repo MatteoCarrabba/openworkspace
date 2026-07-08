@@ -46,6 +46,7 @@ export interface ScanProject {
   nestedUnder: string | null;
   tasks: ScanTask[];
   taskCounts: { total: number; done: number; hidden: number };
+  hasObsidianVault: boolean;
 }
 
 export interface ScanResult {
