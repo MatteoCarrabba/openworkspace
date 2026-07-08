@@ -482,9 +482,18 @@ test("http: serves the single-file index.html at /", async (t) => {
   const res = await get(running.port, "/");
   assert.equal(res.status, 200);
   assert.match(String(res.headers["content-type"]), /text\/html/);
-  assert.match(res.body, /OpenWorkspace dashboard v1/);
+  // React-port build (Phase 2): a single self-contained HTML with all JS/CSS
+  // inlined — assert the shell + the API paths its bundled client calls.
+  assert.match(res.body, /<title>OpenWorkspace<\/title>/);
+  assert.match(res.body, /<script type="module"/);
   assert.match(res.body, /\/api\/scan/);
-  // no external CDN deps in the page
+  assert.match(res.body, /\/api\/task/);
+  assert.match(res.body, /\/api\/automations/);
+  // no external CDN deps in the page — no <script src=http…>/<link href=http…>
+  // resource loads. (React itself embeds a few literal https:// strings, e.g.
+  // SVG/MathML namespace URIs and react.dev error links, which are inert
+  // string constants, not fetched resources — so this checks for a CDN host
+  // specifically rather than absence of "https://" anywhere in the bundle.)
   assert.doesNotMatch(res.body, /https?:\/\/(cdn|unpkg|jsdelivr|googleapis)/);
 });
 
