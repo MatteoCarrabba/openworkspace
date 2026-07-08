@@ -38,6 +38,8 @@ export const CLI_SURFACE: Readonly<Record<string, ReadonlySet<string> | null>> =
   dashboard: new Set(["dev", "open"]),
   import: new Set(["legacy"]),
   help: null,
+  locations: new Set(["list"]), // phase 2: read-only view onto locations.toml
+  reindex: null, // phase 2: documented no-op — no persistent index exists yet
 };
 
 /**

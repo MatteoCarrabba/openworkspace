@@ -33,6 +33,7 @@ import {
   writeRunnerNode,
   writeUidCacheEntry,
 } from "./lib/machine.js";
+import { LocationStore, loadLocationStores, locationsFilePath } from "./lib/locations.js";
 import { isGitWorktree, registerWorkspaceIfCanonical, resolveCanonicalProject } from "./lib/resolve.js";
 import { readToml } from "./lib/toml.js";
 import {
@@ -102,6 +103,13 @@ Workspace
   projects home mint-suffix [<suffix>|--clear]   this machine's ID suffix (e.g. "mini" → task-7-mini)
   projects home runner-node [<path>|--clear]     this machine's granted runner node binary (decision-1)
   projects home machine-id [<name>]       this machine's id — matched against manifests' machines = [...]
+
+Locations (phase 2 — the workspace root lives in config, not just "wherever cwd is")
+  projects locations list [--json]        print the stores configured in ~/.config/openworkspace/locations.toml
+                                           (or OPENWORKSPACE_CONFIG_DIR); none configured ⇒ falls back to
+                                           walking up from cwd for .openworkspace/, exactly as before
+  projects reindex [--json]               rebuild any persistent index (currently none — a documented no-op;
+                                           discovery is always a live tree walk, so there is nothing to rebuild yet)
 
 Projects
   projects init [<path>]                  stamp the full _project/ skeleton (default: the cwd)
@@ -322,6 +330,48 @@ function taskLine(t: tasks.TaskListEntry): string {
 
 // ---------------------------------------------------------------------------
 // Command groups
+
+/**
+ * `projects locations *` — read-only view onto locations.toml (phase 2). No
+ * subcommand mutates the file yet; a human (or a future `locations add`)
+ * authors it. Reading is via the same forgiving loader `openWorkspace` uses,
+ * so this prints exactly what resolution would see.
+ */
+function cmdLocations(argv: string[]): void {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  switch (sub) {
+    case "list": {
+      const { values } = parse(rest, FLAG_JSON);
+      const stores: LocationStore[] = loadLocationStores();
+      if (values["json"] === true) {
+        printJson({ path: locationsFilePath(), stores });
+        return;
+      }
+      if (stores.length === 0) {
+        print(`no stores configured (${locationsFilePath()} absent or empty) — resolving by walk-up from cwd`);
+        return;
+      }
+      for (const s of stores) print(`${s.name}  ${s.driver}  ${s.path}`);
+      return;
+    }
+    default:
+      throw new ConfigError(`unknown locations subcommand: ${sub ?? "(none)"} (expected list)`);
+  }
+}
+
+/**
+ * `projects reindex` — a hook for the future, not a rebuild today. Discovery
+ * is always a live tree walk (no registry file — MODULES.md ground rules);
+ * there is currently nothing persistent to rebuild. This verb exists now so
+ * scripts and muscle memory have somewhere to land once a store gains a
+ * cache/index worth invalidating.
+ */
+function cmdReindex(argv: string[]): void {
+  const { values } = parse(argv, FLAG_JSON);
+  if (values["json"] === true) printJson({ reindexed: false, reason: "no persistent index in this version" });
+  else print("reindex: no-op — discovery is a live tree walk; nothing persistent to rebuild yet");
+}
 
 function cmdHome(argv: string[]): void {
   const sub = argv[0];
@@ -2135,6 +2185,12 @@ export function main(argv: string[]): void {
       return;
     case "home":
       cmdHome(rest);
+      return;
+    case "locations":
+      cmdLocations(rest);
+      return;
+    case "reindex":
+      cmdReindex(rest);
       return;
     case "init":
       cmdInit(rest);
