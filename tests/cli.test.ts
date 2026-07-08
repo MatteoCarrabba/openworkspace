@@ -21,11 +21,11 @@ interface RunResult {
   stderr: string;
 }
 
-function run(args: string[], cwd: string, storeDir: string): RunResult {
+function run(args: string[], cwd: string, storeDir: string, extraEnv: NodeJS.ProcessEnv = {}): RunResult {
   const result = spawnSync(process.execPath, [CLI, ...args], {
     cwd,
     encoding: "utf8",
-    env: { ...process.env, OPENWORKSPACE_STORE_DIR: storeDir, OW_ACTOR: "cli-test" },
+    env: { ...process.env, OPENWORKSPACE_STORE_DIR: storeDir, OW_ACTOR: "cli-test", ...extraEnv },
   });
   return { status: result.status ?? -1, stdout: result.stdout, stderr: result.stderr };
 }
@@ -557,4 +557,65 @@ test("cli: reconcile on a clean workspace is a no-op (exit 0)", (t) => {
   const r = run(["reconcile"], fx.root, fx.storeDir);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /no drift/);
+});
+
+test("cli: locations list — no config configured prints the walk-up fallback note", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const configDir = makeTmpDir("ow-config-dir-"); // exists, but empty — no locations.toml
+  t.after(() => rmrf(configDir));
+
+  const list = run(["locations", "list"], fx.root, fx.storeDir, { OPENWORKSPACE_CONFIG_DIR: configDir });
+  assert.equal(list.status, 0, list.stderr);
+  assert.match(list.stdout, /resolving by walk-up from cwd/);
+
+  const listJson = run(["locations", "list", "--json"], fx.root, fx.storeDir, {
+    OPENWORKSPACE_CONFIG_DIR: configDir,
+  });
+  assert.equal(listJson.status, 0, listJson.stderr);
+  const parsed = JSON.parse(listJson.stdout) as { stores: unknown[] };
+  assert.deepEqual(parsed.stores, []);
+
+  // Ordinary commands are unaffected — the existing tree still resolves by walk-up.
+  const home = run(["home", "list", "--json"], fx.root, fx.storeDir, { OPENWORKSPACE_CONFIG_DIR: configDir });
+  assert.equal(home.status, 0, home.stderr);
+});
+
+test("cli: locations list prints a configured localfs store, and projects runs from anywhere with it", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const configDir = makeTmpDir("ow-config-dir-");
+  t.after(() => rmrf(configDir));
+  fs.writeFileSync(
+    path.join(configDir, "locations.toml"),
+    ['[[stores]]', 'name = "personal"', 'driver = "localfs"', `path = "${fx.root}"`, ""].join("\n"),
+  );
+  const withConfig = { OPENWORKSPACE_CONFIG_DIR: configDir };
+
+  const list = run(["locations", "list", "--json"], fx.root, fx.storeDir, withConfig);
+  assert.equal(list.status, 0, list.stderr);
+  const parsed = JSON.parse(list.stdout) as { stores: Array<{ name: string; driver: string; path: string }> };
+  assert.deepEqual(parsed.stores, [{ name: "personal", driver: "localfs", path: fx.root }]);
+
+  // Run `home list` from a cwd entirely OUTSIDE the workspace tree — config
+  // alone must resolve the workspace root (the point of phase 2).
+  const elsewhere = makeTmpDir("ow-elsewhere-");
+  t.after(() => rmrf(elsewhere));
+  const homeElsewhere = run(["home", "list", "--json"], elsewhere, fx.storeDir, withConfig);
+  assert.equal(homeElsewhere.status, 0, homeElsewhere.stderr);
+  const projects = JSON.parse(homeElsewhere.stdout) as Array<{ relPath: string }>;
+  assert.equal(projects.length, 1);
+  assert.equal(projects[0]?.relPath, "CLI: Proj A");
+});
+
+test("cli: reindex is a documented no-op that exits 0", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const r = run(["reindex"], fx.root, fx.storeDir);
+  assert.equal(r.status, 0, r.stderr);
+  assert.match(r.stdout, /no-op/);
+
+  const rJson = run(["reindex", "--json"], fx.root, fx.storeDir);
+  assert.equal(rJson.status, 0, rJson.stderr);
+  assert.deepEqual(JSON.parse(rJson.stdout), { reindexed: false, reason: "no persistent index in this version" });
 });

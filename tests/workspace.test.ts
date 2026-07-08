@@ -31,6 +31,61 @@ test("findWorkspaceRoot walks up from deep inside; null outside any workspace", 
   assert.throws(() => openWorkspace(outside), NotFoundError);
 });
 
+test("openWorkspace: no locations.toml (or an empty config dir) falls back to walk-up, unchanged", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  const configDir = makeTmpDir("ow-config-dir-"); // exists, but no locations.toml inside
+  t.after(() => rmrf(configDir));
+  const env = { OPENWORKSPACE_CONFIG_DIR: configDir };
+
+  const deep = path.join(tw.root, "Some Project", "src", "deep");
+  fs.mkdirSync(deep, { recursive: true });
+  const ws = openWorkspace(deep, env);
+  assert.equal(ws.root, tw.root);
+
+  // Same outside-any-workspace failure as with no env override at all.
+  const outside = makeTmpDir();
+  t.after(() => rmrf(outside));
+  assert.throws(() => openWorkspace(outside, env), NotFoundError);
+});
+
+test("openWorkspace: locations.toml with a localfs store wins over walk-up — runs from anywhere", (t) => {
+  const tw = makeTmpWorkspace();
+  t.after(tw.cleanup);
+  tw.addProject("Some Project");
+
+  const configDir = makeTmpDir("ow-config-dir-");
+  t.after(() => rmrf(configDir));
+  fs.writeFileSync(
+    path.join(configDir, "locations.toml"),
+    ['[[stores]]', 'name = "personal"', 'driver = "localfs"', `path = "${tw.root}"`, ""].join("\n"),
+  );
+  const env = { OPENWORKSPACE_CONFIG_DIR: configDir };
+
+  // A cwd/startDir that is nowhere near the workspace — config alone resolves it.
+  const elsewhere = makeTmpDir("ow-elsewhere-");
+  t.after(() => rmrf(elsewhere));
+  const ws = openWorkspace(elsewhere, env);
+  assert.equal(ws.root, tw.root);
+  assert.deepEqual(
+    discoverProjects(ws).map((p) => p.relPath),
+    ["Some Project"],
+  );
+});
+
+test("openWorkspace: configured store missing its .openworkspace marker is a clear error, not a silent fallback", (t) => {
+  const notAWorkspace = makeTmpDir("ow-not-a-workspace-");
+  t.after(() => rmrf(notAWorkspace));
+  const configDir = makeTmpDir("ow-config-dir-");
+  t.after(() => rmrf(configDir));
+  fs.writeFileSync(
+    path.join(configDir, "locations.toml"),
+    ['[[stores]]', 'name = "broken"', 'driver = "localfs"', `path = "${notAWorkspace}"`, ""].join("\n"),
+  );
+  const env = { OPENWORKSPACE_CONFIG_DIR: configDir };
+  assert.throws(() => openWorkspace(notAWorkspace, env), NotFoundError);
+});
+
 test("config: absent file means all defaults", (t) => {
   const tw = makeTmpWorkspace();
   t.after(tw.cleanup);
