@@ -120,7 +120,7 @@ function startFixtureDashboard(tmp: TmpWorkspace): Promise<RunningDashboard> {
 // exceed a couple seconds under full-suite CPU load; waitFor returns as soon as
 // the condition holds, so a high ceiling never slows a passing run. No caller
 // relies on a short timeout to assert absence (that path uses a fixed setTimeout).
-async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 10000, intervalMs = 20): Promise<void> {
+async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 30000, intervalMs = 20): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await check()) return;
@@ -611,7 +611,7 @@ test("warm model: an out-of-band file edit is reconciled by the fs.watch path", 
     const scan = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
     const t2 = scan.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((x) => x.id === "task-2");
     return t2?.status === "doing";
-  }, 10000);
+  });
 });
 
 test("warm model: self-echo suppression — a write-through doesn't re-trigger on its own fs.watch event", async (t) => {
