@@ -30,6 +30,9 @@ export interface ScanTask {
   depth: number;
   body: string;
   rollup: TaskRollup | null;
+  /** sha256 of the file as last read; echoed back as `expectedHash` on the
+   *  body/checkbox mutation endpoints so a stale edit is refused, not clobbered. */
+  hash: string;
 }
 
 export interface DoctorIssue {
@@ -46,6 +49,7 @@ export interface ScanProject {
   nestedUnder: string | null;
   tasks: ScanTask[];
   taskCounts: { total: number; done: number; hidden: number };
+  hasObsidianVault: boolean;
 }
 
 export interface ScanResult {
@@ -155,6 +159,7 @@ export interface ViewState {
   sel: string | null;
   selProject: string | null;
   autoFilter: "all" | "drift";
+  autoQuery: string;
 }
 
 export interface MutationResult {

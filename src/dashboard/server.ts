@@ -19,6 +19,10 @@
  *   detail pane.
  *   (waiting / review / tasks-unhidden-today / doctor error count).
  * - Zero stored state, zero mutation endpoints: GET/HEAD only, 405 otherwise.
+ * - POST /api/project/reveal {project, target: "finder"|"obsidian"} opens the
+ *   project's root in Finder or its Obsidian vault. Loopback-gated exactly
+ *   like the task mutation endpoints (it spawns a process); the path is
+ *   always resolved server-side from the project uid, never client-supplied.
  *
  * Doctor note (integrator): src/doctor.ts is the authority for invariant
  * checks (`projects doctor` / `home doctor`). The scan keeps its own
@@ -30,17 +34,25 @@
  */
 
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
 
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
-import { ConfigError, NotFoundError, OwError } from "../lib/errors.js";
+import { ConfigError, ConflictError, NotFoundError, OwError } from "../lib/errors.js";
 import { sha256Hex } from "../lib/fsatomic.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
 import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
-import { TaskStateError, addNote, setFinalSummary, setStatus } from "../primitives/tasks.js";
+import {
+  TaskStateError,
+  addNote,
+  setFinalSummary,
+  setStatus,
+  setTaskBody,
+  toggleChecklistItem,
+} from "../primitives/tasks.js";
 import {
   Lifecycle,
   MARKER_DIR,
@@ -87,6 +99,11 @@ export interface ScanTask {
   depth: number; // 0 = top-level
   body: string; // full in direct scans/detail endpoint; empty in body-light HTTP scans
   rollup: TaskRollup | null; // present only when the task has descendants
+  /** sha256 of the file's raw bytes as last read — the same hash the tasks
+   *  library's optimistic-concurrency guard uses. The client echoes this back
+   *  as `expectedHash` on /api/task/body and /api/task/checkbox so a stale
+   *  edit is refused (409) instead of clobbering a concurrent write. */
+  hash: string;
 }
 
 export interface TaskRollup {
@@ -109,6 +126,8 @@ export interface ScanProject {
   nestedUnder: string | null;
   tasks: ScanTask[];
   taskCounts: { total: number; done: number; hidden: number };
+  /** `<root>/.obsidian` exists — lets the client show an "Open in Obsidian" control. */
+  hasObsidianVault: boolean;
 }
 
 export interface ScanResult {
@@ -352,6 +371,9 @@ function readTaskFile(
     depth: parsed ? parsed.parts.length - 1 : 0,
     body: includeBody ? rec.body : "",
     rollup: null,
+    // Same hash shape as the tasks library's TaskFile.contentHash (sha256 of
+    // the exact bytes read) so a client's expectedHash round-trips cleanly.
+    hash: sha256Hex(rec.originalText),
   };
   return { task, parsed, issues };
 }
@@ -502,6 +524,8 @@ function assembleScanResult(ws: Workspace, now: Date, projectData: readonly Proj
         done: tasks.filter((t) => t.status === "done").length,
         hidden: tasks.filter((t) => t.hidden).length,
       },
+      // Cheap: one stat per project per scan, no directory walk.
+      hasObsidianVault: fs.existsSync(path.join(info.root, ".obsidian")),
     });
   }
 
@@ -1137,6 +1161,15 @@ function isOwnTempFile(fileName: string): boolean {
   return /^\..*\.ow-tmp-\d+-[0-9a-f]{8}$/.test(fileName);
 }
 
+/** One change to the warm model, as pushed to /events subscribers. `task` is
+ *  null when a reconcile couldn't resolve which task id was affected (e.g. a
+ *  file deleted before its id could be recovered) — clients should treat that
+ *  as "something in this project changed" and just refresh. */
+export interface ModelChangeEvent {
+  project: string; // project uid
+  task: string | null; // task id, when known
+}
+
 export class WarmModel {
   private readonly ws: Workspace;
   private readonly nowFn: () => Date;
@@ -1147,13 +1180,30 @@ export class WarmModel {
   private debounceTimers = new Map<string, NodeJS.Timeout>(); // uid -> debounce timer
   private periodicHandle: NodeJS.Timeout | null = null;
   private closed = false;
+  // Batch 3 (SSE): a change fires from write-through OR a watch-reconciled
+  // file — never from the periodic self-heal rebuild (that's a backstop, not
+  // a signal a client should react to). No listener cap: connections are
+  // capped where they're accepted (the /events route), not here.
+  private readonly emitter = new EventEmitter();
 
   constructor(ws: Workspace, nowFn: () => Date, options: { watch?: boolean } = {}) {
     this.ws = ws;
     this.nowFn = nowFn;
+    this.emitter.setMaxListeners(0);
     this.rebuildFull();
     if (options.watch !== false) this.startWatching();
     this.startPeriodicReconcile();
+  }
+
+  /** Subscribe to change events (write-through or fs.watch reconcile). Returns
+   *  an unsubscribe function. Used by the /events SSE route. */
+  onChange(listener: (event: ModelChangeEvent) => void): () => void {
+    this.emitter.on("change", listener);
+    return () => this.emitter.off("change", listener);
+  }
+
+  private emitChange(projectUid: string, taskId: string | null): void {
+    this.emitter.emit("change", { project: projectUid, task: taskId } satisfies ModelChangeEvent);
   }
 
   private rebuildFull(): void {
@@ -1205,6 +1255,7 @@ export class WarmModel {
     const known = mp.idToFile.get(taskId);
     if (known !== undefined) {
       reconcileModelFile(mp, known, now);
+      this.emitChange(projectUid, taskId);
       return;
     }
     // Unknown task id (shouldn't happen for an existing-task mutation, but a
@@ -1214,6 +1265,7 @@ export class WarmModel {
     const rebuilt = buildModelProject(mp.info, now);
     this.projects = this.projects.map((p) => (p.info.uid === projectUid ? rebuilt : p));
     this.byUid.set(projectUid, rebuilt);
+    this.emitChange(projectUid, taskId);
   }
 
   private startWatching(): void {
@@ -1271,7 +1323,14 @@ export class WarmModel {
     if (mp === undefined) return;
     const now = this.nowFn();
     for (const fileName of pending) {
-      reconcileModelFile(mp, fileName, now);
+      const prior = mp.files.get(fileName);
+      const changed = reconcileModelFile(mp, fileName, now);
+      if (!changed) continue; // self-echo or a duplicate event — nothing to tell subscribers
+      const current = mp.files.get(fileName);
+      // Prefer the post-reconcile id; fall back to the pre-reconcile id for a
+      // delete (current is gone by then) so subscribers still learn WHICH
+      // task's file changed rather than getting a bare project-only event.
+      this.emitChange(uid, current?.task.id ?? prior?.task.id ?? null);
     }
   }
 
@@ -1306,6 +1365,7 @@ export class WarmModel {
       clearInterval(this.periodicHandle);
       this.periodicHandle = null;
     }
+    this.emitter.removeAllListeners();
   }
 }
 
@@ -1429,6 +1489,9 @@ export interface DashboardOptions {
    * tailnet-served instance never accepts writes from a peer.
    */
   readOnly?: boolean;
+  /** Injectable process launcher for /api/project/reveal (tests stub this so
+   *  they never actually spawn `open`). Default: `defaultProcessOpener`. */
+  processOpener?: ProcessOpener;
 }
 
 /** A built scan plus the wall-clock instant it was built at. */
@@ -1590,7 +1653,13 @@ export const MUTATION_PATHS: ReadonlySet<string> = new Set([
   "/api/task/status",
   "/api/task/done",
   "/api/task/note",
+  "/api/task/body",
+  "/api/task/checkbox",
 ]);
+
+/** The reveal endpoint's path — spawns a process, so it rides the exact same
+ *  loopback write-gate as MUTATION_PATHS even though it isn't a task verb. */
+export const REVEAL_PATH = "/api/project/reveal";
 
 const LOOPBACK_ADDRS = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1"]);
@@ -1658,10 +1727,71 @@ function projectRootForUid(workspaceRoot: string, uid: string): string | null {
   return info === undefined ? null : path.join(ws.root, info.relPath);
 }
 
+// ---------------------------------------------------------------------------
+// Reveal (Finder / Obsidian): the React client cannot spawn processes, so this
+// is a narrow, loopback-gated endpoint (reuses the mutation write-gate below)
+// that resolves a client-supplied uid to a project root SERVER-SIDE and shells
+// out to macOS `open` — never to a client-supplied path, and never to any
+// argv beyond a single resolved path or URI.
+
+export type RevealTarget = "finder" | "obsidian";
+
+/** Injectable process launcher — tests stub this so they never actually
+ *  launch Finder/Obsidian. Always called with exactly one argument: a
+ *  server-resolved absolute path or an `obsidian://` URI built from one. */
+export type ProcessOpener = (args: readonly string[]) => void;
+
+/** Default opener: macOS `open`, detached, output discarded. */
+export const defaultProcessOpener: ProcessOpener = (args) => {
+  spawn("open", args as string[], { stdio: "ignore", detached: true }).unref();
+};
+
+export interface RevealOutcome {
+  status: number;
+  body: { ok: true } | { error: string };
+}
+
+/**
+ * Resolve `uid` to an absolute project root and shell out to `open`.
+ * - "finder": `open <root>`.
+ * - "obsidian": only when `<root>/.obsidian` exists (else 422); percent-encodes
+ *   the root into an `obsidian://open?path=` URI.
+ * Non-macOS is a hard 501 — never spawns. Unknown uid is 404, never a path
+ * traversal risk since the path always comes from server-side discovery.
+ */
+export function revealProject(
+  workspaceRoot: string,
+  uid: string,
+  target: string,
+  opener: ProcessOpener,
+): RevealOutcome {
+  if (process.platform !== "darwin") {
+    return { status: 501, body: { error: "reveal is only supported on macOS" } };
+  }
+  if (target !== "finder" && target !== "obsidian") {
+    return { status: 400, body: { error: `invalid target: ${target || "(none)"} (expected finder|obsidian)` } };
+  }
+  const root = projectRootForUid(workspaceRoot, uid);
+  if (root === null) {
+    return { status: 404, body: { error: `project not found: ${uid}` } };
+  }
+  if (target === "finder") {
+    opener([root]);
+    return { status: 200, body: { ok: true } };
+  }
+  // target === "obsidian"
+  if (!fs.existsSync(path.join(root, ".obsidian"))) {
+    return { status: 422, body: { error: "not an Obsidian vault (no .obsidian directory)" } };
+  }
+  opener([`obsidian://open?path=${encodeURIComponent(root)}`]);
+  return { status: 200, body: { ok: true } };
+}
+
 /** Map a library error to the HTTP status. Order matters: the most specific
  *  subclass first (TaskStateError/NotFoundError/ConfigError all extend OwError). */
 export function mutationStatus(err: unknown): number {
   if (err instanceof TaskStateError) return 422; // invariant refused (e.g. no Final Summary)
+  if (err instanceof ConflictError) return 409; // stale expectedHash — refused, not clobbered
   if (err instanceof NotFoundError) return 404;
   if (err instanceof ConfigError) return 400;
   if (err instanceof OwError) return 400;
@@ -1710,6 +1840,23 @@ export function applyMutation(
       addNote(root, task, text, { now: nowD, actor });
       break;
     }
+    case "/api/task/body": {
+      const newBody = typeof body["body"] === "string" ? (body["body"] as string) : "";
+      const expectedHash = typeof body["expectedHash"] === "string" ? (body["expectedHash"] as string) : undefined;
+      setTaskBody(root, task, newBody, { expectedHash, now: nowD });
+      break;
+    }
+    case "/api/task/checkbox": {
+      const expectedHash = typeof body["expectedHash"] === "string" ? (body["expectedHash"] as string) : undefined;
+      const checked = body["checked"] === true;
+      const index = typeof body["index"] === "number" ? (body["index"] as number) : undefined;
+      const text = typeof body["text"] === "string" ? (body["text"] as string) : undefined;
+      if (index === undefined && text === undefined) {
+        throw new ConfigError("missing index or text");
+      }
+      toggleChecklistItem(root, task, { index, text, checked, expectedHash, now: nowD });
+      break;
+    }
     default:
       throw new NotFoundError(`unknown mutation: ${pathname}`);
   }
@@ -1752,6 +1899,14 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     ttlMs,
   );
 
+  // Batch 3: SSE live-updates. Read-only (same Host-header gate as every GET
+  // below) — it exposes the warm model's already-current state, it doesn't
+  // add any new write surface. Bounded connection count so a runaway client
+  // (or a misbehaving proxy) can't exhaust file descriptors.
+  const MAX_SSE_CLIENTS = 64;
+  const SSE_KEEPALIVE_MS = 20_000;
+  const sseClients = new Set<http.ServerResponse>();
+
   const server = http.createServer((req, res) => {
     if (!hostAllowed(req.headers.host, allowed)) {
       sendJson(res, 403, { error: "forbidden: host header not allowed" });
@@ -1762,8 +1917,11 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     const pathname = url.pathname;
 
     // Write path (decision-1): loopback-gated mutations, routed through the
-    // library. Read requests may come from the tailnet; writes may not.
-    if (req.method === "POST" && MUTATION_PATHS.has(pathname)) {
+    // library. Read requests may come from the tailnet; writes may not. The
+    // reveal endpoint spawns a process rather than writing a task, but shares
+    // the exact same gate — process-spawning is at least as sensitive as a
+    // file write.
+    if (req.method === "POST" && (MUTATION_PATHS.has(pathname) || pathname === REVEAL_PATH)) {
       if (options.readOnly === true) {
         res.setHeader("allow", "GET, HEAD");
         sendJson(res, 405, { error: "method not allowed: dashboard is read-only" });
@@ -1780,6 +1938,13 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
       void (async () => {
         try {
           const body = await readJsonBody(req);
+          if (pathname === REVEAL_PATH) {
+            const project = typeof body["project"] === "string" ? (body["project"] as string) : "";
+            const target = typeof body["target"] === "string" ? (body["target"] as string) : "";
+            const outcome = revealProject(options.workspaceRoot, project, target, options.processOpener ?? defaultProcessOpener);
+            sendJson(res, outcome.status, outcome.body);
+            return;
+          }
           const detail = applyMutation(pathname, body, options, now);
           // Write-through (Phase 1b): fold ONLY the mutated task back into the
           // warm model — no invalidation, no re-walk. Subsequent /api/scan and
@@ -1816,6 +1981,60 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
         "cache-control": "no-store",
       });
       res.end(req.method === "HEAD" ? undefined : html);
+      return;
+    }
+
+    if (pathname === "/events") {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+        res.end();
+        return;
+      }
+      if (sseClients.size >= MAX_SSE_CLIENTS) {
+        sendJson(res, 503, { error: "too many /events connections" });
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        // "close", not "keep-alive": this socket carries exactly one long-lived
+        // streaming response and is never reused for a second request. Framed
+        // this way, `res.end()` at shutdown tears the socket down immediately
+        // instead of leaving it idle-but-open for the keep-alive timeout,
+        // which is what lets `server.close()` below actually resolve promptly.
+        connection: "close",
+      });
+      res.write(": connected\n\n");
+      sseClients.add(res);
+
+      const unsubscribe = model.onChange((event) => {
+        try {
+          res.write(`data: ${JSON.stringify({ type: "changed", project: event.project, task: event.task })}\n\n`);
+        } catch {
+          // Write raced a half-closed socket; the 'close' listener below cleans up.
+        }
+      });
+
+      const keepalive = setInterval(() => {
+        try {
+          res.write(":\n\n"); // comment line — keeps intermediaries/proxies from timing out the connection
+        } catch {
+          // ditto
+        }
+      }, SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+
+      let cleaned = false;
+      const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        clearInterval(keepalive);
+        unsubscribe();
+        sseClients.delete(res);
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      res.on("error", cleanup);
       return;
     }
 
@@ -1867,9 +2086,20 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     sendJson(res, 404, { error: "not found" });
   });
 
-  // Stop every watcher/timer the model owns once the HTTP server itself is
-  // done — no orphaned handles outliving a closed dashboard.
-  server.once("close", () => model.close());
+  // Stop every watcher/timer the model owns and end every open /events stream
+  // as soon as `close()` is CALLED — not on the 'close' EVENT, which only
+  // fires once every connection has already ended, and an open SSE stream
+  // never ends on its own. Overriding `close` (rather than `once("close", …)`)
+  // means the streams get torn down before Node waits for them, so the
+  // returned close() actually resolves instead of hanging forever on a live
+  // dashboard client.
+  const nativeClose = server.close.bind(server);
+  server.close = ((callback?: (err?: Error) => void) => {
+    model.close();
+    for (const client of sseClients) client.end();
+    sseClients.clear();
+    return nativeClose(callback);
+  }) as typeof server.close;
   return server;
 }
 

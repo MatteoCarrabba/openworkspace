@@ -1,7 +1,7 @@
 import React, { useEffect } from "react";
 import { useStore } from "../store";
-import { renderMarkdown } from "../markdown";
 import { Actions } from "./Actions";
+import { BodyEditor } from "./BodyEditor";
 import { CliCommands } from "./CliCommands";
 import type { ScanProject, ScanTask } from "../types";
 
@@ -73,7 +73,7 @@ function TaskDetailBody({
         </tbody>
       </table>
       <Actions p={p} t={t} />
-      <div className="md" dangerouslySetInnerHTML={{ __html: renderMarkdown(t.body) }} />
+      <BodyEditor p={p} t={t} />
       <CliCommands taskId={t.id} relPath={p.relPath} />
     </aside>
   );

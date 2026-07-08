@@ -832,6 +832,125 @@ export function setRecur(
   return touchAndWrite(tf, { recur: intervalOrOff }, now);
 }
 
+// ---------------------------------------------------------------------------
+// Body editing (DECISION-9): the dashboard's narrow body editor + interactive
+// Acceptance-Criteria checkboxes. Task records only — routed through the same
+// touchAndWrite (atomic write + optimistic-concurrency guard) as every other
+// mutation, plus an EXPLICIT hash guard checked against the hash the caller
+// last loaded (not just the read-to-write window assertUnchangedOnDisk covers)
+// so a client editing a stale copy is refused rather than clobbering a
+// concurrent edit.
+// ---------------------------------------------------------------------------
+
+/** Thrown when `expectedHash` is given and doesn't match the file as it
+ *  stands right now — the client loaded a copy that's since changed. */
+function assertExpectedHash(tf: TaskFile, expectedHash: string | undefined): void {
+  if (expectedHash === undefined) return;
+  if (expectedHash !== tf.contentHash) {
+    throw new ConflictError(`${tf.id}: changed on disk since it was loaded — reload and retry`);
+  }
+}
+
+export interface SetTaskBodyOptions {
+  /** Hash the caller last loaded (from the /api/task response); a mismatch
+   *  means the file changed underneath them, so this throws ConflictError
+   *  rather than clobbering the concurrent edit. */
+  expectedHash?: string;
+  now?: Date;
+}
+
+/**
+ * Replace a task's ENTIRE body, leaving frontmatter FIELDS untouched (only
+ * the body changes) apart from the `updated:` timestamp that every
+ * touchAndWrite call bumps — this is not a literal byte-for-byte write of
+ * the frontmatter block. Faithful otherwise: writes exactly the body it's
+ * given — the caller (the dashboard's plain-textarea editor) is responsible
+ * for seeding the textarea with the full current body so a user's edit never
+ * silently drops `## Final Summary` / `## Log` content.
+ */
+export function setTaskBody(
+  projectRoot: string,
+  ref: string,
+  newBody: string,
+  options: SetTaskBodyOptions = {},
+): Task {
+  const tf = getTaskFile(projectRoot, ref);
+  assertExpectedHash(tf, options.expectedHash);
+  const now = options.now ?? new Date();
+  setBody(tf.rec, newBody);
+  return touchAndWrite(tf, {}, now);
+}
+
+/** One `- [ ]` / `- [x]` (or `*`) checklist line found in a task's body. */
+interface ChecklistItem {
+  /** Offset of the single bracket-content char (` ` or `x`/`X`) to flip. */
+  markerOffset: number;
+  checked: boolean;
+  /** Trimmed line text after the checkbox marker — the `text` match key. */
+  text: string;
+}
+
+/** Matches ANY markdown checkbox list line (Acceptance Criteria is the only
+ *  section the template puts these under, but the scan isn't section-scoped
+ *  — it flips whichever single line the caller identifies). */
+const CHECKLIST_ITEM_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][ \t]*)(.*)$/gm;
+
+function findChecklistItems(body: string): ChecklistItem[] {
+  const out: ChecklistItem[] = [];
+  for (const m of body.matchAll(CHECKLIST_ITEM_RE)) {
+    const prefix = m[1] ?? "";
+    const marker = m[2] ?? " ";
+    const rest = m[4] ?? "";
+    const markerOffset = (m.index ?? 0) + prefix.length;
+    out.push({ markerOffset, checked: marker.toLowerCase() === "x", text: rest.trim() });
+  }
+  return out;
+}
+
+export interface ToggleChecklistItemOptions {
+  /** Match by 0-based occurrence order among checklist lines in the body. */
+  index?: number;
+  /** Match by the (trimmed) text after the checkbox marker — first hit wins. */
+  text?: string;
+  checked: boolean;
+  expectedHash?: string;
+  now?: Date;
+}
+
+/**
+ * Flip exactly one `- [ ]` <-> `- [x]` line in the body (surgical: only the
+ * one marker character changes, every other byte of the body is untouched).
+ * Identify the line by `index` (occurrence order) or `text` (trimmed line
+ * content); exactly one of the two should be given. If a caller ever passes
+ * BOTH, `index` wins and `text` is ignored — the dashboard client only ever
+ * sends `index`, so this hasn't mattered in practice, but it's explicit here
+ * in case `text`-keyed toggles are exposed to another caller later.
+ */
+export function toggleChecklistItem(
+  projectRoot: string,
+  ref: string,
+  options: ToggleChecklistItemOptions,
+): Task {
+  if (options.index === undefined && options.text === undefined) {
+    throw new ConfigError("toggleChecklistItem requires index or text");
+  }
+  const tf = getTaskFile(projectRoot, ref);
+  assertExpectedHash(tf, options.expectedHash);
+  const items = findChecklistItems(tf.rec.body);
+  // index takes precedence over text when both are given — see docstring.
+  const target =
+    options.index !== undefined ? items[options.index] : items.find((it) => it.text === options.text);
+  if (target === undefined) {
+    throw new NotFoundError(`${tf.id}: no matching checklist item`);
+  }
+  const now = options.now ?? new Date();
+  const body = tf.rec.body;
+  const marker = options.checked ? "x" : " ";
+  const newBody = body.slice(0, target.markerOffset) + marker + body.slice(target.markerOffset + 1);
+  setBody(tf.rec, newBody);
+  return touchAndWrite(tf, {}, now);
+}
+
 /**
  * Move a task to `tasks/archive/` (retention, committed). The whole live
  * subtree moves with it — archiving a parent must not strand dotted-ID

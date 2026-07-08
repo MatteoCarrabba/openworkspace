@@ -18,6 +18,7 @@ import {
   TaskDetailResult,
   buildAllowedHosts,
   hostAllowed,
+  revealProject,
   scanAutomations,
   scanWorkspace,
   startDashboard,
@@ -115,7 +116,11 @@ function startFixtureDashboard(tmp: TmpWorkspace): Promise<RunningDashboard> {
  * on an out-of-band filesystem edit landing in the model poll instead of
  * asserting immediately, to stay robust to that (small, real) latency.
  */
-async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 2000, intervalMs = 20): Promise<void> {
+// Default ceiling is generous because fs.watch (FSEvents) reconcile latency can
+// exceed a couple seconds under full-suite CPU load; waitFor returns as soon as
+// the condition holds, so a high ceiling never slows a passing run. No caller
+// relies on a short timeout to assert absence (that path uses a fixed setTimeout).
+async function waitFor(check: () => Promise<boolean> | boolean, timeoutMs = 10000, intervalMs = 20): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     if (await check()) return;
@@ -599,11 +604,14 @@ test("warm model: an out-of-band file edit is reconciled by the fs.watch path", 
   // Hand-edit the file directly — no mutation API involved.
   writeTask(alpha, "task-2 - review me.md", "id: task-2\ntitle: Review me\nstatus: doing");
 
+  // Generous timeout: fs.watch (FSEvents) latency + the model's debounce can
+  // exceed the 2s default under full-suite CPU load. Returns as soon as the
+  // reconcile lands (~200ms in the common case), so this doesn't slow the run.
   await waitFor(async () => {
     const scan = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
     const t2 = scan.projects.find((p) => p.uid === "uid-alpha")!.tasks.find((x) => x.id === "task-2");
     return t2?.status === "doing";
-  });
+  }, 10000);
 });
 
 test("warm model: self-echo suppression — a write-through doesn't re-trigger on its own fs.watch event", async (t) => {
@@ -629,6 +637,116 @@ test("warm model: self-echo suppression — a write-through doesn't re-trigger o
   assert.equal(readTaskFile(alpha, "task-1 -"), bodyAfterFirst);
   const afterWait = JSON.parse((await get(running.port, "/api/scan")).body) as ScanResult;
   assert.deepEqual(afterWait, afterFirst);
+});
+
+// ---------------------------------------------------------------------------
+// SSE live-updates (Batch 3) — /events exposes the warm model's write-through
+// and fs.watch-reconcile signals so a client can refresh without polling.
+
+/** Open a raw /events subscription and collect every chunk it sends. Returns
+ *  once the response has started (headers received) so callers can then wait
+ *  for the leading ": connected" comment before triggering the change under
+ *  test — otherwise there's a race between "subscribe" and "mutate". */
+function subscribeEvents(port: number): { chunks: string[]; req: http.ClientRequest; response: Promise<void> } {
+  const chunks: string[] = [];
+  const req = http.request({
+    host: "127.0.0.1",
+    port,
+    path: "/events",
+    method: "GET",
+    headers: { host: `127.0.0.1:${port}` },
+    setHost: false,
+  });
+  const response = new Promise<void>((resolve, reject) => {
+    req.on("response", (res) => {
+      assert.equal(res.statusCode, 200);
+      assert.match(String(res.headers["content-type"]), /text\/event-stream/);
+      res.setEncoding("utf8");
+      res.on("data", (chunk: string) => chunks.push(chunk));
+      resolve();
+    });
+    req.on("error", reject);
+  });
+  req.end();
+  return { chunks, req, response };
+}
+
+function parseChangedEvents(chunks: string[]): Array<{ type: string; project?: string; task?: string | null }> {
+  const raw = chunks.join("");
+  const events: Array<{ type: string; project?: string; task?: string | null }> = [];
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    events.push(JSON.parse(line.slice("data: ".length)));
+  }
+  return events;
+}
+
+test("SSE: /events pushes a change event when a mutation writes through", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const sub = subscribeEvents(running.port);
+  t.after(() => sub.req.destroy());
+  await sub.response;
+  await waitFor(() => sub.chunks.join("").includes(": connected"));
+
+  const post1 = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-1.2", status: "todo" });
+  assert.equal(post1.status, 200);
+
+  await waitFor(() => parseChangedEvents(sub.chunks).some((e) => e.type === "changed" && e.task === "task-1.2"));
+  const changed = parseChangedEvents(sub.chunks).find((e) => e.task === "task-1.2")!;
+  assert.equal(changed.project, "uid-alpha");
+});
+
+test("SSE: /events pushes a change event for an out-of-band fs.watch reconcile", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const sub = subscribeEvents(running.port);
+  t.after(() => sub.req.destroy());
+  await sub.response;
+  await waitFor(() => sub.chunks.join("").includes(": connected"));
+
+  // Hand-edit the file directly — no mutation API, no write-through call.
+  writeTask(alpha, "task-2 - review me.md", "id: task-2\ntitle: Review me\nstatus: doing");
+
+  await waitFor(() => parseChangedEvents(sub.chunks).some((e) => e.type === "changed" && e.task === "task-2"));
+});
+
+test("SSE: a second /events subscriber does not interfere with the first", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const subA = subscribeEvents(running.port);
+  t.after(() => subA.req.destroy());
+  const subB = subscribeEvents(running.port);
+  t.after(() => subB.req.destroy());
+  await Promise.all([subA.response, subB.response]);
+  await waitFor(() => subA.chunks.join("").includes(": connected"));
+  await waitFor(() => subB.chunks.join("").includes(": connected"));
+
+  const post1 = await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "note" });
+  assert.equal(post1.status, 200);
+
+  await waitFor(() => parseChangedEvents(subA.chunks).some((e) => e.task === "task-1"));
+  await waitFor(() => parseChangedEvents(subB.chunks).some((e) => e.task === "task-1"));
+});
+
+test("SSE: a bad Host header is rejected the same as every other read route", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const res = await get(running.port, "/events", { host: "evil.example.com" });
+  assert.equal(res.status, 403);
 });
 
 // ---------------------------------------------------------------------------
@@ -1189,6 +1307,125 @@ test("write: note appends to the ## Log section", async (t) => {
   assert.match(file, /a dashboard note \(dashboard\)/);
 });
 
+// ---------------------------------------------------------------------------
+// /api/task/body + /api/task/checkbox (DECISION-9: narrow body editor +
+// interactive Acceptance-Criteria checkboxes).
+
+test("write: /api/task exposes a content hash the client can round-trip as expectedHash", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  assert.equal(typeof detail.task.hash, "string");
+  assert.ok(detail.task.hash.length > 0);
+});
+
+test("write: body edit rewrites the file, preserving frontmatter (quadrant survives)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  const newBody = "## Description\n\nRewritten from the dashboard editor.\n";
+  const res = await post(running.port, "/api/task/body", {
+    project: "uid-alpha",
+    task: "task-1",
+    body: newBody,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 200);
+  const updated = JSON.parse(res.body) as TaskDetailResult;
+  assert.equal(updated.task.body, newBody);
+  const file = readTaskFile(alpha, "task-1 -");
+  assert.match(file, /quadrant: q2/, "frontmatter survives the body rewrite");
+  assert.ok(file.endsWith(newBody), "the new body lands on disk verbatim");
+});
+
+test("write: body edit with a stale expectedHash is refused with 409, file not clobbered", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  const staleHash = detail.task.hash;
+
+  // Someone else (another mutation) touches the file after the client loaded it.
+  await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "concurrent edit" });
+  const onDiskBefore = readTaskFile(alpha, "task-1 -");
+
+  const res = await post(running.port, "/api/task/body", {
+    project: "uid-alpha",
+    task: "task-1",
+    body: "## Description\n\nclobber attempt\n",
+    expectedHash: staleHash,
+  });
+  assert.equal(res.status, 409);
+  assert.match(JSON.parse(res.body).error, /changed on disk|changed underneath/);
+  assert.equal(readTaskFile(alpha, "task-1 -"), onDiskBefore, "the stale write never landed");
+});
+
+test("write: checkbox toggle flips exactly one line, keyed by the fresh hash", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  writeTask(
+    path.join(tmp.root, "Alpha Project"),
+    "task-5 - checklist.md",
+    "id: task-5\ntitle: Checklist task\nstatus: todo",
+    "## Acceptance Criteria\n\n- [ ] first\n- [ ] second\n\n## Notes\n\nkeep this\n",
+  );
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-5")).body) as TaskDetailResult;
+  const res = await post(running.port, "/api/task/checkbox", {
+    project: "uid-alpha",
+    task: "task-5",
+    index: 1,
+    checked: true,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 200);
+  const file = readTaskFile(alpha, "task-5 -");
+  assert.match(file, /- \[ \] first/);
+  assert.match(file, /- \[x\] second/);
+  assert.match(file, /keep this/, "prose outside the checklist is untouched");
+});
+
+test("write: checkbox toggle with a stale expectedHash is refused with 409", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  writeTask(
+    path.join(tmp.root, "Alpha Project"),
+    "task-5 - checklist.md",
+    "id: task-5\ntitle: Checklist task\nstatus: todo",
+    "## Acceptance Criteria\n\n- [ ] only item\n",
+  );
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-5")).body) as TaskDetailResult;
+  await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-5", text: "concurrent edit" });
+  const onDiskBefore = readTaskFile(alpha, "task-5 -");
+
+  const res = await post(running.port, "/api/task/checkbox", {
+    project: "uid-alpha",
+    task: "task-5",
+    index: 0,
+    checked: true,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 409);
+  assert.equal(readTaskFile(alpha, "task-5 -"), onDiskBefore, "the stale toggle never landed");
+});
+
 test("write: invalid status value is a 400", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());
@@ -1252,4 +1489,181 @@ test("write: unknown project is a 404", async (t) => {
   t.after(() => running.close());
   const res = await post(running.port, "/api/task/note", { project: "uid-nope", task: "task-1", text: "x" });
   assert.equal(res.status, 404);
+});
+
+// ---------------------------------------------------------------------------
+// Reveal in Finder / Obsidian: uid -> path resolution, obsidian detection, and
+// the loopback gate. The opener is always stubbed — these tests never launch
+// Finder or Obsidian for real.
+
+test("scan: hasObsidianVault reflects the presence of <root>/.obsidian", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    fs.mkdirSync(path.join(tmp.root, "Alpha Project", ".obsidian"));
+    const scan = scanWorkspace(openWorkspace(tmp.root), NOW);
+    const byUid = new Map(scan.projects.map((p) => [p.uid, p]));
+    assert.equal(byUid.get("uid-alpha")?.hasObsidianVault, true);
+    assert.equal(byUid.get("uid-beta")?.hasObsidianVault, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: uid resolves to the project root and invokes the opener with it (finder)", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    const calls: (readonly string[])[] = [];
+    const result = revealProject(tmp.root, "uid-alpha", "finder", (args) => calls.push(args));
+    assert.equal(result.status, 200);
+    assert.deepEqual(result.body, { ok: true });
+    assert.deepEqual(calls, [[path.join(tmp.root, "Alpha Project")]]);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: unknown uid is a 404, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-nope", "finder", () => {
+      called = true;
+    });
+    assert.equal(result.status, 404);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: obsidian target without a vault is a 422, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "obsidian", () => {
+      called = true;
+    });
+    assert.equal(result.status, 422);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: obsidian target with a vault percent-encodes the root into an obsidian:// URI", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    const alpha = path.join(tmp.root, "Alpha Project");
+    fs.mkdirSync(path.join(alpha, ".obsidian"));
+    const calls: (readonly string[])[] = [];
+    const result = revealProject(tmp.root, "uid-alpha", "obsidian", (args) => calls.push(args));
+    assert.equal(result.status, 200);
+    assert.deepEqual(calls, [[`obsidian://open?path=${encodeURIComponent(alpha)}`]]);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: invalid target is a 400, opener never invoked", () => {
+  const tmp = buildFixtureWorkspace();
+  try {
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "bogus", () => {
+      called = true;
+    });
+    assert.equal(result.status, 400);
+    assert.equal(called, false);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test("reveal: non-macOS is a hard 501, never spawns", () => {
+  const tmp = buildFixtureWorkspace();
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  try {
+    Object.defineProperty(process, "platform", { value: "linux", configurable: true });
+    let called = false;
+    const result = revealProject(tmp.root, "uid-alpha", "finder", () => {
+      called = true;
+    });
+    assert.equal(result.status, 501);
+    assert.equal(called, false);
+  } finally {
+    Object.defineProperty(process, "platform", original);
+    tmp.cleanup();
+  }
+});
+
+test("reveal: HTTP endpoint resolves uid, calls the injected opener, and returns 200", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-alpha", target: "finder" });
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.body), { ok: true });
+  assert.deepEqual(calls, [[path.join(tmp.root, "Alpha Project")]]);
+});
+
+test("reveal: HTTP endpoint 404s on an unknown project uid", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-nope", target: "finder" });
+  assert.equal(res.status, 404);
+  assert.equal(calls.length, 0);
+});
+
+test("reveal: HTTP endpoint is loopback-gated exactly like task mutations", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    allowedHosts: ["ws.tailnet.ts.net"],
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  // A tailnet Host reaches reads, but the reveal write is refused.
+  const write = await post(
+    running.port,
+    "/api/project/reveal",
+    { project: "uid-alpha", target: "finder" },
+    { host: "ws.tailnet.ts.net" },
+  );
+  assert.equal(write.status, 403);
+  assert.equal(calls.length, 0);
+});
+
+test("reveal: readOnly:true hard-disables the reveal endpoint too (405)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const calls: (readonly string[])[] = [];
+  const running = await startDashboard({
+    workspaceRoot: tmp.root,
+    now: () => NOW,
+    readOnly: true,
+    processOpener: (args) => calls.push(args),
+  });
+  t.after(() => running.close());
+
+  const res = await post(running.port, "/api/project/reveal", { project: "uid-alpha", target: "finder" });
+  assert.equal(res.status, 405);
+  assert.equal(calls.length, 0);
 });

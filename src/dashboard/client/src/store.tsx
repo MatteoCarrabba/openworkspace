@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { fetchAutomations, fetchScan, fetchTaskDetail, postMutation } from "./api";
 import { parseUrlState, serializeUrlState } from "./urlState";
 import type { AutomationsScanResult, MutationResult, ScanProject, ScanResult, ScanTask, ViewState } from "./types";
@@ -13,6 +13,40 @@ function loadCollapsed(): Set<string> {
   }
 }
 
+// Resizable outer columns (rail | list | detail — see #layout in global.css).
+// Widths are persisted the same way collapsedProjects is: a small localStorage
+// blob, read once at startup and rewritten on every drag.
+const PANE_WIDTHS_KEY = "ow-pane-widths";
+export type PaneName = "rail" | "detail";
+export interface PaneWidths {
+  rail: number;
+  detail: number;
+}
+const DEFAULT_PANE_WIDTHS: PaneWidths = { rail: 220, detail: 390 };
+const PANE_LIMITS: Record<PaneName, { min: number; max: number }> = {
+  rail: { min: 160, max: 480 },
+  detail: { min: 280, max: 640 },
+};
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, n));
+}
+
+function loadPaneWidths(): PaneWidths {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PANE_WIDTHS_KEY) || "null");
+    if (parsed && typeof parsed.rail === "number" && typeof parsed.detail === "number") {
+      return {
+        rail: clamp(parsed.rail, PANE_LIMITS.rail.min, PANE_LIMITS.rail.max),
+        detail: clamp(parsed.detail, PANE_LIMITS.detail.min, PANE_LIMITS.detail.max),
+      };
+    }
+  } catch {
+    // fall through to defaults
+  }
+  return { ...DEFAULT_PANE_WIDTHS };
+}
+
 interface Store {
   scan: ScanResult | null;
   scanError: string | null;
@@ -21,10 +55,12 @@ interface Store {
   autosLoaded: boolean;
   view: ViewState;
   collapsedProjects: Set<string>;
+  paneWidths: PaneWidths;
   setView: (patch: Partial<ViewState>) => void;
   refresh: () => Promise<void>;
   ensureAutos: () => Promise<void>;
   toggleProjectCollapsed: (uid: string) => void;
+  setPaneWidth: (pane: PaneName, px: number) => void;
   loadTaskDetail: (projectUid: string, taskId: string) => Promise<void>;
   mutateTask: (
     path: string,
@@ -50,6 +86,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
   const [autosLoaded, setAutosLoaded] = useState(false);
   const [view, setViewState] = useState<ViewState>(() => parseUrlState(location.search));
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => loadCollapsed());
+  const [paneWidths, setPaneWidths] = useState<PaneWidths>(() => loadPaneWidths());
   const detailInflight = useRef(new Map<string, Promise<void>>());
 
   const findTask = useCallback(
@@ -107,6 +144,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       if (next.has(uid)) next.delete(uid);
       else next.add(uid);
       localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }, []);
+
+  const setPaneWidth = useCallback((pane: PaneName, px: number) => {
+    setPaneWidths((prev) => {
+      const { min, max } = PANE_LIMITS[pane];
+      const next = { ...prev, [pane]: clamp(px, min, max) };
+      localStorage.setItem(PANE_WIDTHS_KEY, JSON.stringify(next));
       return next;
     });
   }, []);
@@ -181,6 +227,67 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
     [findTask, patchTask, refresh],
   );
 
+  // Live updates (Batch 3): subscribe to the server's /events SSE stream and
+  // debounce a burst of change events into a single refresh, so a mutation
+  // made anywhere (an agent, an automation, the CLI, a hand-edit in Obsidian)
+  // shows up here without the user reaching for the manual Refresh button.
+  // The manual button stays as the fallback path — this is additive.
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
+  useEffect(() => {
+    // No EventSource (very old browser, or a non-browser test harness): the
+    // manual Refresh button still works, just without the push.
+    if (typeof EventSource === "undefined") return;
+
+    const EVENT_DEBOUNCE_MS = 250;
+    const RECONNECT_BASE_MS = 1000;
+    const RECONNECT_MAX_MS = 30_000;
+
+    let closed = false;
+    let source: EventSource | null = null;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectDelay = RECONNECT_BASE_MS;
+
+    const scheduleRefresh = (): void => {
+      if (debounceTimer !== null) return; // a refresh is already pending — coalesces a burst into one
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        void refreshRef.current();
+      }, EVENT_DEBOUNCE_MS);
+    };
+
+    const connect = (): void => {
+      if (closed) return;
+      const es = new EventSource("/events");
+      source = es;
+      es.onopen = () => {
+        reconnectDelay = RECONNECT_BASE_MS; // a real connection succeeded — reset backoff
+      };
+      es.onmessage = () => scheduleRefresh();
+      es.onerror = () => {
+        es.close();
+        if (source === es) source = null;
+        if (closed) return;
+        // The browser's own EventSource auto-retry doesn't back off; do that
+        // ourselves so a server that's down for a while isn't hammered.
+        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+      };
+    };
+    connect();
+
+    return () => {
+      closed = true;
+      if (debounceTimer !== null) clearTimeout(debounceTimer);
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      source?.close();
+    };
+  }, []);
+
   const value = useMemo<Store>(
     () => ({
       scan,
@@ -190,10 +297,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       autosLoaded,
       view,
       collapsedProjects,
+      paneWidths,
       setView,
       refresh,
       ensureAutos,
       toggleProjectCollapsed,
+      setPaneWidth,
       loadTaskDetail,
       mutateTask,
       findTask,
@@ -206,10 +315,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       autosLoaded,
       view,
       collapsedProjects,
+      paneWidths,
       setView,
       refresh,
       ensureAutos,
       toggleProjectCollapsed,
+      setPaneWidth,
       loadTaskDetail,
       mutateTask,
       findTask,

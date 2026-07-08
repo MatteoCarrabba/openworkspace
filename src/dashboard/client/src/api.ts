@@ -49,4 +49,30 @@ export async function postMutation(
   }
 }
 
+/**
+ * POST /api/project/reveal — open a local project's root in Finder or its
+ * Obsidian vault. Never throws; callers branch on `.ok` and surface `.error`
+ * quietly (this is a convenience control, not a critical action).
+ */
+export async function revealProject(
+  projectUid: string,
+  target: "finder" | "obsidian",
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    const res = await fetch("/api/project/reveal", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ project: projectUid, target }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const error = (data && typeof data === "object" && "error" in data ? String((data as { error: unknown }).error) : null) ?? "HTTP " + res.status;
+      return { ok: false, error };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export type { MutationResult };
