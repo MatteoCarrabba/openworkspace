@@ -54,7 +54,8 @@ facts.
 
 ## What this repo has actually built so far (see README "Status")
 
-This worktree/branch carries **Phase 1** of decision-7 plus decision-8:
+This branch carries **Phases 1–3** of decision-7 plus decision-8 (all merged
+together 2026-07-08):
 
 - **Phase 1a** — optimistic concurrency in `touchAndWrite` (the write-race
   guard: non-negotiable #2, item 2 above).
@@ -64,13 +65,25 @@ This worktree/branch carries **Phase 1** of decision-7 plus decision-8:
   `/api/automations` is untouched (still the original `ScanCache<T>`).
 - **decision-8** — the dashboard client rebuilt as React + Vite, built to a
   single self-contained HTML file.
+- **Phase 2** — workspace root externalized to `~/.config/openworkspace/
+  locations.toml` (`[[stores]]`, `driver = "localfs"`), with a forgiving
+  loader (`OPENWORKSPACE_CONFIG_DIR` override), backward-compatible walk-up
+  fallback when no config exists, and `projects locations list` / `reindex`
+  verbs. No data is moved; this only externalizes the root pointer (the
+  identity/location/discovery split) so the tool can later live outside the
+  tree.
+- **Phase 3** — compute-plane cleanup: `runs_on` as the forward name for the
+  executor set (`machines` kept as a backward-compatible alias; declaring
+  both is accepted only when they agree, else `runs-on-machines-conflict`),
+  `on_dormant_project` read against the project's metadata-primary effective
+  lifecycle (closing the last spot folder-location was still the primary
+  lifecycle signal), and the vestigial peer-coordination machinery
+  **cataloged** for hub-phase removal (`_project/wiki/compute-plane-
+  vestigial-catalog.md`) rather than deleted, since live laptop automations
+  still depend on it.
 
-**Phases 2 (`locations.toml` externalization) and 3 (compute-plane
-cleanup — `runs_on`, dropping the peer-coordination machinery) were built in
-sibling worktrees/branches this same session and are not present on this
-branch.** Do not assume `locations.toml` or `runs_on` exist here until those
-branches land. Phase 4 (the hub) is explicitly deferred, gated on token
-rotation (Personal OS task-201/203).
+Phase 4 (the hub) is explicitly deferred, gated on token rotation
+(Personal OS task-201).
 
 ## Open question (deferred, not resolved by any phase so far)
 
