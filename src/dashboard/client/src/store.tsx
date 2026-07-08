@@ -1,4 +1,4 @@
-import React, { createContext, useCallback, useContext, useMemo, useRef, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { fetchAutomations, fetchScan, fetchTaskDetail, postMutation } from "./api";
 import { parseUrlState, serializeUrlState } from "./urlState";
 import type { AutomationsScanResult, MutationResult, ScanProject, ScanResult, ScanTask, ViewState } from "./types";
@@ -226,6 +226,67 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
     },
     [findTask, patchTask, refresh],
   );
+
+  // Live updates (Batch 3): subscribe to the server's /events SSE stream and
+  // debounce a burst of change events into a single refresh, so a mutation
+  // made anywhere (an agent, an automation, the CLI, a hand-edit in Obsidian)
+  // shows up here without the user reaching for the manual Refresh button.
+  // The manual button stays as the fallback path — this is additive.
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
+  useEffect(() => {
+    // No EventSource (very old browser, or a non-browser test harness): the
+    // manual Refresh button still works, just without the push.
+    if (typeof EventSource === "undefined") return;
+
+    const EVENT_DEBOUNCE_MS = 250;
+    const RECONNECT_BASE_MS = 1000;
+    const RECONNECT_MAX_MS = 30_000;
+
+    let closed = false;
+    let source: EventSource | null = null;
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let reconnectDelay = RECONNECT_BASE_MS;
+
+    const scheduleRefresh = (): void => {
+      if (debounceTimer !== null) return; // a refresh is already pending — coalesces a burst into one
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        void refreshRef.current();
+      }, EVENT_DEBOUNCE_MS);
+    };
+
+    const connect = (): void => {
+      if (closed) return;
+      const es = new EventSource("/events");
+      source = es;
+      es.onopen = () => {
+        reconnectDelay = RECONNECT_BASE_MS; // a real connection succeeded — reset backoff
+      };
+      es.onmessage = () => scheduleRefresh();
+      es.onerror = () => {
+        es.close();
+        if (source === es) source = null;
+        if (closed) return;
+        // The browser's own EventSource auto-retry doesn't back off; do that
+        // ourselves so a server that's down for a while isn't hammered.
+        reconnectTimer = setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
+      };
+    };
+    connect();
+
+    return () => {
+      closed = true;
+      if (debounceTimer !== null) clearTimeout(debounceTimer);
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
+      source?.close();
+    };
+  }, []);
 
   const value = useMemo<Store>(
     () => ({

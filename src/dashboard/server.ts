@@ -34,6 +34,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as http from "node:http";
 import * as path from "node:path";
@@ -1145,6 +1146,15 @@ function isOwnTempFile(fileName: string): boolean {
   return /^\..*\.ow-tmp-\d+-[0-9a-f]{8}$/.test(fileName);
 }
 
+/** One change to the warm model, as pushed to /events subscribers. `task` is
+ *  null when a reconcile couldn't resolve which task id was affected (e.g. a
+ *  file deleted before its id could be recovered) — clients should treat that
+ *  as "something in this project changed" and just refresh. */
+export interface ModelChangeEvent {
+  project: string; // project uid
+  task: string | null; // task id, when known
+}
+
 export class WarmModel {
   private readonly ws: Workspace;
   private readonly nowFn: () => Date;
@@ -1155,13 +1165,30 @@ export class WarmModel {
   private debounceTimers = new Map<string, NodeJS.Timeout>(); // uid -> debounce timer
   private periodicHandle: NodeJS.Timeout | null = null;
   private closed = false;
+  // Batch 3 (SSE): a change fires from write-through OR a watch-reconciled
+  // file — never from the periodic self-heal rebuild (that's a backstop, not
+  // a signal a client should react to). No listener cap: connections are
+  // capped where they're accepted (the /events route), not here.
+  private readonly emitter = new EventEmitter();
 
   constructor(ws: Workspace, nowFn: () => Date, options: { watch?: boolean } = {}) {
     this.ws = ws;
     this.nowFn = nowFn;
+    this.emitter.setMaxListeners(0);
     this.rebuildFull();
     if (options.watch !== false) this.startWatching();
     this.startPeriodicReconcile();
+  }
+
+  /** Subscribe to change events (write-through or fs.watch reconcile). Returns
+   *  an unsubscribe function. Used by the /events SSE route. */
+  onChange(listener: (event: ModelChangeEvent) => void): () => void {
+    this.emitter.on("change", listener);
+    return () => this.emitter.off("change", listener);
+  }
+
+  private emitChange(projectUid: string, taskId: string | null): void {
+    this.emitter.emit("change", { project: projectUid, task: taskId } satisfies ModelChangeEvent);
   }
 
   private rebuildFull(): void {
@@ -1213,6 +1240,7 @@ export class WarmModel {
     const known = mp.idToFile.get(taskId);
     if (known !== undefined) {
       reconcileModelFile(mp, known, now);
+      this.emitChange(projectUid, taskId);
       return;
     }
     // Unknown task id (shouldn't happen for an existing-task mutation, but a
@@ -1222,6 +1250,7 @@ export class WarmModel {
     const rebuilt = buildModelProject(mp.info, now);
     this.projects = this.projects.map((p) => (p.info.uid === projectUid ? rebuilt : p));
     this.byUid.set(projectUid, rebuilt);
+    this.emitChange(projectUid, taskId);
   }
 
   private startWatching(): void {
@@ -1279,7 +1308,14 @@ export class WarmModel {
     if (mp === undefined) return;
     const now = this.nowFn();
     for (const fileName of pending) {
-      reconcileModelFile(mp, fileName, now);
+      const prior = mp.files.get(fileName);
+      const changed = reconcileModelFile(mp, fileName, now);
+      if (!changed) continue; // self-echo or a duplicate event — nothing to tell subscribers
+      const current = mp.files.get(fileName);
+      // Prefer the post-reconcile id; fall back to the pre-reconcile id for a
+      // delete (current is gone by then) so subscribers still learn WHICH
+      // task's file changed rather than getting a bare project-only event.
+      this.emitChange(uid, current?.task.id ?? prior?.task.id ?? null);
     }
   }
 
@@ -1314,6 +1350,7 @@ export class WarmModel {
       clearInterval(this.periodicHandle);
       this.periodicHandle = null;
     }
+    this.emitter.removeAllListeners();
   }
 }
 
@@ -1827,6 +1864,14 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     ttlMs,
   );
 
+  // Batch 3: SSE live-updates. Read-only (same Host-header gate as every GET
+  // below) — it exposes the warm model's already-current state, it doesn't
+  // add any new write surface. Bounded connection count so a runaway client
+  // (or a misbehaving proxy) can't exhaust file descriptors.
+  const MAX_SSE_CLIENTS = 64;
+  const SSE_KEEPALIVE_MS = 20_000;
+  const sseClients = new Set<http.ServerResponse>();
+
   const server = http.createServer((req, res) => {
     if (!hostAllowed(req.headers.host, allowed)) {
       sendJson(res, 403, { error: "forbidden: host header not allowed" });
@@ -1904,6 +1949,60 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
       return;
     }
 
+    if (pathname === "/events") {
+      if (req.method === "HEAD") {
+        res.writeHead(200, { "content-type": "text/event-stream; charset=utf-8" });
+        res.end();
+        return;
+      }
+      if (sseClients.size >= MAX_SSE_CLIENTS) {
+        sendJson(res, 503, { error: "too many /events connections" });
+        return;
+      }
+      res.writeHead(200, {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "no-store",
+        // "close", not "keep-alive": this socket carries exactly one long-lived
+        // streaming response and is never reused for a second request. Framed
+        // this way, `res.end()` at shutdown tears the socket down immediately
+        // instead of leaving it idle-but-open for the keep-alive timeout,
+        // which is what lets `server.close()` below actually resolve promptly.
+        connection: "close",
+      });
+      res.write(": connected\n\n");
+      sseClients.add(res);
+
+      const unsubscribe = model.onChange((event) => {
+        try {
+          res.write(`data: ${JSON.stringify({ type: "changed", project: event.project, task: event.task })}\n\n`);
+        } catch {
+          // Write raced a half-closed socket; the 'close' listener below cleans up.
+        }
+      });
+
+      const keepalive = setInterval(() => {
+        try {
+          res.write(":\n\n"); // comment line — keeps intermediaries/proxies from timing out the connection
+        } catch {
+          // ditto
+        }
+      }, SSE_KEEPALIVE_MS);
+      keepalive.unref?.();
+
+      let cleaned = false;
+      const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        clearInterval(keepalive);
+        unsubscribe();
+        sseClients.delete(res);
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      res.on("error", cleanup);
+      return;
+    }
+
     if (pathname === "/api/scan") {
       try {
         // Warm model: an in-memory assembly, never a disk walk.
@@ -1952,9 +2051,20 @@ export function createDashboardServer(options: DashboardOptions): http.Server {
     sendJson(res, 404, { error: "not found" });
   });
 
-  // Stop every watcher/timer the model owns once the HTTP server itself is
-  // done — no orphaned handles outliving a closed dashboard.
-  server.once("close", () => model.close());
+  // Stop every watcher/timer the model owns and end every open /events stream
+  // as soon as `close()` is CALLED — not on the 'close' EVENT, which only
+  // fires once every connection has already ended, and an open SSE stream
+  // never ends on its own. Overriding `close` (rather than `once("close", …)`)
+  // means the streams get torn down before Node waits for them, so the
+  // returned close() actually resolves instead of hanging forever on a live
+  // dashboard client.
+  const nativeClose = server.close.bind(server);
+  server.close = ((callback?: (err?: Error) => void) => {
+    model.close();
+    for (const client of sseClients) client.end();
+    sseClients.clear();
+    return nativeClose(callback);
+  }) as typeof server.close;
   return server;
 }
 

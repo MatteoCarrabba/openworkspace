@@ -633,6 +633,116 @@ test("warm model: self-echo suppression — a write-through doesn't re-trigger o
 });
 
 // ---------------------------------------------------------------------------
+// SSE live-updates (Batch 3) — /events exposes the warm model's write-through
+// and fs.watch-reconcile signals so a client can refresh without polling.
+
+/** Open a raw /events subscription and collect every chunk it sends. Returns
+ *  once the response has started (headers received) so callers can then wait
+ *  for the leading ": connected" comment before triggering the change under
+ *  test — otherwise there's a race between "subscribe" and "mutate". */
+function subscribeEvents(port: number): { chunks: string[]; req: http.ClientRequest; response: Promise<void> } {
+  const chunks: string[] = [];
+  const req = http.request({
+    host: "127.0.0.1",
+    port,
+    path: "/events",
+    method: "GET",
+    headers: { host: `127.0.0.1:${port}` },
+    setHost: false,
+  });
+  const response = new Promise<void>((resolve, reject) => {
+    req.on("response", (res) => {
+      assert.equal(res.statusCode, 200);
+      assert.match(String(res.headers["content-type"]), /text\/event-stream/);
+      res.setEncoding("utf8");
+      res.on("data", (chunk: string) => chunks.push(chunk));
+      resolve();
+    });
+    req.on("error", reject);
+  });
+  req.end();
+  return { chunks, req, response };
+}
+
+function parseChangedEvents(chunks: string[]): Array<{ type: string; project?: string; task?: string | null }> {
+  const raw = chunks.join("");
+  const events: Array<{ type: string; project?: string; task?: string | null }> = [];
+  for (const line of raw.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    events.push(JSON.parse(line.slice("data: ".length)));
+  }
+  return events;
+}
+
+test("SSE: /events pushes a change event when a mutation writes through", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const sub = subscribeEvents(running.port);
+  t.after(() => sub.req.destroy());
+  await sub.response;
+  await waitFor(() => sub.chunks.join("").includes(": connected"));
+
+  const post1 = await post(running.port, "/api/task/status", { project: "uid-alpha", task: "task-1.2", status: "todo" });
+  assert.equal(post1.status, 200);
+
+  await waitFor(() => parseChangedEvents(sub.chunks).some((e) => e.type === "changed" && e.task === "task-1.2"));
+  const changed = parseChangedEvents(sub.chunks).find((e) => e.task === "task-1.2")!;
+  assert.equal(changed.project, "uid-alpha");
+});
+
+test("SSE: /events pushes a change event for an out-of-band fs.watch reconcile", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const sub = subscribeEvents(running.port);
+  t.after(() => sub.req.destroy());
+  await sub.response;
+  await waitFor(() => sub.chunks.join("").includes(": connected"));
+
+  // Hand-edit the file directly — no mutation API, no write-through call.
+  writeTask(alpha, "task-2 - review me.md", "id: task-2\ntitle: Review me\nstatus: doing");
+
+  await waitFor(() => parseChangedEvents(sub.chunks).some((e) => e.type === "changed" && e.task === "task-2"));
+});
+
+test("SSE: a second /events subscriber does not interfere with the first", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const subA = subscribeEvents(running.port);
+  t.after(() => subA.req.destroy());
+  const subB = subscribeEvents(running.port);
+  t.after(() => subB.req.destroy());
+  await Promise.all([subA.response, subB.response]);
+  await waitFor(() => subA.chunks.join("").includes(": connected"));
+  await waitFor(() => subB.chunks.join("").includes(": connected"));
+
+  const post1 = await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "note" });
+  assert.equal(post1.status, 200);
+
+  await waitFor(() => parseChangedEvents(subA.chunks).some((e) => e.task === "task-1"));
+  await waitFor(() => parseChangedEvents(subB.chunks).some((e) => e.task === "task-1"));
+});
+
+test("SSE: a bad Host header is rejected the same as every other read route", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const res = await get(running.port, "/events", { host: "evil.example.com" });
+  assert.equal(res.status, 403);
+});
+
+// ---------------------------------------------------------------------------
 // Automations view — synced per-machine registries × declared manifests.
 // Everything against a temp workspace with MOCK machine registries + manifests.
 // Cases exercised: active-here, declared-elsewhere (declared-but-not-activated),
