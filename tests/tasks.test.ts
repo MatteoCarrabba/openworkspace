@@ -8,6 +8,10 @@
 
 import * as assert from "node:assert/strict";
 import * as fs from "node:fs";
+// Default import: the SAME underlying module.exports object as `fs` above —
+// `t.mock.method` needs an object with an own, configurable property to
+// patch, which the frozen `import * as fs` namespace does not offer.
+import fsDefault from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 
@@ -767,4 +771,62 @@ test("regression: archive moves children deepest-first and the parent LAST (re-r
   // unmoved ancestor) LIVE, so `task archive task-1` can simply be re-run;
   // parent-first would strand live orphans whose parent ref no longer scans
   assert.deepEqual(order, ["task-1.1.1", "task-1.1", "task-1"]);
+});
+
+// ---------------------------------------------------------------------------
+// Optimistic concurrency (Phase 1a write-race hole): the CLI and Obsidian are
+// both writers, so every mutating verb must detect — not clobber — a file
+// that changed on disk between its read and its write.
+// ---------------------------------------------------------------------------
+
+test("optimistic concurrency: a normal write still succeeds and refreshes the hash for the next one", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, { title: "Uncontended", now });
+
+  const edited = editField(fx.projectRoot, created.id, "quadrant", "q1", { now });
+  assert.equal(edited.quadrant, "q1");
+
+  // Each verb re-reads the file fresh (getTaskFile), so a chain of ordinary,
+  // non-concurrent writes must keep succeeding — the guard must not misfire
+  // against the tool's own prior write.
+  const noted = addNote(fx.projectRoot, created.id, "second write in the chain", { now });
+  assert.match(noted.body, /second write in the chain/);
+  const hidden = hideTask(fx.projectRoot, created.id, "2026-07-01", { now });
+  assert.equal(hidden.hiddenUntil, "2026-07-01");
+});
+
+test("optimistic concurrency: an out-of-band edit between read and write throws ConflictError and is not clobbered", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, { title: "Contended", now });
+
+  const originalReadFileSync = fs.readFileSync;
+  let matchingReads = 0;
+  t.mock.method(fsDefault, "readFileSync", (...args: Parameters<typeof fs.readFileSync>) => {
+    const isTargetFile = args[0] === created.path;
+    if (isTargetFile) {
+      matchingReads++;
+      // The 1st matching read is inside getTaskFile (captures the base hash);
+      // the 2nd is touchAndWrite's re-read immediately before the atomic
+      // write. Land a concurrent writer's edit right there, between them.
+      if (matchingReads === 2) {
+        const concurrent =
+          originalReadFileSync.call(fs, created.path, "utf8") + "\n<!-- concurrent writer's edit -->\n";
+        fs.writeFileSync(created.path, concurrent);
+      }
+    }
+    return (originalReadFileSync as (...a: unknown[]) => unknown).apply(fs, args);
+  });
+
+  assert.throws(
+    () => editField(fx.projectRoot, created.id, "quadrant", "q2", { now }),
+    (err: unknown) => err instanceof ConflictError && /changed on disk since it was read — retry/.test((err as Error).message),
+  );
+
+  const onDisk = originalReadFileSync.call(fs, created.path, "utf8");
+  assert.ok(onDisk.includes("<!-- concurrent writer's edit -->"), "the concurrent edit survives on disk");
+  assert.ok(!onDisk.includes("quadrant: q2"), "the racing write never landed — no clobber");
 });
