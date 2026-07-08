@@ -155,6 +155,7 @@ export interface ViewState {
   sel: string | null;
   selProject: string | null;
   autoFilter: "all" | "drift";
+  autoQuery: string;
 }
 
 export interface MutationResult {

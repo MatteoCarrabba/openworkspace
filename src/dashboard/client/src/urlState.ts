@@ -18,6 +18,7 @@ export function parseUrlState(search: string): ViewState {
     sel: q.get("task") || null,
     selProject: q.get("project") || null,
     autoFilter: q.get("autofilter") === "drift" ? "drift" : "all",
+    autoQuery: q.get("autoq") || "",
   };
 }
 
@@ -32,6 +33,7 @@ export function serializeUrlState(s: ViewState): string {
   if (s.sel) q.set("task", s.sel);
   if (s.selProject) q.set("project", s.selProject);
   if (s.autoFilter !== "all") q.set("autofilter", s.autoFilter);
+  if (s.autoQuery) q.set("autoq", s.autoQuery);
   const qs = q.toString();
   return qs ? "?" + qs : "";
 }

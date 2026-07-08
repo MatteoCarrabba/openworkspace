@@ -13,6 +13,40 @@ function loadCollapsed(): Set<string> {
   }
 }
 
+// Resizable outer columns (rail | list | detail — see #layout in global.css).
+// Widths are persisted the same way collapsedProjects is: a small localStorage
+// blob, read once at startup and rewritten on every drag.
+const PANE_WIDTHS_KEY = "ow-pane-widths";
+export type PaneName = "rail" | "detail";
+export interface PaneWidths {
+  rail: number;
+  detail: number;
+}
+const DEFAULT_PANE_WIDTHS: PaneWidths = { rail: 220, detail: 390 };
+const PANE_LIMITS: Record<PaneName, { min: number; max: number }> = {
+  rail: { min: 160, max: 480 },
+  detail: { min: 280, max: 640 },
+};
+
+function clamp(n: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, n));
+}
+
+function loadPaneWidths(): PaneWidths {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PANE_WIDTHS_KEY) || "null");
+    if (parsed && typeof parsed.rail === "number" && typeof parsed.detail === "number") {
+      return {
+        rail: clamp(parsed.rail, PANE_LIMITS.rail.min, PANE_LIMITS.rail.max),
+        detail: clamp(parsed.detail, PANE_LIMITS.detail.min, PANE_LIMITS.detail.max),
+      };
+    }
+  } catch {
+    // fall through to defaults
+  }
+  return { ...DEFAULT_PANE_WIDTHS };
+}
+
 interface Store {
   scan: ScanResult | null;
   scanError: string | null;
@@ -21,10 +55,12 @@ interface Store {
   autosLoaded: boolean;
   view: ViewState;
   collapsedProjects: Set<string>;
+  paneWidths: PaneWidths;
   setView: (patch: Partial<ViewState>) => void;
   refresh: () => Promise<void>;
   ensureAutos: () => Promise<void>;
   toggleProjectCollapsed: (uid: string) => void;
+  setPaneWidth: (pane: PaneName, px: number) => void;
   loadTaskDetail: (projectUid: string, taskId: string) => Promise<void>;
   mutateTask: (
     path: string,
@@ -50,6 +86,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
   const [autosLoaded, setAutosLoaded] = useState(false);
   const [view, setViewState] = useState<ViewState>(() => parseUrlState(location.search));
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(() => loadCollapsed());
+  const [paneWidths, setPaneWidths] = useState<PaneWidths>(() => loadPaneWidths());
   const detailInflight = useRef(new Map<string, Promise<void>>());
 
   const findTask = useCallback(
@@ -107,6 +144,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       if (next.has(uid)) next.delete(uid);
       else next.add(uid);
       localStorage.setItem(COLLAPSED_KEY, JSON.stringify([...next]));
+      return next;
+    });
+  }, []);
+
+  const setPaneWidth = useCallback((pane: PaneName, px: number) => {
+    setPaneWidths((prev) => {
+      const { min, max } = PANE_LIMITS[pane];
+      const next = { ...prev, [pane]: clamp(px, min, max) };
+      localStorage.setItem(PANE_WIDTHS_KEY, JSON.stringify(next));
       return next;
     });
   }, []);
@@ -190,10 +236,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       autosLoaded,
       view,
       collapsedProjects,
+      paneWidths,
       setView,
       refresh,
       ensureAutos,
       toggleProjectCollapsed,
+      setPaneWidth,
       loadTaskDetail,
       mutateTask,
       findTask,
@@ -206,10 +254,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }): Reac
       autosLoaded,
       view,
       collapsedProjects,
+      paneWidths,
       setView,
       refresh,
       ensureAutos,
       toggleProjectCollapsed,
+      setPaneWidth,
       loadTaskDetail,
       mutateTask,
       findTask,

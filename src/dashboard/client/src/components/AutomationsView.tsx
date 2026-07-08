@@ -23,7 +23,10 @@ export function AutomationsView(): React.JSX.Element {
   if (!autos) return <div className="empty">Automations scan failed: {autosError}</div>;
 
   const driftN = autos.drift.length;
-  const list = view.autoFilter === "drift" ? autos.automations.filter((a) => a.drift.length) : autos.automations;
+  const q = view.autoQuery.trim().toLowerCase();
+  const list = autos.automations
+    .filter((a) => (view.autoFilter === "drift" ? a.drift.length > 0 : true))
+    .filter((a) => (q ? (a.name + " " + a.project.name + " " + a.project.relPath).toLowerCase().includes(q) : true));
 
   return (
     <>
@@ -47,6 +50,17 @@ export function AutomationsView(): React.JSX.Element {
           })}
         </div>
       )}
+
+      <div className="filter" style={{ margin: "0 0 12px", padding: 0, maxWidth: 320 }}>
+        <label htmlFor="auto-search">Filter</label>
+        <input
+          type="search"
+          id="auto-search"
+          placeholder="Name or project…"
+          value={view.autoQuery}
+          onChange={(e) => setView({ autoQuery: e.target.value })}
+        />
+      </div>
 
       <div className="toggle-row" style={{ margin: "0 0 12px" }}>
         <label>

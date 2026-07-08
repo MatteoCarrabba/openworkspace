@@ -72,6 +72,7 @@ export function Actions({ p, t }: { p: ScanProject; t: ScanTask }): React.JSX.El
   return (
     <div className="actions">
       <h4>Actions</h4>
+      <p className="act-hint">Move status, or complete… (a Final Summary is required to mark done)</p>
       <div className="act-row">
         {TRANSITIONS.map((s) => (
           <button key={s} className="act-status" disabled={busy || t.status === s} onClick={() => void doStatus(s)}>
