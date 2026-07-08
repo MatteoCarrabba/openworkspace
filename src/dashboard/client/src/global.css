@@ -122,6 +122,17 @@ aside .meta-table td:first-child { color: var(--muted); white-space: nowrap; }
 .md pre { background: var(--chip); padding: 8px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
 .md code { background: var(--chip); padding: 0 3px; border-radius: 3px; font-size: 12px; }
 .md ul { padding-left: 20px; margin: 4px 0; }
+.md li { list-style: none; }
+.md .checklist-box { margin: 0 4px 0 -20px; position: relative; top: 1px; cursor: pointer; }
+.body-view-header { display: flex; justify-content: flex-end; margin-bottom: 2px; }
+.body-edit-toggle, .body-editor button { border: 1px solid var(--line); background: var(--panel); border-radius: 5px;
+  padding: 3px 9px; font-size: 12px; cursor: pointer; color: var(--ink); }
+.body-edit-toggle:hover, .body-editor button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.body-editor button:disabled { opacity: .45; cursor: default; }
+.body-editor-textarea { width: 100%; box-sizing: border-box; border: 1px solid var(--line); border-radius: 5px;
+  padding: 8px; font: 12.5px/1.5 ui-monospace, monospace; resize: vertical; background: var(--panel); color: var(--ink); }
+.body-editor-textarea:focus { outline: 2px solid var(--focus-ring); border-color: var(--accent); }
+.body-editor .act-row { margin-top: 6px; }
 .cli { margin-top: 16px; border-top: 1px solid var(--line); padding-top: 10px; }
 .cli h4 { margin: 0 0 6px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
 .cli-row { display: flex; gap: 6px; align-items: center; margin-bottom: 5px; }

@@ -6,12 +6,22 @@ function esc(s: string): string {
  * Tiny escape-first markdown renderer (headings, lists incl. checkboxes,
  * fenced code, inline code/bold/italic/links) — ported verbatim from the
  * vanilla dashboard so task bodies render identically.
+ *
+ * DECISION-9: checkbox list items ("- [ ] …" / "- [x] …") render as REAL
+ * `<input type="checkbox">` elements (no WYSIWYG library) tagged with
+ * `data-checklist-index`, the item's 0-based occurrence order among
+ * checkbox lines in the body — the same order `findChecklistItems` counts
+ * server-side, so the index round-trips to `toggleChecklistItem` cleanly.
+ * The click handler that POSTs the toggle lives in the DetailPane (event
+ * delegation over this raw HTML), not here — this stays a pure string
+ * renderer.
  */
 export function renderMarkdown(src: string): string {
   const lines = src.split(/\r?\n/);
   const out: string[] = [];
   let inCode = false;
   let inList = false;
+  let checklistIndex = 0;
   const closeList = () => {
     if (inList) {
       out.push("</ul>");
@@ -49,8 +59,14 @@ export function renderMarkdown(src: string): string {
         out.push("<ul>");
         inList = true;
       }
-      const box = li[1] ? (/[xX]/.test(li[1]) ? "☑ " : "☐ ") : "";
-      out.push("<li>" + box + inline(li[2] ?? "") + "</li>");
+      if (li[1]) {
+        const checked = /[xX]/.test(li[1]);
+        const idx = checklistIndex++;
+        const box = `<input type="checkbox" class="checklist-box" data-checklist-index="${idx}"${checked ? " checked" : ""}>`;
+        out.push("<li>" + box + " " + inline(li[2] ?? "") + "</li>");
+      } else {
+        out.push("<li>" + inline(li[2] ?? "") + "</li>");
+      }
       continue;
     }
     closeList();
@@ -60,4 +76,22 @@ export function renderMarkdown(src: string): string {
   closeList();
   if (inCode) out.push("</pre>");
   return out.join("\n");
+}
+
+/** Same anchoring as the server's checklist scan: only lines that are ALREADY
+ *  a `- [ ]`/`- [x]` (or `*`) item count, in top-to-bottom occurrence order. */
+const CHECKLIST_LINE_RE = /^([ \t]*[-*][ \t]+\[)([ xX])(\][ \t]*)(.*)$/gm;
+
+/**
+ * Client-side mirror of the server's `toggleChecklistItem`, used ONLY to
+ * compute the optimistic body patch shown immediately on click — the
+ * server's write is still the source of truth once the POST resolves.
+ */
+export function toggleChecklistLineInBody(body: string, index: number, checked: boolean): string {
+  let i = -1;
+  return body.replace(CHECKLIST_LINE_RE, (whole, pre: string, _mark: string, post: string, rest: string) => {
+    i++;
+    if (i !== index) return whole;
+    return pre + (checked ? "x" : " ") + post + rest;
+  });
 }

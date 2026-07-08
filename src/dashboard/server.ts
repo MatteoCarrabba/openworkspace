@@ -40,12 +40,19 @@ import * as http from "node:http";
 import * as path from "node:path";
 
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
-import { ConfigError, NotFoundError, OwError } from "../lib/errors.js";
+import { ConfigError, ConflictError, NotFoundError, OwError } from "../lib/errors.js";
 import { sha256Hex } from "../lib/fsatomic.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
 import { STORE_DIR_ENV, defaultStoreDir } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
-import { TaskStateError, addNote, setFinalSummary, setStatus } from "../primitives/tasks.js";
+import {
+  TaskStateError,
+  addNote,
+  setFinalSummary,
+  setStatus,
+  setTaskBody,
+  toggleChecklistItem,
+} from "../primitives/tasks.js";
 import {
   Lifecycle,
   MARKER_DIR,
@@ -92,6 +99,11 @@ export interface ScanTask {
   depth: number; // 0 = top-level
   body: string; // full in direct scans/detail endpoint; empty in body-light HTTP scans
   rollup: TaskRollup | null; // present only when the task has descendants
+  /** sha256 of the file's raw bytes as last read — the same hash the tasks
+   *  library's optimistic-concurrency guard uses. The client echoes this back
+   *  as `expectedHash` on /api/task/body and /api/task/checkbox so a stale
+   *  edit is refused (409) instead of clobbering a concurrent write. */
+  hash: string;
 }
 
 export interface TaskRollup {
@@ -359,6 +371,9 @@ function readTaskFile(
     depth: parsed ? parsed.parts.length - 1 : 0,
     body: includeBody ? rec.body : "",
     rollup: null,
+    // Same hash shape as the tasks library's TaskFile.contentHash (sha256 of
+    // the exact bytes read) so a client's expectedHash round-trips cleanly.
+    hash: sha256Hex(rec.originalText),
   };
   return { task, parsed, issues };
 }
@@ -1638,6 +1653,8 @@ export const MUTATION_PATHS: ReadonlySet<string> = new Set([
   "/api/task/status",
   "/api/task/done",
   "/api/task/note",
+  "/api/task/body",
+  "/api/task/checkbox",
 ]);
 
 /** The reveal endpoint's path — spawns a process, so it rides the exact same
@@ -1774,6 +1791,7 @@ export function revealProject(
  *  subclass first (TaskStateError/NotFoundError/ConfigError all extend OwError). */
 export function mutationStatus(err: unknown): number {
   if (err instanceof TaskStateError) return 422; // invariant refused (e.g. no Final Summary)
+  if (err instanceof ConflictError) return 409; // stale expectedHash — refused, not clobbered
   if (err instanceof NotFoundError) return 404;
   if (err instanceof ConfigError) return 400;
   if (err instanceof OwError) return 400;
@@ -1820,6 +1838,23 @@ export function applyMutation(
       const text = typeof body["text"] === "string" ? (body["text"] as string) : "";
       const actor = typeof body["actor"] === "string" && body["actor"] !== "" ? (body["actor"] as string) : "dashboard";
       addNote(root, task, text, { now: nowD, actor });
+      break;
+    }
+    case "/api/task/body": {
+      const newBody = typeof body["body"] === "string" ? (body["body"] as string) : "";
+      const expectedHash = typeof body["expectedHash"] === "string" ? (body["expectedHash"] as string) : undefined;
+      setTaskBody(root, task, newBody, { expectedHash, now: nowD });
+      break;
+    }
+    case "/api/task/checkbox": {
+      const expectedHash = typeof body["expectedHash"] === "string" ? (body["expectedHash"] as string) : undefined;
+      const checked = body["checked"] === true;
+      const index = typeof body["index"] === "number" ? (body["index"] as number) : undefined;
+      const text = typeof body["text"] === "string" ? (body["text"] as string) : undefined;
+      if (index === undefined && text === undefined) {
+        throw new ConfigError("missing index or text");
+      }
+      toggleChecklistItem(root, task, { index, text, checked, expectedHash, now: nowD });
       break;
     }
     default:

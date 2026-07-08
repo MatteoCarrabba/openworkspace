@@ -30,6 +30,9 @@ export interface ScanTask {
   depth: number;
   body: string;
   rollup: TaskRollup | null;
+  /** sha256 of the file as last read; echoed back as `expectedHash` on the
+   *  body/checkbox mutation endpoints so a stale edit is refused, not clobbered. */
+  hash: string;
 }
 
 export interface DoctorIssue {

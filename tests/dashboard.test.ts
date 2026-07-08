@@ -1300,6 +1300,125 @@ test("write: note appends to the ## Log section", async (t) => {
   assert.match(file, /a dashboard note \(dashboard\)/);
 });
 
+// ---------------------------------------------------------------------------
+// /api/task/body + /api/task/checkbox (DECISION-9: narrow body editor +
+// interactive Acceptance-Criteria checkboxes).
+
+test("write: /api/task exposes a content hash the client can round-trip as expectedHash", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  assert.equal(typeof detail.task.hash, "string");
+  assert.ok(detail.task.hash.length > 0);
+});
+
+test("write: body edit rewrites the file, preserving frontmatter (quadrant survives)", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  const newBody = "## Description\n\nRewritten from the dashboard editor.\n";
+  const res = await post(running.port, "/api/task/body", {
+    project: "uid-alpha",
+    task: "task-1",
+    body: newBody,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 200);
+  const updated = JSON.parse(res.body) as TaskDetailResult;
+  assert.equal(updated.task.body, newBody);
+  const file = readTaskFile(alpha, "task-1 -");
+  assert.match(file, /quadrant: q2/, "frontmatter survives the body rewrite");
+  assert.ok(file.endsWith(newBody), "the new body lands on disk verbatim");
+});
+
+test("write: body edit with a stale expectedHash is refused with 409, file not clobbered", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-1")).body) as TaskDetailResult;
+  const staleHash = detail.task.hash;
+
+  // Someone else (another mutation) touches the file after the client loaded it.
+  await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-1", text: "concurrent edit" });
+  const onDiskBefore = readTaskFile(alpha, "task-1 -");
+
+  const res = await post(running.port, "/api/task/body", {
+    project: "uid-alpha",
+    task: "task-1",
+    body: "## Description\n\nclobber attempt\n",
+    expectedHash: staleHash,
+  });
+  assert.equal(res.status, 409);
+  assert.match(JSON.parse(res.body).error, /changed on disk|changed underneath/);
+  assert.equal(readTaskFile(alpha, "task-1 -"), onDiskBefore, "the stale write never landed");
+});
+
+test("write: checkbox toggle flips exactly one line, keyed by the fresh hash", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  writeTask(
+    path.join(tmp.root, "Alpha Project"),
+    "task-5 - checklist.md",
+    "id: task-5\ntitle: Checklist task\nstatus: todo",
+    "## Acceptance Criteria\n\n- [ ] first\n- [ ] second\n\n## Notes\n\nkeep this\n",
+  );
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-5")).body) as TaskDetailResult;
+  const res = await post(running.port, "/api/task/checkbox", {
+    project: "uid-alpha",
+    task: "task-5",
+    index: 1,
+    checked: true,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 200);
+  const file = readTaskFile(alpha, "task-5 -");
+  assert.match(file, /- \[ \] first/);
+  assert.match(file, /- \[x\] second/);
+  assert.match(file, /keep this/, "prose outside the checklist is untouched");
+});
+
+test("write: checkbox toggle with a stale expectedHash is refused with 409", async (t) => {
+  const tmp = buildFixtureWorkspace();
+  t.after(() => tmp.cleanup());
+  writeTask(
+    path.join(tmp.root, "Alpha Project"),
+    "task-5 - checklist.md",
+    "id: task-5\ntitle: Checklist task\nstatus: todo",
+    "## Acceptance Criteria\n\n- [ ] only item\n",
+  );
+  const running = await startDashboard({ workspaceRoot: tmp.root, now: () => NOW });
+  t.after(() => running.close());
+  const alpha = path.join(tmp.root, "Alpha Project");
+
+  const detail = JSON.parse((await get(running.port, "/api/task?project=uid-alpha&task=task-5")).body) as TaskDetailResult;
+  await post(running.port, "/api/task/note", { project: "uid-alpha", task: "task-5", text: "concurrent edit" });
+  const onDiskBefore = readTaskFile(alpha, "task-5 -");
+
+  const res = await post(running.port, "/api/task/checkbox", {
+    project: "uid-alpha",
+    task: "task-5",
+    index: 0,
+    checked: true,
+    expectedHash: detail.task.hash,
+  });
+  assert.equal(res.status, 409);
+  assert.equal(readTaskFile(alpha, "task-5 -"), onDiskBefore, "the stale toggle never landed");
+});
+
 test("write: invalid status value is a 400", async (t) => {
   const tmp = buildFixtureWorkspace();
   t.after(() => tmp.cleanup());

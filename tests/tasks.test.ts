@@ -34,11 +34,14 @@ import {
   parseInterval,
   setRecur,
   setStatus,
+  setTaskBody,
   showTask,
   slugFromTitle,
   tasksArchiveDir,
   tasksDir,
+  toggleChecklistItem,
 } from "../src/primitives/tasks.js";
+import { sha256Hex } from "../src/lib/fsatomic.js";
 import { makeTmpStore, makeTmpWorkspace } from "./helpers.js";
 
 /** Local 09:00 on the given local calendar date — timezone-proof "today". */
@@ -829,4 +832,153 @@ test("optimistic concurrency: an out-of-band edit between read and write throws 
   const onDisk = originalReadFileSync.call(fs, created.path, "utf8");
   assert.ok(onDisk.includes("<!-- concurrent writer's edit -->"), "the concurrent edit survives on disk");
   assert.ok(!onDisk.includes("quadrant: q2"), "the racing write never landed — no clobber");
+});
+
+// ---------------------------------------------------------------------------
+// setTaskBody / toggleChecklistItem (DECISION-9: the dashboard's narrow body
+// editor + interactive Acceptance-Criteria checkboxes).
+// ---------------------------------------------------------------------------
+
+test("setTaskBody: replaces the body, preserves frontmatter byte-for-byte", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, {
+    title: "Body edit target",
+    quadrant: "q2",
+    labels: ["a", "b"],
+    now,
+  });
+  const before = fs.readFileSync(created.path, "utf8");
+  const frontmatterBefore = before.slice(0, before.indexOf("\n---", 3) + 4);
+
+  const newBody = "## Description\n\nRewritten by the dashboard editor.\n";
+  const updated = setTaskBody(fx.projectRoot, created.id, newBody, { now });
+  assert.equal(updated.body, newBody);
+  // Frontmatter (id, title, quadrant, labels, created, updated timestamp
+  // aside) is untouched — only `updated` legitimately changes on any write.
+  assert.equal(updated.quadrant, "q2");
+  assert.deepEqual(updated.labels, ["a", "b"]);
+
+  const after = fs.readFileSync(created.path, "utf8");
+  const frontmatterAfter = after.slice(0, after.indexOf("\n---", 3) + 4);
+  assert.equal(
+    frontmatterAfter.replace(/updated: .*/, "updated: X"),
+    frontmatterBefore.replace(/updated: .*/, "updated: X"),
+    "frontmatter besides `updated` survives the body rewrite untouched",
+  );
+  assert.ok(after.endsWith(newBody), "the new body lands on disk verbatim");
+});
+
+test("setTaskBody: does not silently destroy Final Summary / Log — writes exactly what it's given", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, { title: "Has history", now });
+  writeFinalSummary(fx.projectRoot, created.id, "Shipped it.");
+  const withSummary = getTask(fx.projectRoot, created.id);
+  assert.ok(withSummary.body.includes("## Final Summary"));
+
+  // The caller (the client) is responsible for seeding the textarea with the
+  // FULL current body — a save that includes the existing sections keeps them.
+  const preserved = withSummary.body + "\n## Log\n\n- a note\n";
+  const updated = setTaskBody(fx.projectRoot, created.id, preserved, { now });
+  assert.ok(updated.body.includes("## Final Summary"));
+  assert.ok(updated.body.includes("Shipped it."));
+  assert.ok(updated.body.includes("## Log"));
+
+  // But the primitive itself is faithful: given a body that OMITS a section,
+  // it writes exactly that (no auto-preservation at the library layer).
+  const stripped = setTaskBody(fx.projectRoot, created.id, "## Description\n\ngone\n", { now });
+  assert.ok(!stripped.body.includes("## Final Summary"));
+});
+
+test("setTaskBody: a stale expectedHash is refused with ConflictError, not clobbered", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, { title: "Racy body edit", now });
+  const staleHash = sha256Hex(fs.readFileSync(created.path, "utf8"));
+
+  // Someone else edits the file after the client loaded its copy.
+  editField(fx.projectRoot, created.id, "quadrant", "q3", { now });
+  const onDiskBefore = fs.readFileSync(created.path, "utf8");
+
+  assert.throws(
+    () => setTaskBody(fx.projectRoot, created.id, "## Description\n\nclobber attempt\n", { expectedHash: staleHash, now }),
+    (err: unknown) => err instanceof ConflictError,
+  );
+  assert.equal(fs.readFileSync(created.path, "utf8"), onDiskBefore, "the stale write never landed");
+
+  // The CURRENT hash still works.
+  const fresh = getTask(fx.projectRoot, created.id);
+  const ok = setTaskBody(fx.projectRoot, created.id, "## Description\n\nfor real this time\n", {
+    expectedHash: sha256Hex(fs.readFileSync(fresh.path, "utf8")),
+    now,
+  });
+  assert.match(ok.body, /for real this time/);
+});
+
+test("toggleChecklistItem: flips exactly one '- [ ]' <-> '- [x]' line, by index and by text", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, {
+    title: "Checklist target",
+    body: "## Acceptance Criteria\n\n- [ ] first\n- [ ] second\n- [x] third\n\n## Notes\n\nsome prose\n",
+    now,
+  });
+
+  const afterIndex1 = toggleChecklistItem(fx.projectRoot, created.id, { index: 1, checked: true, now });
+  assert.ok(afterIndex1.body.includes("- [ ] first"));
+  assert.ok(afterIndex1.body.includes("- [x] second"));
+  assert.ok(afterIndex1.body.includes("- [x] third"));
+  assert.ok(afterIndex1.body.includes("some prose"), "prose outside the checklist is untouched");
+
+  const afterText = toggleChecklistItem(fx.projectRoot, created.id, { text: "third", checked: false, now });
+  assert.ok(afterText.body.includes("- [x] second"));
+  assert.ok(afterText.body.includes("- [ ] third"));
+});
+
+test("toggleChecklistItem: a stale expectedHash is refused, not clobbered", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, {
+    title: "Racy checkbox",
+    body: "## Acceptance Criteria\n\n- [ ] only item\n",
+    now,
+  });
+  const staleHash = sha256Hex(fs.readFileSync(created.path, "utf8"));
+  editField(fx.projectRoot, created.id, "quadrant", "q4", { now });
+  const onDiskBefore = fs.readFileSync(created.path, "utf8");
+
+  assert.throws(
+    () => toggleChecklistItem(fx.projectRoot, created.id, { index: 0, checked: true, expectedHash: staleHash, now }),
+    (err: unknown) => err instanceof ConflictError,
+  );
+  assert.equal(fs.readFileSync(created.path, "utf8"), onDiskBefore, "the stale toggle never landed");
+});
+
+test("toggleChecklistItem: unknown index/text is NotFoundError; missing both is ConfigError", (t) => {
+  const fx = makeFixture();
+  t.after(fx.cleanup);
+  const now = at(2026, 6, 10);
+  const created = createTask(fx.projectRoot, fx.store, {
+    title: "No such item",
+    body: "## Acceptance Criteria\n\n- [ ] only item\n",
+    now,
+  });
+  assert.throws(
+    () => toggleChecklistItem(fx.projectRoot, created.id, { index: 5, checked: true, now }),
+    (err: unknown) => err instanceof NotFoundError,
+  );
+  assert.throws(
+    () => toggleChecklistItem(fx.projectRoot, created.id, { text: "nope", checked: true, now }),
+    (err: unknown) => err instanceof NotFoundError,
+  );
+  assert.throws(
+    () => toggleChecklistItem(fx.projectRoot, created.id, { checked: true, now }),
+    (err: unknown) => err instanceof ConfigError,
+  );
 });
