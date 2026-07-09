@@ -80,6 +80,10 @@ together 2026-07-08):
   per-file sha256 (`ConflictError` → 409 on a stale `expectedHash`, same
   posture as the write-race guard in Phase 1a) and both deliberately fenced
   short of a general Markdown/WYSIWYG editor — see the decision for why.
+- **Automation log viewer** — `GET /api/automation/logs` wraps the existing
+  `logsFor()` (the CLI's `automation logs`): run list + tail-capped, traversal-
+  safe per-run content, surfaced as a "logs" disclosure on each Automations
+  card. Read-only; secret keys but never values appear (runner discipline).
 - **Phase 2** — workspace root externalized to `~/.config/openworkspace/
   locations.toml` (`[[stores]]`, `driver = "localfs"`), with a forgiving
   loader (`OPENWORKSPACE_CONFIG_DIR` override), backward-compatible walk-up
