@@ -2,22 +2,31 @@
 name: developing-openworkspace
 description: >-
   Safely modify, build, and test the OpenWorkspace codebase itself (the
-  `projects` CLI + the dashboard) which lives at `Personal OS/openworkspace/`.
+  `projects` CLI + the dashboard) which lives at `~/Code/openworkspace/`.
   Use this skill BEFORE editing any TypeScript under that repo's `src/` or
   `tests/`, changing the dashboard React client, running `npm test` there, or
   touching its build — because the live `projects` CLI and the always-on
   dashboard both run from that repo's built `dist/`, so a careless build breaks
   the very tooling you depend on mid-session. Trigger whenever the task is
   "change/fix/add to OpenWorkspace", "the projects CLI", "the dashboard code",
-  or any work inside `Personal OS/openworkspace`. To promote finished work, use
+  or any work inside `~/Code/openworkspace`. To promote finished work, use
   the companion `openworkspace-ship` skill.
 ---
 
 # Developing OpenWorkspace safely
 
+The repo lives at **`~/Code/openworkspace`** (moved out of iCloud 2026-09-29;
+the old `~/Documents/Personal OS/openworkspace` holds only `CODE-MOVED.md`). It
+is itself an OpenWorkspace project (commits its own `_project/`), discovered by
+the `~/Documents` workspace through `[projects] external_roots` in
+`~/Documents/.openworkspace/config.toml`.
+
 The OpenWorkspace package is **npm-linked**: `projects` on PATH →
-`/opt/homebrew/bin/projects` → `<repo>/dist/src/cli.js`. The always-on
-dashboard LaunchAgent (`com.openworkspace.dashboard`) runs from the same
+`/opt/homebrew/bin/projects` → `/opt/homebrew/lib/node_modules/openworkspace`
+(symlink → `~/Code/openworkspace`) → `dist/src/cli.js`. The always-on
+dashboard LaunchAgent (`com.openworkspace.dashboard`), the automation
+supervisor (`com.openworkspace.supervisor`) and every activated automation
+plist (`com.openworkspace.<uid>.<name>`) run from the same
 `dist`. **A broken `dist` on main breaks the CLI every skill and this session
 depend on.** So the one rule is: never develop against main's `dist` — work in
 an isolated worktree and only rebuild main's `dist` after the full suite passes
@@ -35,21 +44,25 @@ on the merged result.
 
 ## Set up an isolated worktree (do this first)
 
-Work off-tree (off iCloud, so git internals + build artifacts stay out of
-FileProvider). Replace `<SCRATCH>` with your session scratchpad dir.
+Put the worktree in your session scratchpad (never in iCloud). Replace
+`<SCRATCH>` with your session scratchpad dir.
 
 ```sh
-cd "$HOME/Documents/Personal OS/openworkspace"
-WT="<SCRATCH>/ow-wt"                     # off-tree path
+cd "$HOME/Code/openworkspace"
+WT="<SCRATCH>/ow-wt"
 git worktree add "$WT" -b my/feature main
-# a git worktree has NO node_modules — symlink BOTH from main (no new deps? symlink; new deps? npm install in the worktree instead):
+# a git worktree has NO node_modules — symlink BOTH from main (no new deps? symlink; new deps? npm ci in the worktree instead):
 ln -s "$PWD/node_modules" "$WT/node_modules"
 ln -s "$PWD/src/dashboard/client/node_modules" "$WT/src/dashboard/client/node_modules"
-cd "$WT" && npm test        # baseline — expect ~451 pass / 0 fail
+cd "$WT" && npm test        # baseline — expect ~466 pass / 0 fail
 ```
 
+Main's `node_modules` (root and `src/dashboard/client/`) are plain `npm ci`
+installs — no symlinks into `~/.node_modules` or iCloud copies. If one is
+ever broken, `npm ci` in that dir (the lockfiles are authoritative).
+
 - **If a phase will add npm deps**, do NOT symlink that `node_modules` — run a
-  real `npm install` inside the worktree (root and/or client) so you don't
+  real `npm ci`/`npm install` inside the worktree (root and/or client) so you don't
   pollute main's install through the symlink.
 - **`node_modules` symlink trap:** `.gitignore` now ignores `node_modules`
   (no trailing slash) so a symlink of that name is ignored — but historically a
@@ -60,7 +73,7 @@ cd "$WT" && npm test        # baseline — expect ~451 pass / 0 fail
 ## Test discipline
 
 - `npm test` = `tsc` + the client `vite build` + `node --test`. Green is
-  **451/451** (grows as you add tests). Only commit a phase when green.
+  **466/466** (grows as you add tests). Only commit a phase when green.
 - **Known load-flaky tests** (NOT regressions): the `ids.ts`
   "stale-lock steal under contention" race, and the dashboard `fs.watch`
   reconcile / SSE-reconcile tests (FSEvents latency under full-parallel load).
@@ -70,7 +83,7 @@ cd "$WT" && npm test        # baseline — expect ~451 pass / 0 fail
 
 ## Architecture you must respect (read before changing behavior)
 
-Canonical decisions live in `Personal OS/_project/decisions/`:
+Canonical decisions live in `~/Documents/Personal OS/_project/decisions/`:
 - **decision-1** — the dashboard write path: mutations route **through the
   library** (never `fs.writeFile` from the server); only status/done/note
   originally, plus decision-9's narrow body edit. Loopback-gated writes.

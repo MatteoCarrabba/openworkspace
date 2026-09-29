@@ -4,7 +4,7 @@ description: >-
   Promote finished OpenWorkspace development from an isolated worktree branch to
   `main` and the live tooling — the merge → install-client-deps → rebuild dist →
   full-suite → push → restart-dashboard → verify → cleanup checklist. Use this
-  whenever work on the OpenWorkspace repo (`Personal OS/openworkspace`) is
+  whenever work on the OpenWorkspace repo (`~/Code/openworkspace`) is
   complete and needs to reach the live `projects` CLI and the always-on
   dashboard, or when the user says "ship it", "merge to main", "promote", or
   "make it live" for OpenWorkspace. Assumes the change was built in a worktree
@@ -14,7 +14,10 @@ description: >-
 # Shipping OpenWorkspace to main + the live tooling
 
 The live `projects` CLI and the `com.openworkspace.dashboard` LaunchAgent both
-run from main's built `dist/`. Promotion = rebuild that `dist` from a verified
+run from main's built `dist/` in `~/Code/openworkspace` (the global npm link
+`/opt/homebrew/lib/node_modules/openworkspace` points there; so do the
+supervisor and automation plists, which `automation apply` regenerates from the
+installed path). Promotion = rebuild that `dist` from a verified
 merge, then refresh the running dashboard. Do the steps in order; each gate
 protects the live tooling.
 
@@ -27,7 +30,7 @@ protects the live tooling.
 
 2. **Merge to main** (in the real repo, not the worktree):
    ```sh
-   cd "$HOME/Documents/Personal OS/openworkspace"
+   cd "$HOME/Code/openworkspace"
    git merge --no-ff <worktree-branch> -m "…"
    ```
    If multiple branches must land (e.g. a scattered workflow), merge each and
@@ -38,7 +41,7 @@ protects the live tooling.
 3. **Install client deps in main.** The client `node_modules` is git-ignored, so
    after a merge that touched the client the build needs them:
    ```sh
-   (cd src/dashboard/client && npm install)
+   (cd src/dashboard/client && npm ci)
    ```
 
 4. **Rebuild `dist` + run the full suite on main:**
@@ -76,6 +79,6 @@ protects the live tooling.
 
 If the CLI is broken after a rebuild (module-load error, bad build), restore by
 checking out the last-good `main` and rebuilding (`git log` shows it); if
-`node_modules` was clobbered, `npm install` (root) + `npm install` in the client
+`node_modules` was clobbered, `npm ci` (root) + `npm ci` in the client
 (package-lock is authoritative — nothing is lost). If restore fails, **STOP**
 and park a sign-off item rather than improvising on the live toolchain.

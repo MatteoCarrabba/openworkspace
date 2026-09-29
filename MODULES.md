@@ -141,8 +141,11 @@ interface WorkspaceConfig {
   paths: { dormant: string; archives: string };
   discovery: { ignore: string[] };
   secrets: { resolvers: Record<string, string> };
+  skills: { bundledDir: string | null };      // [skills] bundled_dir (task-7)
+  projects: { externalRoots: string[] };      // [projects] external_roots, verbatim
 }
 interface Workspace { root: string; config: WorkspaceConfig }
+interface ExternalRoot { configured: string; path: string }  // path: ~-expanded, ws-root-relative resolved
 interface ProjectInfo {
   root: string; relPath: string; uid: string; lifecycle: Lifecycle;  // location view
   nestedUnder: string | null;   // enclosing project root when nested
@@ -150,6 +153,7 @@ interface ProjectInfo {
   effectiveLifecycle: DeclaredLifecycle;   // declared wins, else location — THE source of truth
   declaredLifecycle: DeclaredLifecycle | null;  // explicit project.toml value, else null
   lifecycleSetAt: string | null;           // lifecycle_set audit stamp
+  externalRoot: string | null;             // the external root it was found under; null in-tree
 }
 function findWorkspaceRoot(startDir: string): string | null    // walk-up for .openworkspace/
 function loadWorkspaceConfig(rootDir: string): WorkspaceConfig // all keys optional + defaults
@@ -162,7 +166,12 @@ function locationOfDeclared(declared: DeclaredLifecycle): Lifecycle  // identity
 function readDeclaredLifecycle(projectRoot): { lifecycle, setAt, problem }  // forgiving; unknown→null+problem
 function writeDeclaredLifecycle(projectRoot, lifecycle, setAt): void // lossless; active sheds the key
 function effectiveLifecycle(ws, projectRoot): DeclaredLifecycle      // declared-wins, location-fallback (TRUTH)
-function discoverProjects(ws: Workspace, options?: { all?: boolean; maxDepth?: number }): ProjectInfo[]
+function discoverProjects(ws: Workspace, options?: { all?: boolean; maxDepth?: number; external?: boolean }): ProjectInfo[]
+function expandHomePath(p: string, home?: string): string            // "~" / "~/…" only
+function externalProjectRoots(ws: Workspace, home?: string): ExternalRoot[]  // resolved + deduped, no fs checks
+function isOutsideWorkspace(ws: Workspace, p: string): boolean
+function isWithinPath(p: string, parent: string): boolean            // realpath-aware containment
+function isLinkedWorktreeCheckout(dir: string): boolean              // spawn-free: .git FILE → …/worktrees/<name>
 function findDuplicateUids(projects: ProjectInfo[]): Map<string, string[]>
 function findProjectByUid(ws: Workspace, uid: string): ProjectInfo | null  // live scan, shelves included
 ```
@@ -172,7 +181,15 @@ and appear as their own entries; the workspace root itself is never a project;
 shelf dirs (configured `paths.dormant`/`paths.archives`) are excluded from default
 scans (`all: true` includes them); lifecycle's SOURCE OF TRUTH is the declared
 `project.toml` field (`effectiveLifecycle`), with `lifecycleOf` (location) the
-derived view — `reconcile` aligns them (decision-2). Primitive scanners
+derived view — `reconcile` aligns them (decision-2). `[projects]
+external_roots` are walked after the tree (same walker, default on; `external:
+false` opts out): missing/non-dir/foreign-git roots are skipped silently (doctor
+warns via `externalRootIssues`), linked worktrees are never discovered from an
+external root, and projects are deduped by real path (in-tree wins). Outside the
+tree `lifecycleOf` returns the declared value (absent ⇒ active), so an external
+project never drifts and is never moved. `resolve.ts#findWorkspaceClaimingPath`
+(store, dir) is the CLI's fallback when walk-up finds no marker: the known
+workspace whose external roots contain `dir`. Primitive scanners
 (tasks/forum/…) must NOT descend across a nested project boundary — use
 `isProjectBoundary` when walking project content.
 

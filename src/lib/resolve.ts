@@ -26,10 +26,13 @@ import {
   writeUidCacheEntry,
 } from "./machine.js";
 import {
+  MARKER_DIR,
   Workspace,
+  externalProjectRoots,
   findProjectByUid,
   findProjectRoot,
   findWorkspaceRoot,
+  isWithinPath,
   loadWorkspaceConfig,
   readProjectUid,
 } from "./workspace.js";
@@ -213,4 +216,35 @@ export function resolveCanonicalProject(
       `Run \`projects home init\` (or any workspace-routed command) from inside the ` +
       `canonical workspace checkout on this machine once to register it.`,
   );
+}
+
+/**
+ * Find the workspace that CLAIMS `startDir` through its `[projects]
+ * external_roots` — the fallback for workspace-routed commands run from inside
+ * an external project (e.g. `~/Code/<repo>`), where walking up finds no
+ * `.openworkspace/` marker. Only machine-store-registered workspaces are
+ * consulted (every command run inside the canonical tree registers it), and
+ * worktree-resident registrations are skipped, same as canonical resolution.
+ * Returns null when no known workspace lists a root containing `startDir`.
+ */
+export function findWorkspaceClaimingPath(store: MachineStore, startDir: string): Workspace | null {
+  const target = path.resolve(startDir);
+  for (const wsRoot of readKnownWorkspaces(store)) {
+    try {
+      if (!fs.statSync(path.join(wsRoot, MARKER_DIR)).isDirectory()) continue;
+    } catch {
+      continue; // stale registration
+    }
+    if (isGitWorktree(wsRoot)) continue;
+    let ws: Workspace;
+    try {
+      ws = { root: wsRoot, config: loadWorkspaceConfig(wsRoot) };
+    } catch {
+      continue;
+    }
+    for (const ext of externalProjectRoots(ws)) {
+      if (isWithinPath(target, ext.path)) return ws;
+    }
+  }
+  return null;
 }
