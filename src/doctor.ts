@@ -51,8 +51,11 @@ import {
   ProjectInfo,
   Workspace,
   discoverProjects,
+  externalProjectRoots,
   findDuplicateUids,
   findWorkspaceRoot,
+  isLinkedWorktreeCheckout,
+  isWithinPath,
   readDeclaredLifecycle,
   readProjectUid,
 } from "./lib/workspace.js";
@@ -1149,6 +1152,94 @@ function ownsGraphIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
   return issues;
 }
 
+/**
+ * `[projects] external_roots` health. Discovery skips a bad root silently (a
+ * missing drive or a not-yet-cloned repo must never crash the CLI or the
+ * dashboard), so doctor is where it surfaces — as a WARNING, never an error:
+ *  - missing / not a directory;
+ *  - a linked git worktree (never canonical — point at the main checkout);
+ *  - a git checkout that is not an OpenWorkspace project (nothing to discover);
+ *  - no projects found under it;
+ *  - (info) redundant: already inside the workspace tree, or inside another
+ *    external root — discovery dedupes, so this is only noise.
+ */
+export function externalRootIssues(ws: Workspace, all: ProjectInfo[]): DoctorIssue[] {
+  const issues: DoctorIssue[] = [];
+  const externals = externalProjectRoots(ws);
+  const at = (configured: string, abs: string): string =>
+    configured === abs ? `"${configured}"` : `"${configured}" (${abs})`;
+  for (const ext of externals) {
+    const where = at(ext.configured, ext.path);
+    let st: fs.Stats | null = null;
+    try {
+      st = fs.statSync(ext.path);
+    } catch {
+      st = null;
+    }
+    if (st === null || !st.isDirectory()) {
+      issues.push({
+        severity: "warn",
+        project: null,
+        file: null,
+        message:
+          `external project root ${where} ${st === null ? "does not exist" : "is not a directory"} ` +
+          `— its projects are not discovered (fix or remove it in [projects] external_roots)`,
+      });
+      continue;
+    }
+    if (isLinkedWorktreeCheckout(ext.path)) {
+      issues.push({
+        severity: "warn",
+        project: null,
+        file: null,
+        message:
+          `external project root ${where} is a linked git worktree — a worktree is never canonical, ` +
+          `so it is not discovered; list the repo's main checkout instead`,
+      });
+      continue;
+    }
+    if (readProjectUid(ext.path) === null && fs.existsSync(path.join(ext.path, ".git"))) {
+      issues.push({
+        severity: "warn",
+        project: null,
+        file: null,
+        message:
+          `external project root ${where} is a git checkout that is not an OpenWorkspace project ` +
+          `(no _project/id) — nothing is discovered there`,
+      });
+      continue;
+    }
+    if (isWithinPath(ext.path, ws.root)) {
+      issues.push({
+        severity: "info",
+        project: null,
+        file: null,
+        message: `external project root ${where} is inside the workspace tree — redundant (already discovered)`,
+      });
+      continue;
+    }
+    const other = externals.find((o) => o !== ext && o.path !== ext.path && isWithinPath(ext.path, o.path));
+    if (other !== undefined) {
+      issues.push({
+        severity: "info",
+        project: null,
+        file: null,
+        message: `external project root ${where} is inside external root "${other.configured}" — redundant`,
+      });
+      continue;
+    }
+    if (!all.some((p) => p.externalRoot === ext.path)) {
+      issues.push({
+        severity: "warn",
+        project: null,
+        file: null,
+        message: `external project root ${where} contains no OpenWorkspace projects (no _project/id found)`,
+      });
+    }
+  }
+  return issues;
+}
+
 /** Workspace-level checks only (no per-project recursion). */
 export function doctorWorkspaceOnly(
   ws: Workspace,
@@ -1183,6 +1274,8 @@ export function doctorWorkspaceOnly(
       });
     }
   }
+
+  issues.push(...externalRootIssues(ws, all));
 
   // duplicate project UIDs (iCloud copy / merge backstop)
   for (const [uid, roots] of findDuplicateUids(all)) {

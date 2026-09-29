@@ -313,8 +313,10 @@ export function reconcilePlan(ws: Workspace, store: MachineStore): ReconcilePlan
   for (const p of projects) {
     // Nested projects don't shelve (they ride their enclosing project); a
     // linked git worktree's location is never a lifecycle signal — never move
-    // a worktree. Both are skipped for the lifecycle axis.
-    const skipLifecycle = p.nestedUnder !== null || isGitWorktree(p.root);
+    // a worktree. All three are skipped for the lifecycle axis.
+    // An external-root project (outside the tree) has no shelf location at
+    // all: its lifecycle is metadata-only, never a move.
+    const skipLifecycle = p.nestedUnder !== null || p.externalRoot !== null || isGitWorktree(p.root);
     if (!skipLifecycle) {
       planLifecycleDrift(ws, store, p, actions, ambiguous, convergedIntents);
     }

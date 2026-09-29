@@ -34,7 +34,12 @@ import {
   writeUidCacheEntry,
 } from "./lib/machine.js";
 import { LocationStore, loadLocationStores, locationsFilePath } from "./lib/locations.js";
-import { isGitWorktree, registerWorkspaceIfCanonical, resolveCanonicalProject } from "./lib/resolve.js";
+import {
+  findWorkspaceClaimingPath,
+  isGitWorktree,
+  registerWorkspaceIfCanonical,
+  resolveCanonicalProject,
+} from "./lib/resolve.js";
 import { readToml } from "./lib/toml.js";
 import {
   DeclaredLifecycle,
@@ -227,7 +232,17 @@ function getStore(): MachineStore {
  * (PRD §6.4: UID-registry-first from day one).
  */
 function openWorkspaceRegistered(startDir: string): Workspace {
-  const ws = openWorkspace(startDir);
+  let ws: Workspace;
+  try {
+    ws = openWorkspace(startDir);
+  } catch (err) {
+    // Outside any tree: an external project (`[projects] external_roots`, e.g.
+    // a repo under ~/Code) is still routed to the known workspace that lists it.
+    if (!(err instanceof NotFoundError)) throw err;
+    const claiming = findWorkspaceClaimingPath(getStore(), startDir);
+    if (claiming === null) throw err;
+    return claiming; // already registered (that's how it was found)
+  }
   registerWorkspaceIfCanonical(getStore(), ws.root);
   return ws;
 }
@@ -646,7 +661,11 @@ function projectView(root: string, uid: string): Record<string, unknown> {
     try {
       return openWorkspace(root);
     } catch {
-      return null;
+      try {
+        return findWorkspaceClaimingPath(getStore(), root); // external project
+      } catch {
+        return null;
+      }
     }
   })();
   const declared = readDeclaredLifecycle(root);

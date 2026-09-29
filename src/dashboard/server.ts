@@ -1727,7 +1727,7 @@ function readJsonBody(req: http.IncomingMessage, limitBytes = 64 * 1024): Promis
 function projectRootForUid(workspaceRoot: string, uid: string): string | null {
   const ws = openWorkspace(workspaceRoot);
   const info = discoverProjects(ws, { all: true }).find((p) => p.uid === uid);
-  return info === undefined ? null : path.join(ws.root, info.relPath);
+  return info === undefined ? null : info.root;
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { ConfigError, NotFoundError } from "./errors.js";
@@ -277,6 +278,13 @@ export interface WorkspaceConfig {
    * the installed package's `skills/` dir; "" ⇒ disable bundled discovery.
    */
   skills: { bundledDir: string | null };
+  /**
+   * `[projects] external_roots`: extra project roots OUTSIDE the workspace
+   * tree (e.g. a git repo that is itself an OpenWorkspace project and lives
+   * under `~/Code`). Kept exactly as written; `externalProjectRoots` resolves
+   * them (`~` ⇒ home dir, relative ⇒ against the workspace root).
+   */
+  projects: { externalRoots: string[] };
 }
 
 export interface Workspace {
@@ -308,6 +316,14 @@ export interface ProjectInfo {
   declaredLifecycle: DeclaredLifecycle | null;
   /** The `lifecycle_set` audit timestamp, or null. */
   lifecycleSetAt: string | null;
+  /**
+   * The resolved `[projects] external_roots` entry this project was found
+   * under, or null for a project inside the workspace tree. For an external
+   * project `relPath` is still `path.relative(ws.root, root)` (so it starts
+   * with `..`) — the invariant `path.resolve(ws.root, relPath) === root` holds
+   * for every project.
+   */
+  externalRoot: string | null;
 }
 
 export function defaultConfig(): WorkspaceConfig {
@@ -318,6 +334,7 @@ export function defaultConfig(): WorkspaceConfig {
     discovery: { ignore: [...DEFAULT_IGNORE] },
     secrets: { resolvers: {} },
     skills: { bundledDir: null },
+    projects: { externalRoots: [] },
   };
 }
 
@@ -393,6 +410,17 @@ export function loadWorkspaceConfig(rootDir: string): WorkspaceConfig {
   if (skills !== undefined && typeof skills === "object" && skills !== null) {
     const k = skills as Record<string, unknown>;
     if (k["bundled_dir"] !== undefined) config.skills.bundledDir = asString(k["bundled_dir"], "skills.bundled_dir");
+  }
+  const projectsTable = raw["projects"];
+  if (projectsTable !== undefined && typeof projectsTable === "object" && projectsTable !== null) {
+    const pt = projectsTable as Record<string, unknown>;
+    const ext = pt["external_roots"];
+    if (ext !== undefined) {
+      if (!Array.isArray(ext) || ext.some((x) => typeof x !== "string")) {
+        throw new ConfigError("config key projects.external_roots must be an array of strings");
+      }
+      config.projects.externalRoots = (ext as string[]).filter((x) => x.trim() !== "");
+    }
   }
   return config;
 }
@@ -487,9 +515,100 @@ function isUnder(child: string, parent: string): boolean {
   return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
 }
 
-/** Lifecycle from location: under a shelf path → dormant/archived, else active. */
+function realpathOrSelf(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * True when `p` lies inside `parent` (or is `parent`), comparing real paths so
+ * symlinked spellings (/var vs /private/var, a symlinked ~/Code) agree.
+ */
+export function isWithinPath(p: string, parent: string): boolean {
+  const a = realpathOrSelf(p);
+  const b = realpathOrSelf(parent);
+  return a === b || isUnder(a, b);
+}
+
+/**
+ * Expand a leading `~` (`~` alone or `~/…`) to the home dir. `~user` forms are
+ * NOT expanded (left as a relative path) — keep the config portable and simple.
+ */
+export function expandHomePath(p: string, home: string = os.homedir()): string {
+  if (p === "~") return home;
+  if (p.startsWith("~/")) return path.join(home, p.slice(2));
+  return p;
+}
+
+export interface ExternalRoot {
+  /** The entry exactly as written in `[projects] external_roots`. */
+  configured: string;
+  /** Absolute path: `~` expanded, relative entries resolved against ws.root. */
+  path: string;
+}
+
+/**
+ * The workspace's `[projects] external_roots`, resolved and deduped (by
+ * resolved path). Pure: no existence checks — discovery skips a missing root
+ * silently and doctor reports it.
+ */
+export function externalProjectRoots(ws: Workspace, home: string = os.homedir()): ExternalRoot[] {
+  const out: ExternalRoot[] = [];
+  const seen = new Set<string>();
+  for (const configured of ws.config.projects?.externalRoots ?? []) {
+    const abs = path.resolve(ws.root, expandHomePath(configured, home));
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    out.push({ configured, path: abs });
+  }
+  return out;
+}
+
+/** True when `p` is outside the workspace tree (location carries no lifecycle there). */
+export function isOutsideWorkspace(ws: Workspace, p: string): boolean {
+  const abs = path.resolve(p);
+  const root = path.resolve(ws.root);
+  if (abs === root || isUnder(abs, root)) return false; // fast path: no syscalls
+  return !isWithinPath(abs, root);
+}
+
+/**
+ * Cheap, spawn-free linked-worktree check for discovery: a linked git worktree
+ * has a `.git` FILE whose `gitdir:` points into `<common>/.git/worktrees/…`
+ * (a submodule's points into `.git/modules/…` and is not a worktree). The
+ * authoritative git-based check (`resolve.ts#isGitWorktree`) still vetoes
+ * canonical candidates; this one keeps worktrees out of external discovery
+ * without forking git per directory.
+ */
+export function isLinkedWorktreeCheckout(dir: string): boolean {
+  let text: string;
+  try {
+    const gitPath = path.join(dir, ".git");
+    if (!fs.lstatSync(gitPath).isFile()) return false;
+    text = fs.readFileSync(gitPath, "utf8");
+  } catch {
+    return false;
+  }
+  const m = /^gitdir:\s*(.+)$/m.exec(text);
+  if (m === null || m[1] === undefined) return false;
+  return /[\\/]worktrees[\\/][^\\/]+[\\/]?$/.test(m[1].trim());
+}
+
+/**
+ * Lifecycle from location: under a shelf path → dormant/archived, else active.
+ *
+ * Outside the workspace tree (an `[projects] external_roots` project) location
+ * carries NO lifecycle signal — there is no shelf to be under — so the view
+ * mirrors the declared metadata (absent ⇒ active). Location and metadata then
+ * never "drift" for an external project, so neither `projects lifecycle` nor
+ * `reconcile` ever moves one: its lifecycle is metadata-only.
+ */
 export function lifecycleOf(ws: Workspace, projectRoot: string): Lifecycle {
   const abs = path.resolve(projectRoot);
+  if (isOutsideWorkspace(ws, abs)) return readDeclaredLifecycle(abs).lifecycle ?? "active";
   const dormant = path.resolve(ws.root, ws.config.paths.dormant);
   const archives = path.resolve(ws.root, ws.config.paths.archives);
   if (isUnder(abs, dormant)) return "dormant";
@@ -515,6 +634,12 @@ export interface DiscoverOptions {
   all?: boolean;
   /** Safety bound on recursion depth from the workspace root. Default 12. */
   maxDepth?: number;
+  /**
+   * Include projects under `[projects] external_roots`. Default true. (The
+   * shelves flag does not apply to them: an external project has no shelf
+   * location; its lifecycle is its declared metadata.)
+   */
+  external?: boolean;
 }
 
 /**
@@ -529,6 +654,18 @@ export interface DiscoverOptions {
  * into a foreign git checkout's working tree (a dir with `.git` that is not an
  * OpenWorkspace project). It DOES still descend into real projects so nested
  * projects are found. `maxDepth` bounds runaway recursion.
+ *
+ * External roots (`[projects] external_roots`) are then walked the same way,
+ * each from its own root: an entry may be a project (e.g. a repo that is
+ * itself an OpenWorkspace project) or a plain folder holding projects; nested
+ * projects under it are found as usual. Missing roots are skipped silently
+ * (doctor reports them). Guards: a linked git worktree is never discovered
+ * from an external root (the root itself or any dir under it — a worktree of
+ * a project repo carries the committed `_project/id` and would otherwise
+ * surface as a duplicate UID and poison canonical resolution), a foreign git
+ * checkout root is skipped, and every project is deduped by real path, so an
+ * external root that overlaps the tree or another external root (or is a
+ * symlink to one) never yields the same project twice.
  */
 export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): ProjectInfo[] {
   const includeShelves = options.all === true;
@@ -539,16 +676,29 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
     path.resolve(ws.root, ws.config.paths.archives),
   ];
   const projects: ProjectInfo[] = [];
+  // Real paths of discovered project roots — populated only when external
+  // roots are walked (the in-tree walk alone cannot visit a dir twice).
+  let seenReal: Set<string> | null = null;
 
-  const walk = (dir: string, depth: number, enclosingProject: string | null): void => {
+  const walk = (
+    dir: string,
+    depth: number,
+    enclosingProject: string | null,
+    externalRoot: string | null,
+  ): void => {
     if (depth > maxDepth) return;
-    if (!includeShelves && shelves.some((s) => s === dir)) return;
+    if (externalRoot === null && !includeShelves && shelves.some((s) => s === dir)) return;
+    if (externalRoot !== null && isLinkedWorktreeCheckout(dir)) return;
 
-    const uid = dir === ws.root ? null : readProjectUid(dir);
+    const uid = externalRoot === null && dir === ws.root ? null : readProjectUid(dir);
     let enclosing = enclosingProject;
     if (uid !== null) {
+      const real = seenReal !== null ? realpathOrSelf(dir) : null;
+      if (seenReal !== null && real !== null && seenReal.has(real)) return; // already found
+      if (seenReal !== null && real !== null) seenReal.add(real);
       const declared = readDeclaredLifecycle(dir);
-      const located = lifecycleOf(ws, dir);
+      const located: Lifecycle =
+        externalRoot === null ? lifecycleOf(ws, dir) : (declared.lifecycle ?? "active");
       projects.push({
         root: dir,
         relPath: path.relative(ws.root, dir),
@@ -558,6 +708,7 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
         effectiveLifecycle: declared.lifecycle ?? located,
         declaredLifecycle: declared.lifecycle,
         lifecycleSetAt: declared.setAt,
+        externalRoot,
       });
       enclosing = dir;
     }
@@ -582,11 +733,29 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
       // isForeignGitWorktree returns false for any dir with `_project/id`, so
       // the project boundary and any nested projects under it are still found.
       if (isForeignGitWorktree(child)) continue;
-      walk(child, depth + 1, enclosing);
+      walk(child, depth + 1, enclosing, externalRoot);
     }
   };
 
-  walk(path.resolve(ws.root), 0, null);
+  walk(path.resolve(ws.root), 0, null, null);
+
+  if (options.external !== false) {
+    const externals = externalProjectRoots(ws);
+    if (externals.length > 0) {
+      seenReal = new Set(projects.map((p) => realpathOrSelf(p.root)));
+      for (const ext of externals) {
+        let st: fs.Stats;
+        try {
+          st = fs.statSync(ext.path);
+        } catch {
+          continue; // missing root: doctor warns, discovery never crashes
+        }
+        if (!st.isDirectory()) continue;
+        if (isForeignGitWorktree(ext.path)) continue; // a code checkout, not a project
+        walk(ext.path, 0, null, ext.path);
+      }
+    }
+  }
   return projects;
 }
 

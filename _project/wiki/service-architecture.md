@@ -91,6 +91,16 @@ together 2026-07-08):
   verbs. No data is moved; this only externalizes the root pointer (the
   identity/location/discovery split) so the tool can later live outside the
   tree.
+- **External project roots** (2026-09-29) — `[projects] external_roots` in
+  the workspace config extends DISCOVERY past the tree (e.g. `~/Code/<repo>`
+  for a git repo that is itself a project, moved out of iCloud whole). The
+  storage plane is unchanged (files stay authoritative); every read model —
+  scan, dashboard + its per-project `fs.watch`, skills sync, doctor,
+  canonical resolution — rides the same `discoverProjects`, so no separate
+  registry exists. Worktrees are never discovered from an external root
+  (split-brain guard), projects dedupe by real path, lifecycle is
+  metadata-only outside the tree, and bad roots are doctor warnings. See the
+  README section.
 - **Phase 3** — compute-plane cleanup: `runs_on` as the forward name for the
   executor set (`machines` kept as a backward-compatible alias; declaring
   both is accepted only when they agree, else `runs-on-machines-conflict`),

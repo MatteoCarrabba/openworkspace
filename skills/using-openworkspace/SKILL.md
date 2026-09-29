@@ -51,6 +51,15 @@ directory. Init pre-creates every primitive: `tasks/`, `wiki/`,
 `decisions/`, `automations/`, `forum/`, `plans/current.md`, plus the README
 and a stamped `.gitignore`. Never restamp by hand; never edit `_project/id`.
 
+A project can also live **outside** the workspace tree — typically a git repo
+that is itself a project, kept under `~/Code` (out of iCloud). The workspace
+lists it in `.openworkspace/config.toml` under `[projects] external_roots =
+["~/Code/<repo>"]`; it then shows up in `home list`/`home scan`, the dashboard,
+`skills sync` and `home doctor` like any other project (its `relPath` starts
+with `..`), and `projects` commands work from inside it. Its lifecycle is
+metadata-only (nothing ever moves it). Run agents' worktrees of such a repo
+anywhere; worktrees are never discovered or treated as canonical.
+
 ## Tasks — including reminders and recurrence
 
 One file per task, flat in `_project/tasks/`, named `task-<n> - <slug>.md`.
