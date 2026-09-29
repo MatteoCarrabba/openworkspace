@@ -306,7 +306,11 @@ interface SkillsFs { existsSync; readdirSync; readFileSync; lstatSync; readlinkS
                      symlinkSync; unlinkSync; mkdirSync }   // injected subset of node:fs
 interface SkillsEnv { ws; claudeSkillsDir: string | null; codexSkillsDir: string | null;
                       sourceRoots: string[]; readmePath: string | null; fs: SkillsFs }
-function defaultSourceRoots(env: Pick<SkillsEnv, "ws" | "fs">): string[]
+function packageSkillsDir(): string                           // <installed package>/skills (from __dirname)
+function bundledSkillsDir(ws: Workspace): string | null      // [skills] bundled_dir override ("" ⇒ null), else packageSkillsDir()
+interface SourceRootOptions { bundledDir?: string | null }   // undefined ⇒ bundledSkillsDir(ws); null ⇒ none
+function defaultSourceRoots(env: Pick<SkillsEnv, "ws" | "fs">, opts?: SourceRootOptions): string[]
+                                                             // project Skills/ first, then bundled; deduped by path AND (dev, ino)
 interface DiscoveredSkill { name: string; description: string; source: string }
 interface DiscoverResult { skills: DiscoveredSkill[]; collisions: Map<string, string[]> }
 function discoverSkills(env: SkillsEnv): DiscoverResult

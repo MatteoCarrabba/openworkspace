@@ -162,37 +162,72 @@ export interface SkillsEnv {
 }
 
 /**
- * Default source roots for a workspace: every project's `Skills/` dir (active +
- * shelved, via a live scan) plus OpenWorkspace's own `skills/` dir. Only roots
- * that exist as directories are returned. Deduped, stable order.
+ * OpenWorkspace's own bundled `skills/` dir, resolved from the INSTALLED
+ * package — not from any assumed workspace layout. This module compiles to
+ * `<package>/dist/src/skills.js`, so the package root is two levels up (same
+ * convention doctor.ts uses for the using-openworkspace SKILL.md).
  */
-export function defaultSourceRoots(env: Pick<SkillsEnv, "ws" | "fs">): string[] {
+export function packageSkillsDir(): string {
+  return path.resolve(__dirname, "..", "..", "skills");
+}
+
+/**
+ * Where to read bundled skills from for this workspace: the `[skills]
+ * bundled_dir` config override (relative ⇒ against the workspace root; "" ⇒
+ * disabled, returns null), else the installed package's `skills/` dir.
+ */
+export function bundledSkillsDir(ws: Workspace): string | null {
+  const override = ws.config.skills.bundledDir;
+  if (override === null) return packageSkillsDir();
+  if (override === "") return null;
+  return path.resolve(ws.root, override);
+}
+
+export interface SourceRootOptions {
+  /**
+   * Bundled-skills dir to include (after the project roots). undefined ⇒
+   * `bundledSkillsDir(ws)`; null ⇒ include none (tests isolating projects).
+   */
+  bundledDir?: string | null;
+}
+
+/**
+ * Default source roots for a workspace: every project's `Skills/` dir (active +
+ * shelved, via a live scan) plus OpenWorkspace's own bundled `skills/` dir
+ * (see `bundledSkillsDir`). Only roots that exist as directories are returned.
+ * Deduped — by resolved path AND by (dev, ino), so the same directory reached
+ * via two spellings (e.g. `Skills/` vs `skills/` on a case-insensitive
+ * volume) is scanned once instead of colliding with itself. Stable order;
+ * project roots come first and so win name collisions.
+ */
+export function defaultSourceRoots(env: Pick<SkillsEnv, "ws" | "fs">, opts: SourceRootOptions = {}): string[] {
   const { ws, fs: vfs } = env;
   const roots: string[] = [];
   const seen = new Set<string>();
   const add = (p: string): void => {
     const abs = path.resolve(p);
     if (seen.has(abs)) return;
-    if (!isDir(vfs, abs)) return;
+    let st: fs.Stats;
+    try {
+      st = vfs.lstatSync(abs);
+    } catch {
+      return;
+    }
+    if (!st.isDirectory()) return;
+    const identity = `${st.dev}:${st.ino}`;
     seen.add(abs);
+    if (seen.has(identity)) return;
+    seen.add(identity);
     roots.push(abs);
   };
   for (const proj of discoverProjects(ws, { all: true })) {
     add(path.join(proj.root, "Skills"));
   }
   // OpenWorkspace's own bundled skills (it may or may not be a discovered
-  // project depending on where the marker lives — add unconditionally).
-  add(path.join(ws.root, "Personal OS", "OpenWorkspace", "skills"));
-  add(path.join(ws.root, "OpenWorkspace", "skills"));
+  // project depending on where the package lives — add unconditionally).
+  const bundled = opts.bundledDir === undefined ? bundledSkillsDir(ws) : opts.bundledDir;
+  if (bundled !== null) add(bundled);
   return roots;
-}
-
-function isDir(vfs: SkillsFs, p: string): boolean {
-  try {
-    return vfs.lstatSync(p).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 // ---------------------------------------------------------------------------
