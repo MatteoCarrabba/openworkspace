@@ -271,6 +271,12 @@ export interface WorkspaceConfig {
   paths: { dormant: string; archives: string };
   discovery: { ignore: string[] };
   secrets: { resolvers: Record<string, string> };
+  /**
+   * `[skills] bundled_dir`: override where OpenWorkspace's own bundled skills
+   * are read from (relative paths resolve against the workspace root). null ⇒
+   * the installed package's `skills/` dir; "" ⇒ disable bundled discovery.
+   */
+  skills: { bundledDir: string | null };
 }
 
 export interface Workspace {
@@ -311,6 +317,7 @@ export function defaultConfig(): WorkspaceConfig {
     paths: { dormant: DEFAULT_DORMANT, archives: DEFAULT_ARCHIVES },
     discovery: { ignore: [...DEFAULT_IGNORE] },
     secrets: { resolvers: {} },
+    skills: { bundledDir: null },
   };
 }
 
@@ -381,6 +388,11 @@ export function loadWorkspaceConfig(rootDir: string): WorkspaceConfig {
         config.secrets.resolvers[scheme] = asString(cmd, `secrets.resolvers.${scheme}`);
       }
     }
+  }
+  const skills = raw["skills"];
+  if (skills !== undefined && typeof skills === "object" && skills !== null) {
+    const k = skills as Record<string, unknown>;
+    if (k["bundled_dir"] !== undefined) config.skills.bundledDir = asString(k["bundled_dir"], "skills.bundled_dir");
   }
   return config;
 }

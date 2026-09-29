@@ -19,9 +19,11 @@ import {
   SkillsFs,
   applyReadmeSection,
   applySkillsSync,
+  bundledSkillsDir,
   defaultSourceRoots,
   discoverSkills,
   parseSkillFrontmatter,
+  packageSkillsDir,
   planSkillsSync,
 } from "../src/skills.js";
 import { makeTmpWorkspace, TmpWorkspace } from "./helpers.js";
@@ -39,6 +41,9 @@ const realFs: SkillsFs = {
     fs.mkdirSync(p, opts);
   },
 };
+
+/** Isolate the project-root tests from the package's real bundled skills. */
+const NO_BUNDLED = { bundledDir: null } as const;
 
 interface Harness {
   tw: TmpWorkspace;
@@ -79,7 +84,7 @@ function makeHarness(): Harness {
     fs: realFs,
     claudeSkillsDir: claudeDir,
     codexSkillsDir: codexDir,
-    sourceRoots: defaultSourceRoots({ ws: tw.ws, fs: realFs }),
+    sourceRoots: defaultSourceRoots({ ws: tw.ws, fs: realFs }, NO_BUNDLED),
     readmePath,
   };
   return { tw, env, claudeDir, codexDir, readmePath, agentsDir };
@@ -110,7 +115,7 @@ test("parseSkillFrontmatter: inline, quoted, and block scalars", () => {
 test("defaultSourceRoots discovers each project's Skills/ dir", () => {
   const h = makeHarness();
   try {
-    const roots = defaultSourceRoots({ ws: h.env.ws, fs: realFs });
+    const roots = defaultSourceRoots({ ws: h.env.ws, fs: realFs }, NO_BUNDLED);
     assert.ok(roots.some((r) => r.endsWith(path.join("Alpha Project", "Skills"))));
     assert.ok(roots.some((r) => r.endsWith(path.join("Inbox:Outbox Proj", "Skills"))));
   } finally {
@@ -217,7 +222,7 @@ test("repoints a moved source on re-sync (update, not stale)", () => {
     writeSkill(path.join(p3.root, "Skills"), "alpha-one", "does alpha one things");
 
     // Rebuild env (source roots are a live default scan).
-    const env2: SkillsEnv = { ...h.env, sourceRoots: defaultSourceRoots({ ws: h.env.ws, fs: realFs }) };
+    const env2: SkillsEnv = { ...h.env, sourceRoots: defaultSourceRoots({ ws: h.env.ws, fs: realFs }, NO_BUNDLED) };
     const plan = planSkillsSync(env2);
     const update = plan.actions.find((a) => a.layer === "agents" && path.basename(a.link) === "alpha-one");
     assert.equal(update?.kind, "update");
@@ -322,12 +327,112 @@ test("name collision across source roots: first root wins, loser recorded", () =
     // Add a second skill that DECLARES the same name as alpha-one in another root.
     const p2Skills = path.join(h.tw.root, "Inbox:Outbox Proj", "Skills");
     writeSkill(p2Skills, "dupe-dir", "shadowed copy", "alpha-one");
-    const env2: SkillsEnv = { ...h.env, sourceRoots: defaultSourceRoots({ ws: h.env.ws, fs: realFs }) };
+    const env2: SkillsEnv = { ...h.env, sourceRoots: defaultSourceRoots({ ws: h.env.ws, fs: realFs }, NO_BUNDLED) };
     const { skills, collisions } = discoverSkills(env2);
     // Only one alpha-one survives.
     assert.equal(skills.filter((s) => s.name === "alpha-one").length, 1);
     assert.ok(collisions.has("alpha-one"));
   } finally {
     h.tw.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bundled skills: resolved from the installed package, not a workspace layout.
+
+test("packageSkillsDir resolves <package>/skills (holds the shipped using-openworkspace)", () => {
+  const dir = packageSkillsDir();
+  // dist/tests/*.test.js → package root is two up; skills/ sits beside src/.
+  assert.equal(dir, path.resolve(__dirname, "..", "..", "skills"));
+  assert.ok(fs.existsSync(path.join(dir, "using-openworkspace", "SKILL.md")));
+});
+
+test("a workspace at an arbitrary temp root finds the bundled skills", () => {
+  // No "Personal OS/OpenWorkspace" anywhere under this root.
+  const tw = makeTmpWorkspace();
+  try {
+    const roots = defaultSourceRoots({ ws: tw.ws, fs: realFs });
+    assert.ok(roots.includes(packageSkillsDir()), `roots: ${roots.join(", ")}`);
+    const env: SkillsEnv = {
+      ws: tw.ws,
+      fs: realFs,
+      claudeSkillsDir: null,
+      codexSkillsDir: null,
+      sourceRoots: roots,
+      readmePath: null,
+    };
+    const names = discoverSkills(env).skills.map((s) => s.name);
+    assert.ok(names.includes("using-openworkspace"), `found: ${names.join(", ")}`);
+  } finally {
+    tw.cleanup();
+  }
+});
+
+test("existing layout: the OW repo as a project with its own skills dir — scanned once, project path wins", () => {
+  // Mirrors the live layout: the package repo is ALSO a discovered project,
+  // and its bundled `skills/` is the same dir as the project's `Skills/` on a
+  // case-insensitive volume (default macOS APFS). It must be scanned once, the
+  // project spelling must win, and nothing may collide with itself. (On a
+  // case-sensitive volume the lowercase alias simply doesn't exist → skipped.)
+  const tw = makeTmpWorkspace();
+  try {
+    const ow = tw.addProject(path.join("Some Folder", "openworkspace"));
+    const skillsDir = path.join(ow.root, "Skills");
+    writeSkill(skillsDir, "using-openworkspace", "bundled");
+    const alias = path.join(ow.root, "skills");
+    const roots = defaultSourceRoots({ ws: tw.ws, fs: realFs }, { bundledDir: alias });
+    assert.deepEqual(roots, [skillsDir]);
+    const env: SkillsEnv = {
+      ws: tw.ws,
+      fs: realFs,
+      claudeSkillsDir: null,
+      codexSkillsDir: null,
+      sourceRoots: roots,
+      readmePath: null,
+    };
+    const { skills, collisions } = discoverSkills(env);
+    assert.deepEqual(skills.map((s) => s.source), [path.join(skillsDir, "using-openworkspace")]);
+    assert.equal(collisions.size, 0);
+  } finally {
+    tw.cleanup();
+  }
+});
+
+test("the same directory reached via two distinct paths is deduped by identity (no self-collision)", () => {
+  const tw = makeTmpWorkspace();
+  try {
+    const p = tw.addProject("Proj");
+    const skillsDir = path.join(p.root, "Skills");
+    writeSkill(skillsDir, "one", "d");
+    // A second spelling of the same dir via a symlinked PARENT (lstat of the
+    // final component is still the real dir, so only (dev, ino) catches it).
+    const linkParent = path.join(tw.root, "alias-parent");
+    fs.symlinkSync(p.root, linkParent);
+    const roots = defaultSourceRoots({ ws: tw.ws, fs: realFs }, { bundledDir: path.join(linkParent, "Skills") });
+    assert.deepEqual(roots, [skillsDir]);
+  } finally {
+    tw.cleanup();
+  }
+});
+
+test("[skills] bundled_dir config: relative override resolves against the workspace root; \"\" disables", () => {
+  const custom = makeTmpWorkspace(`[skills]\nbundled_dir = "vendor/ow-skills"\n`);
+  const off = makeTmpWorkspace(`[skills]\nbundled_dir = ""\n`);
+  const dflt = makeTmpWorkspace();
+  try {
+    assert.equal(bundledSkillsDir(custom.ws), path.join(custom.root, "vendor", "ow-skills"));
+    writeSkill(path.join(custom.root, "vendor", "ow-skills"), "vendored", "d");
+    const roots = defaultSourceRoots({ ws: custom.ws, fs: realFs });
+    assert.deepEqual(roots, [path.join(custom.root, "vendor", "ow-skills")]);
+    assert.ok(!roots.includes(packageSkillsDir()));
+
+    assert.equal(bundledSkillsDir(off.ws), null);
+    assert.deepEqual(defaultSourceRoots({ ws: off.ws, fs: realFs }), []);
+
+    assert.equal(bundledSkillsDir(dflt.ws), packageSkillsDir());
+  } finally {
+    custom.cleanup();
+    off.cleanup();
+    dflt.cleanup();
   }
 });
