@@ -18,9 +18,30 @@ import { parseArgs } from "node:util";
 
 import { doctorProjectReport, doctorWorkspace, DoctorReport } from "./doctor.js";
 import { ImportPlan, applyLegacyImport, planLegacyImport, renderPlan } from "./importers.js";
-import { initProject, initWorkspace, updateMachineRegistry } from "./init.js";
+import { initProject, initWorkspace, pruneEmptyStores, updateMachineRegistry } from "./init.js";
 import { scanWorkspace, startDashboard } from "./dashboard/server.js";
-import { ConfigError, ConflictError, NotFoundError, OwError, ResolveError } from "./lib/errors.js";
+import { ConfigError, ConflictError, HomeElsewhereError, NotFoundError, OwError, ResolveError } from "./lib/errors.js";
+import {
+  CORE_PRIMITIVES,
+  CorePrimitive,
+  EntrySpec,
+  MapEntry,
+  NATIVE_STORE,
+  checkMapDocs,
+  describeHome,
+  elsewhereMessage,
+  ensureMapDeclared,
+  entryOf,
+  homeOf,
+  isCorePrimitive,
+  mapView,
+  nativeRecordCount,
+  nativeStoreState,
+  parseHomeShorthand,
+  readInfoMap,
+  renderMapDocs,
+  writeMapEntry,
+} from "./lib/infomap.js";
 import {
   MachineStore,
   appendLifecycleIntent,
@@ -117,8 +138,13 @@ Locations (phase 2 — the workspace root lives in config, not just "wherever cw
                                            discovery is always a live tree walk, so there is nothing to rebuild yet)
 
 Projects
-  projects init [<path>]                  stamp the full _project/ skeleton (default: the cwd)
-  projects new <name> [--parent <ref>] [--kind subproject|code|remote]   create ./<name>/ and stamp the skeleton (--parent links it under a parent via [[owns]])
+  projects init [<path>] [--native <prims>] [--home <key>=<home> ...] [--no-docs]
+                                          make a project (default: the cwd): _project/id + README + .gitignore +
+                                          the information map; NO native stores are pre-created
+  projects new <name> [--parent <ref>] [--kind subproject|code|remote] [--native ...] [--home ...] [--no-docs]
+                                          create ./<name>/ and init it (--parent links it under a parent via [[owns]])
+    --native tasks,wiki | all             home these core primitives in OpenWorkspace's native stores
+    --home tasks=<url>|<path>|none        declare another home (repeatable); details via \`projects map set\`
   projects show [--project <ref>] [--json]
   projects doctor [--project <ref>] [--json]
   projects rename <new-name> [--project <ref>]
@@ -127,6 +153,21 @@ Projects
   projects reconcile [--all] [--apply] [--auto] [--json]            heal location⟷metadata drift (decision-2)
                      [--revert <ref>] [--adopt-location <ref>]      human tiebreak for ambiguous drift
     (dry-run default; --apply executes the plan except ambiguous rows; --auto = the glitch-certain class only)
+
+Information map (where each kind of project information canonically lives — the default purpose)
+  projects map show [--json]              the map: tasks, decisions, wiki, plans, forum + extras, and each home's state
+  projects map set <key> [native|none|<url>|<path>] [--system S] [--url U] [--locator L] [--path P]
+                       [--note N] [--label L] [--no-render]
+                                          declare a home (key = a core primitive or any extra, e.g. credentials);
+                                          re-renders README.md/AGENTS.md
+  projects map unset <key> [--no-render]
+  projects map render [--dry-run] [--json]   (re)write the generated "Where information lives" sections (idempotent)
+  projects map adopt [--apply] [--prune-empty] [--json]
+                                          legacy project → declared map: populated native stores become "native";
+                                          --prune-empty removes stores holding only the old empty skeleton
+  All map verbs take [--project <ref>]. A native command whose primitive lives elsewhere prints the
+  pointer instead (reads) or exits 3 without writing (task create, decision new, forum open/post, plan open);
+  an undeclared primitive still writes natively, with a note asking you to declare it.
 
 Tasks (records ride the branch: writes are worktree-local)
   projects task create "title" [--parent <id>] [--quadrant qN] [--label L ...]
@@ -189,7 +230,7 @@ Import (PRD §11 — dry-run-first; apply executes exactly the rendered plan)
     (b) legacy reminders → tasks (surface_on → hidden_until; dismissed/promoted → archived)
     (c) dirchannels → forum (threads <date>--<channel>--<slug>; one maildir file per message)
 
-Exit codes: 0 ok · 1 error · 2 canonical-resolution failure.
+Exit codes: 0 ok · 1 error · 2 canonical-resolution failure · 3 home is elsewhere (nothing written; see message).
 `;
 
 function print(text: string): void {
@@ -609,8 +650,46 @@ function guardCwdInitTarget(dir: string): void {
   }
 }
 
+/** Init/new flags declaring the information map up front. */
+const FLAG_MAP_INIT: Spec = {
+  native: { type: "string", multiple: true },
+  home: { type: "string", multiple: true },
+  "no-docs": { type: "boolean", default: false },
+};
+
+function initMapOptions(values: Record<string, unknown>): {
+  native: CorePrimitive[];
+  homes: Record<string, EntrySpec>;
+  renderDocs: boolean;
+} {
+  const native: CorePrimitive[] = [];
+  for (const raw of (values["native"] as string[] | undefined) ?? []) {
+    for (const part of raw.split(",").map((x) => x.trim()).filter((x) => x !== "")) {
+      if (part === "all") native.push(...CORE_PRIMITIVES);
+      else if (isCorePrimitive(part)) native.push(part);
+      else throw new ConfigError(`--native: "${part}" is not one of ${CORE_PRIMITIVES.join(", ")} (or all)`);
+    }
+  }
+  const homes: Record<string, EntrySpec> = {};
+  for (const raw of (values["home"] as string[] | undefined) ?? []) {
+    const eq = raw.indexOf("=");
+    if (eq <= 0) throw new ConfigError(`--home expects <key>=<native|none|url|path>, got "${raw}"`);
+    homes[raw.slice(0, eq).trim()] = parseHomeShorthand(raw.slice(eq + 1));
+  }
+  return { native: [...new Set(native)], homes, renderDocs: values["no-docs"] !== true };
+}
+
+function printInitMapHint(root: string, rendered: string[]): void {
+  const map = readInfoMap(root);
+  const undeclared = map.entries.filter((e) => e.core && e.kind === "undeclared").map((e) => e.key);
+  if (rendered.length > 0) print(`  "Where information lives" rendered into ${rendered.join(", ")}`);
+  if (undeclared.length > 0) {
+    print(`  no declared home yet for: ${undeclared.join(", ")} — declare each with \`projects map set <key> native|none|<url>\``);
+  }
+}
+
 function cmdInit(argv: string[]): void {
-  const { values, positionals } = parse(argv, FLAG_JSON);
+  const { values, positionals } = parse(argv, { ...FLAG_JSON, ...FLAG_MAP_INIT });
   const target = positionals[0];
   let dir: string;
   if (target !== undefined) {
@@ -619,21 +698,25 @@ function cmdInit(argv: string[]): void {
     dir = process.cwd();
     guardCwdInitTarget(dir);
   }
-  const result = initProject(dir);
+  const result = initProject(dir, initMapOptions(values));
   seedProjectResolution(result.projectRoot, result.uid);
   if (values["json"] === true) printJson(result);
-  else print(`initialized project at ${result.projectRoot} (uid ${result.uid})`);
+  else {
+    print(`initialized project at ${result.projectRoot} (uid ${result.uid})`);
+    printInitMapHint(result.projectRoot, result.rendered);
+  }
 }
 
 function cmdNew(argv: string[]): void {
   const { values, positionals } = parse(argv, {
     ...FLAG_JSON,
+    ...FLAG_MAP_INIT,
     parent: { type: "string" },
     kind: { type: "string" },
   });
   const name = positionals[0];
   if (name === undefined || name.trim() === "") throw new ConfigError('usage: projects new "Name"');
-  const result = initProject(path.resolve(process.cwd(), name));
+  const result = initProject(path.resolve(process.cwd(), name), initMapOptions(values));
 
   // --parent: write the [[owns]] edge ON THE PARENT (the edge is parent-
   // canonical). The child's ref is its ws-relative path from ws.root, so it
@@ -653,7 +736,10 @@ function cmdNew(argv: string[]): void {
 
   seedProjectResolution(result.projectRoot, result.uid);
   if (values["json"] === true) printJson({ ...result, parent: parentRoot });
-  else print(`created project ${name} at ${result.projectRoot} (uid ${result.uid})`);
+  else {
+    print(`created project ${name} at ${result.projectRoot} (uid ${result.uid})`);
+    printInitMapHint(result.projectRoot, result.rendered);
+  }
 }
 
 function projectView(root: string, uid: string): Record<string, unknown> {
@@ -679,6 +765,7 @@ function projectView(root: string, uid: string): Record<string, unknown> {
     locatedLifecycle: ws !== null ? lifecycleOf(ws, root) : null,
     declaredLifecycle: declared.lifecycle,
     inWorktree: isGitWorktree(root),
+    map: mapView(root),
   };
 }
 
@@ -692,6 +779,8 @@ function cmdShow(argv: string[]): void {
     print(`  root:      ${root}`);
     print(`  uid:       ${uid}`);
     print(`  lifecycle: ${String(view["lifecycle"] ?? "unknown (outside any workspace)")}`);
+    print("");
+    printMap(root);
   }
 }
 
@@ -886,6 +975,7 @@ function cmdTask(argv: string[]): void {
       const title = positionals[0];
       if (title === undefined) throw new ConfigError('usage: projects task create "title" [flags]');
       const { root } = resolveProject(values["project"] as string | undefined);
+      requireNativeHome(root, "tasks");
       const store = getStore();
       const task = tasks.createTask(root, store, {
         title,
@@ -909,13 +999,19 @@ function cmdTask(argv: string[]): void {
         all: { type: "boolean", default: false },
       });
       const { root } = resolveProject(values["project"] as string | undefined);
+      const elsewhere = noteHomeElsewhere(root, "tasks", values["json"] === true);
       const entries = tasks.listTasks(root, {
         subtasks: values["subtasks"] === true,
         hidden: values["hidden"] === true,
         all: values["all"] === true,
       });
       if (values["json"] === true) printJson(entries);
-      else if (entries.length === 0) print("no tasks");
+      else if (elsewhere) {
+        if (entries.length > 0) {
+          print(`native task records still here (migrate them to the declared home):`);
+          for (const t of entries) print(taskLine(t));
+        }
+      } else if (entries.length === 0) print("no tasks");
       else for (const t of entries) print(taskLine(t));
       return;
     }
@@ -1056,6 +1152,7 @@ function cmdDecision(argv: string[]): void {
       const title = positionals[0];
       if (title === undefined) throw new ConfigError('usage: projects decision new "title"');
       const { root } = resolveProject(values["project"] as string | undefined);
+      requireNativeHome(root, "decisions");
       const store = getStore();
       const d = decisions.newDecision(root, store, {
         title,
@@ -1081,11 +1178,17 @@ function cmdDecision(argv: string[]): void {
     case "list": {
       const { values } = parse(rest, { ...common, status: { type: "string" } });
       const { root } = resolveProject(values["project"] as string | undefined);
+      const elsewhere = noteHomeElsewhere(root, "decisions", values["json"] === true);
       const list = decisions.listDecisions(root, {
         status: values["status"] as decisions.DecisionStatus | undefined,
       });
       if (values["json"] === true) printJson(list);
-      else if (list.length === 0) print("no decisions");
+      else if (list.length === 0) {
+        if (!elsewhere) print("no decisions");
+      } else if (elsewhere) {
+        print(`native decision records still here (migrate them to the declared home):`);
+        for (const d of list) print(`${d.id}  ${d.status}  ${d.date}  ${d.title}`);
+      }
       else
         for (const d of list) {
           const sup = d.supersededBy !== null ? ` (superseded by ${d.supersededBy})` : "";
@@ -1472,6 +1575,13 @@ function cmdPlan(argv: string[]): void {
 
   switch (sub) {
     case "show": {
+      const planHome = homeOf(root, "plans");
+      if ((planHome.kind === "external" || planHome.kind === "none") && !fs.existsSync(planPath)) {
+        const msg = elsewhereMessage(planHome, path.basename(root));
+        if (values["json"] === true) printJson({ path: null, content: null, elsewhere: msg });
+        else print(msg);
+        return;
+      }
       if (!fs.existsSync(planPath)) throw new NotFoundError(`no plan file: ${planPath}`);
       const content = fs.readFileSync(planPath, "utf8");
       if (values["json"] === true) printJson({ path: planPath, content });
@@ -1479,6 +1589,7 @@ function cmdPlan(argv: string[]): void {
       return;
     }
     case "open": {
+      requireNativeHome(root, "plans");
       const editor = process.env["VISUAL"] ?? process.env["EDITOR"];
       if (editor === undefined || editor === "") {
         print(planPath); // no editor configured: hand the path to the caller
@@ -1508,6 +1619,7 @@ function cmdForum(argv: string[]): void {
   switch (sub) {
     case "announce": {
       const { values } = parse(rest, { ...common, doing: { type: "string" } });
+      if (forumElsewhere(values)) return; // presence only where the forum is native
       const entry = forum.announce(forumCtx(values["project"] as string | undefined), {
         as: values["as"] as string | undefined,
         plan: values["doing"] as string | undefined,
@@ -1518,6 +1630,7 @@ function cmdForum(argv: string[]): void {
     }
     case "depart": {
       const { values } = parse(rest, common);
+      if (forumElsewhere(values)) return;
       const removed = forum.depart(forumCtx(values["project"] as string | undefined), {
         as: values["as"] as string | undefined,
       });
@@ -1527,6 +1640,7 @@ function cmdForum(argv: string[]): void {
     }
     case "who": {
       const { values } = parse(rest, common);
+      forumElsewhere(values);
       const entries = forum.who(forumCtx(values["project"] as string | undefined));
       if (values["json"] === true) printJson(entries);
       else if (entries.length === 0) print("nobody here");
@@ -1542,6 +1656,7 @@ function cmdForum(argv: string[]): void {
       const { values, positionals } = parse(rest, { ...common, slug: { type: "string" }, body: { type: "string" } });
       const title = positionals[0];
       if (title === undefined) throw new ConfigError('usage: projects forum open "title"');
+      requireNativeHome(resolveProject(values["project"] as string | undefined).root, "forum");
       const info = forum.openThread(forumCtx(values["project"] as string | undefined), {
         title,
         slug: values["slug"] as string | undefined,
@@ -1564,6 +1679,7 @@ function cmdForum(argv: string[]): void {
       if (thread === undefined || body === undefined) {
         throw new ConfigError('usage: projects forum post <thread> "body" [flags]');
       }
+      requireNativeHome(resolveProject(values["project"] as string | undefined).root, "forum");
       const message = forum.post(forumCtx(values["project"] as string | undefined), thread, {
         body,
         kind: values["kind"] as forum.MessageKind | undefined,
@@ -1597,6 +1713,7 @@ function cmdForum(argv: string[]): void {
     }
     case "list": {
       const { values } = parse(rest, { ...common, archived: { type: "boolean", default: false } });
+      forumElsewhere(values);
       const threads = forum.listThreads(forumCtx(values["project"] as string | undefined), {
         includeArchived: values["archived"] === true,
       });
@@ -1611,6 +1728,7 @@ function cmdForum(argv: string[]): void {
     }
     case "inbox": {
       const { values } = parse(rest, common);
+      forumElsewhere(values);
       const items = forum.inbox(forumCtx(values["project"] as string | undefined), {
         as: values["as"] as string | undefined,
       });
@@ -1660,6 +1778,224 @@ function cmdForum(argv: string[]): void {
       throw new ConfigError(
         `unknown forum subcommand: ${sub ?? "(none)"} (expected announce|depart|who|open|post|show|list|inbox|resolve|archive|sweep)`,
       );
+  }
+}
+
+// --- information map (decision-2) ---
+
+/**
+ * Writes that would CREATE a native record refuse when the map declares the
+ * primitive's home external or "none": exit 3 with the pointer, nothing
+ * written. An UNDECLARED primitive still writes natively (scripts that
+ * `projects init` then `task create`, e.g. pmt's engagement tracker, keep
+ * working) with a stderr nudge to declare it; the new store then counts as
+ * an inferred native home and doctor asks for the declaration. Mutations of
+ * existing native records are never blocked — a half-migrated store stays
+ * drainable.
+ */
+function requireNativeHome(root: string, prim: CorePrimitive): void {
+  const e = homeOf(root, prim);
+  if (e.kind === "native") return;
+  if (e.kind === "undeclared") {
+    process.stderr.write(
+      `note: ${path.basename(root)} declares no home for ${prim}; writing to the native store ` +
+        `(_project/${NATIVE_STORE[prim]}). Declare it: \`projects map set ${prim} native\` — or point it elsewhere.\n`,
+    );
+    return;
+  }
+  throw new HomeElsewhereError(elsewhereMessage(e, path.basename(root)));
+}
+
+/**
+ * Reads of a primitive homed elsewhere print the pointer (stdout in text
+ * mode; stderr in --json mode so the JSON shape on stdout is unchanged) and
+ * then show any native records that remain. Returns true when elsewhere.
+ */
+function noteHomeElsewhere(root: string, prim: CorePrimitive, json: boolean): boolean {
+  const e = homeOf(root, prim);
+  if (e.kind === "native" || e.kind === "undeclared") return false;
+  const msg = elsewhereMessage(e, path.basename(root));
+  if (json) process.stderr.write(msg + "\n");
+  else print(msg);
+  return true;
+}
+
+function forumElsewhere(values: Record<string, unknown>): boolean {
+  const { root } = resolveProject(values["project"] as string | undefined);
+  return noteHomeElsewhere(root, "forum", values["json"] === true);
+}
+
+function sourceTag(e: MapEntry, root: string): string {
+  const tags: string[] = [];
+  if (e.source === "inferred") tags.push("inferred — not declared");
+  if (e.source === "undeclared") tags.push("undeclared");
+  if (e.core) {
+    const st = nativeStoreState(root, e.key as CorePrimitive);
+    if (st === "populated") tags.push(`native store: ${nativeRecordCount(root, e.key as CorePrimitive)} record(s)`);
+    else if (st === "empty") tags.push("native store: empty");
+  }
+  return tags.length > 0 ? `  [${tags.join("; ")}]` : "";
+}
+
+function printMap(root: string): void {
+  const map = readInfoMap(root);
+  print(
+    map.declared
+      ? `Where information lives — ${path.basename(root)} (declared in _project/project.toml [map])`
+      : `Where information lives — ${path.basename(root)} (legacy: no [map] declared; every primitive treated as native — \`projects map adopt\`)`,
+  );
+  const width = Math.max(...map.entries.map((e) => e.label.length)) + 2;
+  for (const e of map.entries) {
+    print(`  ${(e.label + ":").padEnd(width)} ${describeHome(e).replace(/[`<>]/g, "")}${sourceTag(e, root)}`);
+  }
+  for (const prob of map.problems) print(`  problem: ${prob}`);
+  if (map.declared) {
+    const docs = checkMapDocs(root, map).map((d) => `${d.file} (${d.state})`);
+    if (docs.length > 0) print(`  rendered into: ${docs.join(", ")}`);
+  }
+}
+
+function cmdMap(argv: string[]): void {
+  const sub = argv[0];
+  const rest = argv.slice(1);
+  const common: Spec = { ...FLAG_JSON, ...FLAG_PROJECT };
+
+  switch (sub) {
+    case "show": {
+      const { values } = parse(rest, common);
+      const { root } = resolveProject(values["project"] as string | undefined);
+      if (values["json"] === true) printJson(mapView(root));
+      else printMap(root);
+      return;
+    }
+    case "set": {
+      const { values, positionals } = parse(rest, {
+        ...common,
+        system: { type: "string" },
+        url: { type: "string" },
+        locator: { type: "string" },
+        path: { type: "string" },
+        note: { type: "string" },
+        label: { type: "string" },
+        "no-render": { type: "boolean", default: false },
+      });
+      const [key, home] = positionals;
+      if (key === undefined) {
+        throw new ConfigError(
+          "usage: projects map set <key> [native|none|<url>|<path>] [--system S] [--url U] [--locator L] [--path P] [--note N] [--label L]",
+        );
+      }
+      const { root } = resolveProject(values["project"] as string | undefined);
+      const flag = (k: string): string | undefined => values[k] as string | undefined;
+      const hasPointerFlag = ["system", "url", "locator", "path"].some((k) => flag(k) !== undefined);
+      let spec: EntrySpec;
+      if (home !== undefined) spec = parseHomeShorthand(home);
+      else if (hasPointerFlag) spec = { kind: "external" };
+      else throw new ConfigError(`say where ${key} lives: native | none | <url> | <path>, or --system/--url/--locator/--path`);
+      if (spec.kind !== "external" && hasPointerFlag) {
+        throw new ConfigError(`"${home}" takes no --system/--url/--locator/--path (those describe an external home)`);
+      }
+      for (const k of ["system", "url", "locator", "path", "note", "label"] as const) {
+        if (flag(k) !== undefined) spec[k] = flag(k) as string;
+      }
+      writeMapEntry(root, key, spec);
+      const rendered = values["no-render"] === true ? [] : renderMapDocs(root).filter((r) => r.changed);
+      const entry = entryOf(readInfoMap(root), key) as MapEntry;
+      const remaining =
+        isCorePrimitive(key) && spec.kind !== "native" && nativeStoreState(root, key) === "populated"
+          ? nativeRecordCount(root, key)
+          : 0;
+      if (values["json"] === true) {
+        printJson({ entry, rendered: rendered.map((r) => r.file), nativeRecordsRemaining: remaining });
+        return;
+      }
+      print(`map.${key} → ${describeHome(entry).replace(/[`<>]/g, "")}`);
+      if (spec.kind === "native" && isCorePrimitive(key) && nativeStoreState(root, key) === "absent") {
+        print(`  (_project/${NATIVE_STORE[key]} is created by the first write)`);
+      }
+      if (remaining > 0) {
+        print(`  note: _project/${NATIVE_STORE[key as CorePrimitive]} still holds ${remaining} record(s) — migrate them to the new home, then remove the store`);
+      }
+      if (rendered.length > 0) print(`  rendered into ${rendered.map((r) => r.file).join(", ")}`);
+      return;
+    }
+    case "unset": {
+      const { values, positionals } = parse(rest, { ...common, "no-render": { type: "boolean", default: false } });
+      const key = positionals[0];
+      if (key === undefined) throw new ConfigError("usage: projects map unset <key>");
+      const { root } = resolveProject(values["project"] as string | undefined);
+      if (!readInfoMap(root).declared) throw new ConfigError("no [map] declared in this project — nothing to unset");
+      writeMapEntry(root, key, null);
+      const rendered = values["no-render"] === true ? [] : renderMapDocs(root).filter((r) => r.changed);
+      if (values["json"] === true) printJson({ unset: key, rendered: rendered.map((r) => r.file) });
+      else print(`map.${key} removed${rendered.length > 0 ? `; rendered into ${rendered.map((r) => r.file).join(", ")}` : ""}`);
+      return;
+    }
+    case "render": {
+      const { values } = parse(rest, { ...common, "dry-run": { type: "boolean", default: false } });
+      const { root } = resolveProject(values["project"] as string | undefined);
+      const results = renderMapDocs(root, { dryRun: values["dry-run"] === true });
+      if (values["json"] === true) {
+        printJson(results);
+        return;
+      }
+      const verb = values["dry-run"] === true ? "would " : "";
+      for (const r of results) {
+        print(`${r.file}: ${r.changed ? (r.created ? `${verb}create` : `${verb}update`) : "unchanged"}`);
+      }
+      if (!readInfoMap(root).declared) {
+        print("note: no [map] declared — rendered the legacy view (everything native); declare one with `projects map adopt --apply`");
+      }
+      return;
+    }
+    case "adopt": {
+      const { values } = parse(rest, {
+        ...common,
+        apply: { type: "boolean", default: false },
+        "dry-run": { type: "boolean", default: false },
+        "prune-empty": { type: "boolean", default: false },
+      });
+      const { root } = resolveProject(values["project"] as string | undefined);
+      const apply = values["apply"] === true && values["dry-run"] !== true;
+      const map = readInfoMap(root);
+      const declare: CorePrimitive[] = [];
+      const decide: CorePrimitive[] = [];
+      for (const e of map.entries) {
+        if (!e.core || e.source === "declared") continue;
+        const prim = e.key as CorePrimitive;
+        if (nativeStoreState(root, prim) === "populated") declare.push(prim);
+        else decide.push(prim);
+      }
+      const prune = values["prune-empty"] === true ? pruneEmptyStores(root, { dryRun: true }) : [];
+      let rendered: string[] = [];
+      let pruned: string[] = [];
+      if (apply) {
+        ensureMapDeclared(root);
+        for (const prim of declare) writeMapEntry(root, prim, { kind: "native" });
+        if (values["prune-empty"] === true) pruned = pruneEmptyStores(root);
+        rendered = renderMapDocs(root).filter((r) => r.changed).map((r) => r.file);
+      }
+      const result = { apply, declareNative: declare, undecided: decide, prune: apply ? pruned : prune, rendered };
+      if (values["json"] === true) {
+        printJson(result);
+        return;
+      }
+      const verb = apply ? "" : "would ";
+      print(`${apply ? "adopted" : "plan (dry-run; --apply to execute)"} — ${path.basename(root)}`);
+      if (!map.declared) print(`  ${verb}declare [map] in _project/project.toml`);
+      for (const prim of declare) {
+        print(`  ${verb}declare ${prim} = native  (_project/${NATIVE_STORE[prim]} holds ${nativeRecordCount(root, prim)} record(s))`);
+      }
+      for (const p of result.prune) print(`  ${verb}remove empty store ${p}`);
+      if (apply) for (const f of rendered) print(`  rendered "Where information lives" into ${f}`);
+      else print(`  ${verb}render "Where information lives" into ${map.renderTo.join(", ")}`);
+      if (decide.length > 0) {
+        print(`  still to decide (no content here to infer from): ${decide.join(", ")} — \`projects map set <key> native|none|<url>\``);
+      }
+      return;
+    }
+    default:
+      throw new ConfigError(`unknown map subcommand: ${sub ?? "(none)"} (expected show|set|unset|render|adopt)`);
   }
 }
 
@@ -2235,6 +2571,9 @@ export function main(argv: string[]): void {
     case "reconcile":
       cmdReconcile(rest);
       return;
+    case "map":
+      cmdMap(rest);
+      return;
     case "task":
       cmdTask(rest);
       return;
@@ -2274,6 +2613,11 @@ if (require.main === module) {
   try {
     main(process.argv.slice(2));
   } catch (err) {
+    if (err instanceof HomeElsewhereError) {
+      // Not a failure of the tool: the information lives elsewhere (exit 3).
+      process.stderr.write(`${err.message}\n`);
+      process.exit(err.exitCode);
+    }
     if (err instanceof OwError) {
       process.stderr.write(`error: ${err.message}\n`);
       process.exit(err.exitCode);

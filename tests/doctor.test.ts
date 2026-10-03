@@ -318,6 +318,7 @@ test("doctor: _project/id git-ignored and tracked-should-be-ignored files are pr
   fs.writeFileSync(path.join(tmp, ".gitignore"), "*\n!.gitignore\n");
   // and a presence file that got committed despite the stamp
   const presence = path.join(projectRoot, "_project", "forum", "presence", "mbp--claude.md");
+  fs.mkdirSync(path.dirname(presence), { recursive: true });
   fs.writeFileSync(presence, "---\nparticipant: claude\n---\n");
   git(["add", "-f", "Proj/_project/forum/presence/mbp--claude.md"], tmp);
   git(["commit", "-q", "-m", "oops"], tmp);

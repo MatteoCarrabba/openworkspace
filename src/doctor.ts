@@ -28,7 +28,11 @@
  * the stamped orientation READMEs), and the decision-1 runner-posture checks
  * (runner-node-unset / runner-node-provenance / claude-grant-staleness —
  * machine-local, best-effort, run only when a MachineStore is provided;
- * system binaries sit behind the injectable ExecFn seam).
+ * system binaries sit behind the injectable ExecFn seam), and the
+ * information-map checks (decision-2, `infoMapIssues`: declared homes,
+ * empty native stores, leftover records in a store homed elsewhere,
+ * pointer resolvability without network, rendered README/AGENTS sections;
+ * a legacy project with no [map] gets one info-level notice only).
  *
  * Not yet implemented (deferred, see README "Status"): the
  * aging-untracked-forum-message commit sweep proposal (needs git-tracking
@@ -41,6 +45,16 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { checkDocCurrency } from "./lib/clisurface.js";
+import {
+  CorePrimitive,
+  NATIVE_STORE,
+  checkMapDocs,
+  nativeRecordCount,
+  nativeStoreState,
+  pointerProblems,
+  pointerText,
+  readInfoMap,
+} from "./lib/infomap.js";
 import { readRecord } from "./lib/frontmatter.js";
 import { formatId, idFromFilename, parseId } from "./lib/ids.js";
 import { MachineStore, readRunnerNode } from "./lib/machine.js";
@@ -188,7 +202,7 @@ function localToday(now: Date): string {
 /** All project-level checks for one project root. */
 export function doctorProject(
   projectRoot: string,
-  options: { relPath?: string; now?: Date } = {},
+  options: { relPath?: string; now?: Date; legacyMapNotice?: boolean } = {},
 ): DoctorIssue[] {
   const project = options.relPath ?? projectRoot;
   const now = options.now ?? new Date();
@@ -634,6 +648,95 @@ export function doctorProject(
     }
   }
 
+  issues.push(...infoMapIssues(projectRoot, project, { legacyNotice: options.legacyMapNotice ?? true }));
+
+  return issues;
+}
+
+/** The message doctor uses for a project with no `[map]` (legacy). */
+export const LEGACY_MAP_NOTICE =
+  "no information map declared — every primitive is treated as a native store (legacy). " +
+  "Declare where this project's information lives: `projects map adopt`";
+
+/**
+ * Information-map checks (OpenWorkspace decision-2). A legacy project (no
+ * `[map]`) gets one info-level notice and nothing else, so existing
+ * workspaces see no new errors or warnings. In map mode:
+ *  - a malformed map / entry → error;
+ *  - every core primitive must have a DECLARED home (inferred-native and
+ *    undeclared are warnings that say how to declare);
+ *  - no native store sits empty (warn; stores are created on first write);
+ *  - a primitive homed elsewhere whose native store still holds records →
+ *    warn (migrate, then remove);
+ *  - pointers look resolvable: URLs well-formed, local paths exist (no
+ *    network);
+ *  - the README/AGENTS "Where information lives" sections exist and match.
+ */
+export function infoMapIssues(
+  projectRoot: string,
+  project: string,
+  options: { legacyNotice?: boolean } = {},
+): DoctorIssue[] {
+  const issues: DoctorIssue[] = [];
+  const tomlRel = path.join("_project", "project.toml");
+  const push = (severity: DoctorSeverity, file: string | null, message: string) =>
+    issues.push({ severity, project, file, message });
+
+  const map = readInfoMap(projectRoot);
+  for (const prob of map.problems) push("error", tomlRel, `information map: ${prob}`);
+  if (!map.declared) {
+    if (options.legacyNotice !== false) push("info", tomlRel, LEGACY_MAP_NOTICE);
+    return issues;
+  }
+
+  for (const e of map.entries) {
+    if (e.core) {
+      const prim = e.key as CorePrimitive;
+      const storeRel = path.join("_project", NATIVE_STORE[prim]);
+      if (e.source === "undeclared") {
+        push("warn", tomlRel, `${e.label}: no declared home — \`projects map set ${e.key} native|none|<url>|<path>\``);
+      } else if (e.source === "inferred") {
+        push(
+          "warn",
+          tomlRel,
+          `${e.label}: no declared home; inferred native from the existing ${storeRel} — ` +
+            `declare it (\`projects map set ${e.key} native\`) or point it elsewhere`,
+        );
+      }
+      const state = nativeStoreState(projectRoot, prim);
+      if (state === "empty") {
+        const why =
+          e.kind === "native"
+            ? "native stores are created on first write"
+            : `the home is ${e.kind === "none" ? "\"none\"" : pointerText(e)}`;
+        push(
+          "warn",
+          storeRel,
+          `empty native store (${why}) — remove it (\`projects map adopt --prune-empty --apply\`)`,
+        );
+      } else if (state === "populated" && (e.kind === "external" || e.kind === "none")) {
+        const n = nativeRecordCount(projectRoot, prim);
+        push(
+          "warn",
+          storeRel,
+          `${e.label} home is ${e.kind === "none" ? "\"none\"" : pointerText(e)}, but the native store still holds ` +
+            `${n} record(s) — migrate them to the declared home, then remove the store`,
+        );
+      }
+    }
+    for (const prob of pointerProblems(projectRoot, e)) push("warn", tomlRel, `information map: ${prob}`);
+  }
+
+  for (const doc of checkMapDocs(projectRoot, map)) {
+    if (doc.state === "ok") continue;
+    const what =
+      doc.state === "missing-file"
+        ? "file missing"
+        : doc.state === "missing-section"
+          ? "no \"Where information lives\" section"
+          : "\"Where information lives\" section is stale (does not match the map)";
+    push("warn", doc.file, `${what} — run \`projects map render\``);
+  }
   return issues;
 }
 
@@ -1467,8 +1570,25 @@ export function doctorWorkspaceOnly(
 export function doctorWorkspace(ws: Workspace, options: DoctorWorkspaceOptions = {}): DoctorReport {
   const projects = discoverProjects(ws, { all: true });
   const issues = doctorWorkspaceOnly(ws, projects, options);
+  const legacy: string[] = [];
   for (const proj of projects) {
-    issues.push(...doctorProject(proj.root, { relPath: proj.relPath, now: options.now }));
+    issues.push(
+      ...doctorProject(proj.root, { relPath: proj.relPath, now: options.now, legacyMapNotice: false }),
+    );
+    if (!readInfoMap(proj.root).declared) legacy.push(proj.relPath);
+  }
+  // One aggregated notice instead of one per legacy project (info-level:
+  // legacy projects keep working exactly as before; decision-2).
+  if (legacy.length > 0) {
+    const shown = legacy.slice(0, 6).join(", ") + (legacy.length > 6 ? `, … (+${legacy.length - 6})` : "");
+    issues.push({
+      severity: "info",
+      project: null,
+      file: null,
+      message:
+        `${legacy.length} project(s) declare no information map (legacy: every primitive treated as native): ${shown} — ` +
+        "declare where each project's information lives with `projects map adopt --project <ref>`",
+    });
   }
   return report(issues);
 }
@@ -1476,7 +1596,7 @@ export function doctorWorkspace(ws: Workspace, options: DoctorWorkspaceOptions =
 /** Doctor for one project (CLI `projects doctor`). */
 export function doctorProjectReport(
   projectRoot: string,
-  options: { relPath?: string; now?: Date } = {},
+  options: { relPath?: string; now?: Date; legacyMapNotice?: boolean } = {},
 ): DoctorReport {
   return report(doctorProject(projectRoot, options));
 }

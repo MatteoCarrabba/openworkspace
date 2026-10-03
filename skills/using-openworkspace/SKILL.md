@@ -2,24 +2,78 @@
 name: using-openworkspace
 description: >-
   Work correctly inside an OpenWorkspace workspace using the `projects` CLI —
-  creating and triaging tasks (including reminders-as-tasks and recurring
-  tasks), recording decisions, coordinating with other agents on the forum,
-  navigating projects, and validating with doctor. Use this skill whenever you
-  are operating in a directory tree that contains a `.openworkspace/` marker or
-  a `_project/` directory, or when the user mentions the `projects` CLI,
-  OpenWorkspace, project tasks/decisions/forum, or asks you to organize work in
-  such a workspace.
+  first finding and maintaining each project's information map (where its
+  tasks, decisions, wiki, plans and coordination canonically live, native or
+  external), then, where a primitive is homed natively, creating and triaging
+  tasks (including reminders-as-tasks and recurring tasks), recording
+  decisions, coordinating with other agents on the forum, navigating projects,
+  and validating with doctor. Use this skill whenever you are operating in a
+  directory tree that contains a `.openworkspace/` marker or a `_project/`
+  directory, or when the user mentions the `projects` CLI, OpenWorkspace,
+  project tasks/decisions/forum, or asks you to organize work in such a
+  workspace.
 ---
 
 # Using OpenWorkspace
 
-OpenWorkspace manages a personal workspace as plain files: **projects are
-directories** (marked by `_project/id`), primitives are Markdown + YAML
-frontmatter (TOML for config), and every view is computed from the live tree.
-The CLI is `projects`. Validate anything you're unsure about with
-`projects doctor`.
+OpenWorkspace's default purpose is to make every project say **where each
+kind of its information canonically lives** — its task tracker, decision log,
+knowledge base, plans, coordination channel, and extras like a credentials
+vault or data stores. That **information map** lives in
+`_project/project.toml` under `[map]` and is rendered into a generated
+"Where information lives" section of the project's `README.md` and
+`AGENTS.md`. OpenWorkspace also ships plain-file **native stores** for tasks,
+decisions, wiki, plans and forum — one option per primitive, chosen à la
+carte, never the default expectation. The CLI is `projects`. Validate
+anything you're unsure about with `projects doctor`.
 
-## The two rules that explain everything
+## First: find where things live
+
+Before you create a task, record a decision or write a wiki page, check the
+project's map — and put the information in its declared home, not wherever
+is convenient:
+
+```sh
+projects map show             # each primitive's home: native, an external system, or "none"
+grep -A20 "Where information lives" README.md   # the same, rendered
+```
+
+- **Native** → use the `projects` verbs below (the store is created by its
+  first write; nothing is scaffolded empty).
+- **External** (GitHub Issues, Teamwork, a wiki URL, a Slack channel, a repo
+  path, …) → go there. The native verbs say so instead of writing here:
+  reads (`task list`, `decision list`, `forum list`) print the pointer, and
+  creates (`task create`, `decision new`, `forum open|post`, `plan open`)
+  **exit 3** with the pointer and write nothing. Never work around exit 3
+  by hand-writing a native file.
+- **"none"** → the project deliberately has no such home; ask before
+  inventing one.
+- **Undeclared** → native writes still work (with a stderr note), but
+  declare the home — or ask the user where it should be.
+
+Keep the map current when a home changes — it is the one thing everyone
+(people and agents) relies on to find information:
+
+```sh
+projects map set tasks https://github.com/acme/widget/issues --locator acme/widget
+projects map set tasks --system Teamwork --url https://acme.teamwork.com/app/projects/42
+projects map set decisions docs/decisions          # a path in this repo
+projects map set wiki native                       # OpenWorkspace's file store
+projects map set forum none                        # not used here
+projects map set credentials --system 1Password --locator "vault Acme"   # any extra key
+projects map unset credentials
+projects map render                                # re-render the README/AGENTS sections (idempotent)
+```
+
+`map set`/`unset` re-render the sections automatically; the block between
+the `openworkspace:information-map` markers is generated — edit the map, not
+the block. Text around the block is never touched. A project with no `[map]`
+at all is a **legacy** project: everything is treated as native, exactly as
+before; `projects map adopt` (dry-run; `--apply` to execute, `--prune-empty`
+to remove stores holding only the old empty skeleton) declares a map from
+what is actually in use.
+
+## Rules for native records
 
 1. **Location encodes visibility and retention for records; project lifecycle
    is metadata-primary.** Live records sit directly in their primitive's
@@ -38,18 +92,22 @@ The CLI is `projects`. Validate anything you're unsure about with
 
 ```sh
 projects home list --all      # what projects exist (live scan; --all includes shelves)
-projects home scan --json     # task/planning view; plain scan is only a summary
-projects show                 # which project am I in (walk-up from cwd)
-projects doctor               # are this project's invariants intact
+projects home scan --json     # task/planning view (+ each project's declared map); plain scan is a summary
+projects show                 # which project am I in (walk-up from cwd) + its information map
+projects doctor               # are this project's invariants intact (incl. the map and its rendered sections)
 cat _project/README.md        # every project carries its own orientation file
 ```
 
 Any directory becomes a project with `projects init [<path>]` (path defaults
 to the cwd, which must be inside a workspace and be neither the workspace
 root nor a shelf root) — or `projects new "Name"` to create a fresh
-directory. Init pre-creates every primitive: `tasks/`, `wiki/`,
-`decisions/`, `automations/`, `forum/`, `plans/current.md`, plus the README
-and a stamped `.gitignore`. Never restamp by hand; never edit `_project/id`.
+directory. Init stamps only `_project/id`, the orientation README, a
+`.gitignore` and `project.toml` with the `[map]`, and renders the map into
+the project's `README.md`/`AGENTS.md` (`--no-docs` skips that). Declare homes
+up front with `--native tasks,wiki` (or `--native all`) and
+`--home tasks=<url>` / `--home forum=none`; otherwise doctor asks for each.
+**No native store is pre-created.** Never restamp by hand; never edit
+`_project/id`.
 
 A project can also live **outside** the workspace tree — typically a git repo
 that is itself a project, kept under `~/Code` (out of iCloud). The workspace
@@ -60,7 +118,7 @@ with `..`), and `projects` commands work from inside it. Its lifecycle is
 metadata-only (nothing ever moves it). Run agents' worktrees of such a repo
 anywhere; worktrees are never discovered or treated as canonical.
 
-## Tasks — including reminders and recurrence
+## Tasks — including reminders and recurrence (when tasks are native)
 
 One file per task, flat in `_project/tasks/`, named `task-<n> - <slug>.md`.
 Subtasks use dotted IDs (`task-36.7`) — parentage lives in the ID alone, no
@@ -104,7 +162,7 @@ catch-up pile). The record stays open; `status` never becomes `done` while
 `recur:` is set. To retire: `projects task recur <id> off`, then close
 normally with a Final Summary.
 
-## Decisions
+## Decisions (when decisions are native)
 
 One short ADR-style record per significant decision in `_project/decisions/`:
 Context / Decision / Consequences, optional `Expected:` line.
@@ -122,7 +180,7 @@ happen* — `decision new` takes two minutes, and an unrecorded decision is the
 primary failure mode this primitive exists to prevent. A rejection worth
 recording is an accepted decision *not* to do the thing.
 
-## Forum — coordination etiquette and the worktree rule
+## Forum — coordination etiquette and the worktree rule (when the forum is native)
 
 The forum (`_project/forum/`) is a blackboard, not a switchboard: threads are
 the only message home, one immutable uniquely-named file per message, history
@@ -195,7 +253,13 @@ project) are cheap — run them:
 - before declaring a migration or multi-file change done,
 - when anything looks off (missing task, odd duplicate, stale thread).
 
-Doctor *proposes*; it never mutates. Exit 1 means errors (schema invariants
+Doctor *proposes*; it never mutates. In a project with a `[map]` it also
+checks that every core primitive has a declared home, that no native store
+sits empty, that a primitive homed elsewhere has no records left in its
+native store, that pointers look resolvable (local paths exist, URLs are
+well-formed — no network calls), and that the README/AGENTS sections exist
+and match the map (`projects map render` fixes those). A legacy project gets
+one info-level "no information map declared" note. Exit 1 means errors (schema invariants
 violated — fix before proceeding); warnings are hygiene proposals (e.g. a
 recurring task lagging behind, a missing git-posture stamp). Typical findings
 and the right response: duplicate IDs after a sync/merge → reconcile by hand,

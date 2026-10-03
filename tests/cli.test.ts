@@ -43,7 +43,9 @@ function makeFixture(): Fixture {
   const init = run(["home", "init"], root, storeDir);
   assert.equal(init.status, 0, init.stderr);
   const projectDir = path.join(root, "CLI: Proj A");
-  const initProj = run(["init", projectDir], root, storeDir);
+  // The fixture project homes every core primitive natively (decision-2:
+  // an explicit, à-la-carte opt-in — nothing is scaffolded empty).
+  const initProj = run(["init", projectDir, "--native", "all"], root, storeDir);
   assert.equal(initProj.status, 0, initProj.stderr);
   return {
     root,
@@ -250,7 +252,7 @@ test("cli: forum flow inside the canonical workspace; doctor flags planted viola
   assert.equal(run(["forum", "archive", "cli-thread"], cwd, fx.storeDir).status, 0);
 
   // plant a violation: state-named subdir under tasks/ → doctor exits 1
-  fs.mkdirSync(path.join(fx.projectDir, "_project", "tasks", "done"));
+  fs.mkdirSync(path.join(fx.projectDir, "_project", "tasks", "done"), { recursive: true });
   const doctor = run(["doctor"], cwd, fx.storeDir);
   assert.equal(doctor.status, 1);
   assert.match(doctor.stdout, /state-named subdirectory/);
@@ -422,6 +424,7 @@ test("cli: forum sweep removes own-machine stale presence and PROPOSES thread ar
   // a stale own-machine presence file + a foreign machine's stale file
   const machineId = fs.readFileSync(path.join(fx.storeDir, "machine-id"), "utf8").trim();
   const presenceDir = path.join(fx.projectDir, "_project", "forum", "presence");
+  fs.mkdirSync(presenceDir, { recursive: true });
   const oldTs = "2026-01-01T00:00:00Z";
   fs.writeFileSync(
     path.join(presenceDir, `${machineId}--old-agent.md`),

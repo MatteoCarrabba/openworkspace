@@ -193,6 +193,32 @@ workspace whose external roots contain `dir`. Primitive scanners
 (tasks/forum/…) must NOT descend across a nested project boundary — use
 `isProjectBoundary` when walking project content.
 
+## `src/lib/infomap.ts` — the information map (decision-2)
+
+The default purpose of OpenWorkspace: each project declares where each kind
+of its information lives. `[map]` in `_project/project.toml` (tool-owned,
+read-modify-write via `writeMapEntry`, preserving every other key).
+
+- `readInfoMap(root)` → `{declared, entries, renderTo, problems}`; never
+  throws. Core primitives (`tasks, decisions, wiki, plans, forum`) first in
+  fixed order, then extras in declaration order. Entry kinds: `native |
+  external | none | undeclared`; sources: `declared | inferred | legacy |
+  undeclared`. No `[map]` ⇒ legacy (all native). In map mode an undeclared
+  core primitive whose native store exists is inferred native.
+- `nativeStoreState(root, prim)` → `absent | empty | populated` (empty =
+  nothing a person wrote: empty dirs, the untouched plan stub, no threads).
+- `writeMapEntry`, `ensureMapDeclared`, `parseHomeShorthand`, `validateSpec`.
+- `renderMapSection` / `applyMapSection` / `renderMapDocs` / `checkMapDocs`
+  — the marker-delimited README/AGENTS block (idempotent; text outside the
+  markers is preserved byte-for-byte).
+- `pointerProblems` (URL well-formedness, local path existence; no network),
+  `describeHome`, `elsewhereMessage` (the CLI's redirect text; exit 3 via
+  `HomeElsewhereError`).
+
+Consumers: `init.ts` (declares + renders at init; `pruneEmptyStores`),
+`doctor.ts` (`infoMapIssues`), `cli.ts` (`projects map`, redirects),
+`dashboard/server.ts` (`ScanProject.map`).
+
 ## `src/lib/locations.ts` — locations config (phase 2: identity/location/discovery split)
 
 ```ts

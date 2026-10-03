@@ -17,6 +17,7 @@ import { test } from "node:test";
 
 import { doctorProject, doctorWorkspace } from "../src/doctor.js";
 import { FORUM_README, PROJECT_GITIGNORE, PROJECT_README, initProject, initWorkspace } from "../src/init.js";
+import { MAP_BEGIN } from "../src/lib/infomap.js";
 import { discoverProjects, openWorkspace } from "../src/lib/workspace.js";
 import * as decisions from "../src/primitives/decisions.js";
 import * as forum from "../src/primitives/forum.js";
@@ -45,35 +46,34 @@ function treeOf(root: string): string[] {
 // 4. init output matches the §4.3 skeleton exactly
 // ---------------------------------------------------------------------------
 
-test("acceptance: projects init stamps exactly the Appendix A / §4.3 skeleton", (t) => {
+test("acceptance: projects init stamps identity + orientation + the information map — no empty stores (decision-2)", (t) => {
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectDir = path.join(tmp, "Colon: And Space Project");
 
-  const { uid } = initProject(projectDir);
+  const { uid, rendered } = initProject(projectDir);
   assert.match(uid, /^[0-9a-f-]{36}$/);
 
+  // No native store is scaffolded: they appear on first write.
   assert.deepEqual(treeOf(path.join(projectDir, "_project")), [
     ".gitignore",
     "README.md",
-    "automations/",
-    "decisions/",
-    "forum/",
-    "forum/README.md",
-    "forum/presence/",
-    "forum/threads/",
     "id",
-    "plans/",
-    "plans/current.md",
-    "tasks/",
-    "wiki/",
+    "project.toml",
   ]);
+  // The map is declared (map mode) but nothing is homed yet.
+  assert.match(fs.readFileSync(path.join(projectDir, "_project", "project.toml"), "utf8"), /^\[map\]$/m);
+  // ...and rendered into the project's README.md and AGENTS.md.
+  assert.deepEqual(rendered, ["README.md", "AGENTS.md"]);
+  for (const doc of ["README.md", "AGENTS.md"]) {
+    const text = fs.readFileSync(path.join(projectDir, doc), "utf8");
+    assert.ok(text.includes(MAP_BEGIN) && text.includes("## Where information lives"), doc);
+  }
 
   // Orientation artifacts are part of the schema deliverable, stamped verbatim.
   assert.equal(fs.readFileSync(path.join(projectDir, "_project", "README.md"), "utf8"), PROJECT_README);
   assert.equal(fs.readFileSync(path.join(projectDir, "_project", ".gitignore"), "utf8"), PROJECT_GITIGNORE);
-  assert.equal(fs.readFileSync(path.join(projectDir, "_project", "forum", "README.md"), "utf8"), FORUM_README);
-  assert.ok(PROJECT_README.includes("## The two rules that explain everything here"));
+  assert.ok(PROJECT_README.includes("## First: where does this project's information live?"));
   assert.ok(FORUM_README.includes("## Arrival protocol"));
   assert.equal(fs.readFileSync(path.join(projectDir, "_project", "id"), "utf8"), uid + "\n");
 
@@ -85,9 +85,32 @@ test("acceptance: projects init stamps exactly the Appendix A / §4.3 skeleton",
   // Re-init refuses: _project/id is write-once.
   assert.throws(() => initProject(projectDir), /already a project/);
 
-  // A freshly stamped project is doctor-clean.
+  // A fresh project with nothing declared: doctor asks for a home per core
+  // primitive — and nothing else.
   const issues = doctorProject(projectDir);
-  assert.deepEqual(issues.map((i) => i.message), []);
+  assert.deepEqual(
+    issues.map((i) => [i.severity, i.message.replace(/:.*$/, "")]),
+    [
+      ["warn", "Tasks & backlog"],
+      ["warn", "Decisions"],
+      ["warn", "Knowledge (wiki)"],
+      ["warn", "Plans"],
+      ["warn", "Coordination (forum)"],
+    ],
+  );
+
+  // Declaring homes at init (à la carte) yields a doctor-clean project.
+  const declared = path.join(tmp, "Declared");
+  initProject(declared, {
+    native: ["tasks", "wiki"],
+    homes: {
+      decisions: { kind: "external", system: "repo", path: "." },
+      plans: { kind: "none" },
+      forum: { kind: "external", system: "Slack", url: "https://example.slack.com/archives/C123" },
+    },
+  });
+  assert.deepEqual(doctorProject(declared).map((i) => i.message), []);
+  assert.deepEqual(treeOf(path.join(declared, "_project")), [".gitignore", "README.md", "id", "project.toml"]);
 });
 
 test("acceptance: home init mints a workspace_id and writes only non-defaults", (t) => {
@@ -164,11 +187,15 @@ test("acceptance: a full operation battery writes records only — no registry/m
   const offenders = tree.filter((p) => forbidden.test(p));
   assert.deepEqual(offenders, []);
 
-  // Every file written lives where the schema says records live.
+  // Every file written lives where the schema says records live (plus the
+  // project docs the information map renders into, decision-2).
   const files = tree.filter((p) => !p.endsWith("/"));
   for (const f of files) {
     assert.ok(
-      f === ".openworkspace/config.toml" || f.startsWith("Proj A/_project/"),
+      f === ".openworkspace/config.toml" ||
+        f.startsWith("Proj A/_project/") ||
+        f === "Proj A/README.md" ||
+        f === "Proj A/AGENTS.md",
       `unexpected write outside the schema: ${f}`,
     );
   }
@@ -208,7 +235,7 @@ test("acceptance: state-named subdirectory under tasks/ is a doctor error", (t) 
   t.after(() => rmrf(tmp));
   const projectDir = path.join(tmp, "Stateful");
   initProject(projectDir);
-  fs.mkdirSync(path.join(projectDir, "_project", "tasks", "todo"));
+  fs.mkdirSync(path.join(projectDir, "_project", "tasks", "todo"), { recursive: true });
   fs.mkdirSync(path.join(projectDir, "_project", "tasks", "archive")); // allowed
 
   const issues = doctorProject(projectDir);

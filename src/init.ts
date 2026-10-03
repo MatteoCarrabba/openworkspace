@@ -5,10 +5,12 @@
  *   marker and mint a workspace_id. config.toml carries only non-default
  *   values (the minted id and schema); everything else stays implicit.
  * - `initProject` — `projects init [<path>]` (path defaults to the cwd, with
- *   cli.ts guard rails): stamp the FULL skeleton — every
- *   designed primitive pre-created, plus the two orientation artifacts
- *   (_project/README.md per Appendix A, forum/README.md) and the committed
- *   git posture (_project/.gitignore, §6.1). No shape flags.
+ *   cli.ts guard rails): stamp the identity (`_project/id`), the orientation
+ *   README, the committed git posture (_project/.gitignore, §6.1) and the
+ *   information map (`project.toml` `[map]`, decision-2), then render the
+ *   map into the project's README.md / AGENTS.md. Native stores are NOT
+ *   pre-created: the map declares which primitives are homed natively, and
+ *   each store is created by its first write (nothing scaffolded empty).
  *
  * Both are refuse-don't-overwrite: re-running against an existing target is a
  * ConflictError, never a silent restamp (hand edits are precious).
@@ -20,6 +22,15 @@ import * as path from "node:path";
 
 import { ConflictError, NotFoundError } from "./lib/errors.js";
 import { createExclusive, ensureDir, readTextIfExists, writeFileAtomic } from "./lib/fsatomic.js";
+import {
+  CorePrimitive,
+  EntrySpec,
+  PLAN_STUB,
+  ensureMapDeclared,
+  renderMapDocs,
+  validateSpec,
+  writeMapEntry,
+} from "./lib/infomap.js";
 import { readTomlIfExists, writeToml } from "./lib/toml.js";
 import { CONFIG_FILE, MARKER_DIR, readProjectUid } from "./lib/workspace.js";
 
@@ -43,20 +54,44 @@ automations/*/logs/
 /archive/
 `;
 
-/** Appendix A — the `_project/README.md` stamped by init. VERBATIM from the PRD. */
+/**
+ * The `_project/README.md` stamped by init. Originally PRD Appendix A
+ * verbatim; reframed by OpenWorkspace decision-2 (2026-10-03): the
+ * information map comes first, native stores are optional and per-primitive.
+ */
 export const PROJECT_README = `# _project/ — OpenWorkspace control plane
 
-This directory holds this project's work-organization records, owned by
-OpenWorkspace (\`projects\` CLI). The project's actual content lives at the
-project root; agent configuration (CLAUDE.md, .claude/) also stays at the
-root, outside this directory.
+This directory holds this project's OpenWorkspace records (\`projects\` CLI).
+The project's actual content lives at the project root; agent configuration
+(CLAUDE.md, AGENTS.md, .claude/) also stays at the root.
 
-## The two rules that explain everything here
+## First: where does this project's information live?
+
+OpenWorkspace's job is to make every project say where each kind of its
+information canonically lives — the task tracker, the decision log, the
+knowledge base, plans, the coordination channel, and anything else worth
+finding (credentials vault, data stores, …). That **information map** is
+declared in \`project.toml\` under \`[map]\` and rendered into a generated
+"Where information lives" section of the project's README.md and AGENTS.md.
+
+    projects map show                      # the map, with each home's state
+    projects map set tasks <url> --system "GitHub Issues" --locator owner/repo
+    projects map set wiki native           # use OpenWorkspace's own file store
+    projects map set forum none            # this project doesn't use one
+    projects map render                    # re-render the README/AGENTS sections
+    projects doctor                        # checks the map and the rendered sections
+
+Each core primitive — tasks, decisions, wiki, plans, forum — is homed
+**à la carte**: an OpenWorkspace native store here, an external system
+(a URL, a system name plus a locator, or a repo path), or "none". When a
+primitive lives elsewhere, the native command prints where instead of
+writing here (\`projects task create\` exits 3 with the pointer).
+
+## The two rules for native records
 
 1. **Location encodes visibility and retention.** Live records sit directly
-   in their primitive's directory; archived records sit in its \`archive/\`
-   subdirectory; a project's lifecycle (active/dormant/archived) is encoded
-   by where the *project folder* sits in the workspace — never by a field.
+   in their store's directory; archived records sit in its \`archive/\`
+   subdirectory. A project's lifecycle is declared in \`project.toml\`.
 2. **Frontmatter encodes workflow state.** A task's \`status:\` (and a
    decision's, a thread's) lives in YAML frontmatter, edited in place.
    Never encode state by moving a record between subdirectories; never
@@ -73,60 +108,39 @@ keys you don't recognize.**
 - \`.gitignore\` — this project's git posture (stamped at init; doctor checks
   it). Ignored material here may still be canonical (synced, backed up) —
   **never run \`git clean -fdx\` in this workspace.**
-- \`project.toml\` — optional; declared facts (e.g. \`lifecycle = "dormant"\`) only.
-- \`plans/current.md\` — the forward-looking plan, in prose. Complements
-  tasks; never a duplicate checkbox list of them.
-- \`tasks/\` — one file per task: \`task-<n> - <slug>.md\`.
-  - **Status** lives in frontmatter: \`todo | doing | waiting | review |
-    done\`. \`done\` requires a \`## Final Summary\` (one line suffices for a
-    judgment call: "Decided: skip").
-  - **Subtasks** use dotted IDs (\`task-36.7\`; parentage lives in the ID
-    alone), flat in the same directory. Keep nesting ≤3 levels — if a
-    child doesn't need its own status/notes, make it an Acceptance
-    Criteria checkbox instead.
-  - **Reminders are tasks.** Set \`hidden_until: <date>\` and the task stays
-    out of default listings until then, then reappears for you to act on,
-    re-hide (\`projects task hide <id> --until <date>\`), or close.
-  - **Recurring tasks** set \`recur: <weekly|monthly|yearly|every-N-days>\`.
-    \`projects task done\` on one completes the *occurrence*: it appends a
-    completion line to \`## Log\` and advances \`hidden_until\` to the next
-    occurrence — the record stays open. A recurring task is never
-    \`status: done\`; to retire it, \`projects task recur <id> off\`, then
-    close it normally.
-- \`wiki/\` — the project's repository of substantive accumulated knowledge:
-  research notes, reference pages, distilled findings, design docs. If the
-  project learned something worth keeping, it goes here.
+- \`project.toml\` — declared facts: the \`[map]\`, \`lifecycle\`, \`[[owns]]\` edges.
+
+Native stores exist only for the primitives the map homes here, and each is
+created by its first write — never scaffolded empty:
+
+- \`tasks/\` — one file per task: \`task-<n> - <slug>.md\`. Status in
+  frontmatter (\`todo | doing | waiting | review | done\`; \`done\` needs a
+  \`## Final Summary\`). Subtasks use dotted IDs (\`task-36.7\`). Reminders
+  are tasks with \`hidden_until: <date>\`; recurring tasks set
+  \`recur: <weekly|monthly|yearly|every-N-days>\`.
 - \`decisions/\` — one short record per significant decision:
   \`decision-<n> - <slug>.md\`, Context / Decision / Consequences. Immutable
-  once accepted; changing course means a new record plus \`superseded_by:\`
-  on the old one. **Record decisions when they happen** —
-  \`projects decision new "<title>"\` takes two minutes.
-- \`automations/\` — scheduled-job definitions: a TOML manifest (cadence,
-  declared target machines, secret *pointers* — never secret values),
-  README, and program. Definitions are intent; nothing runs until
-  \`projects automation apply\` is executed on a declared machine.
-- \`forum/\` — coordination: announce presence (\`projects forum announce
-  --doing "..."\`), check in on workstream threads, ask addressed questions
-  (\`--to <participant>\`). One immutable file per message; never edit or
-  delete another participant's files. Forum verbs always read and write
-  the project's CANONICAL location (so agents in different git worktrees
-  see each other) — never hand-edit \`forum/\` from inside a worktree.
+  once accepted; changing course means a new record plus \`superseded_by:\`.
+- \`wiki/\` — substantive accumulated knowledge: research notes, reference
+  pages, distilled findings, design docs.
+- \`plans/current.md\` — the forward-looking plan, in prose.
+- \`forum/\` — agent coordination: presence, workstream threads, addressed
+  questions. One immutable file per message. Forum verbs always use the
+  project's CANONICAL location — never hand-edit \`forum/\` from a worktree.
+- \`automations/\` — scheduled-job definitions (not part of the map):
+  nothing runs until \`projects automation apply\` on a declared machine.
 
-Tool-created when needed: \`archive/\` (bulk preserved material, e.g.
-migration imports; not tracked in git — durability rides the backup tier)
-and \`dashboard/\` (dashboard config). There are deliberately no other
-directories here; anything else (helper scripts, retrospectives, …) is
-ordinary project content and belongs at the project root.
+Tool-created when needed: \`archive/\` (bulk preserved material; not tracked
+in git) and \`dashboard/\` (dashboard config). Anything else is ordinary
+project content and belongs at the project root.
 
 ## Quick reference
 
+    projects map show · set <key> <home> · unset <key> · render · adopt
     projects task create "title" [--parent 36] [--quadrant q2]
-                                 [--hidden-until 2026-09-01] [--recur weekly]
     projects task list [--subtasks] [--hidden] [--all]
-    projects task status <id> <todo|doing|waiting|review|done>
     projects decision new "title"
     projects forum announce --doing "..." · who · post <thread> "..." · inbox
-    projects automation apply [--all] · status
     projects doctor
 
 ## What never lives here
@@ -184,12 +198,8 @@ is computed from the lexically-last message filename — never stored.
   the project is the channel.
 `;
 
-/** plans/current.md stub — forward-looking prose, never a task mirror. */
-export const PLAN_STUB = `# Current plan
-
-Forward-looking prose: where this project is heading and why. Complements
-the task records in ../tasks/ — never a duplicate checkbox list of them.
-`;
+/** plans/current.md stub — now defined with the information map (store-emptiness checks). */
+export { PLAN_STUB };
 
 // ---------------------------------------------------------------------------
 // projects home init
@@ -397,34 +407,35 @@ export function recordRegistryRunOutcome(
 // projects init [<path>]
 // ---------------------------------------------------------------------------
 
-/** The §4.3 skeleton, relative to _project/. Dirs end with "/". */
-export const SKELETON_ENTRIES = [
-  "README.md",
-  ".gitignore",
-  "id",
-  "plans/",
-  "plans/current.md",
-  "tasks/",
-  "wiki/",
-  "decisions/",
-  "automations/",
-  "forum/",
-  "forum/README.md",
-  "forum/threads/",
-  "forum/presence/",
-] as const;
+/**
+ * What init stamps, relative to _project/. Dirs end with "/". Native stores
+ * are deliberately absent (decision-2): they appear on first write.
+ */
+export const SKELETON_ENTRIES = ["README.md", ".gitignore", "id", "project.toml"] as const;
+
+export interface InitProjectOptions {
+  /** Core primitives homed in OpenWorkspace's native stores. */
+  native?: readonly CorePrimitive[];
+  /** Other declared homes (external pointers or "none"), by map key. */
+  homes?: Readonly<Record<string, EntrySpec>>;
+  /** Render the map into README.md / AGENTS.md (default true). */
+  renderDocs?: boolean;
+}
 
 export interface InitProjectResult {
   projectRoot: string;
   uid: string;
+  /** Docs the map section was rendered into (project-root-relative). */
+  rendered: string[];
 }
 
 /**
- * Stamp the full project skeleton at `dir` (creating the directory when
- * absent). Refuses when `dir` is already a project (write-once `_project/id`).
- * No shape flags: every designed primitive is pre-created (PRD §4.3).
+ * Stamp a project at `dir` (creating the directory when absent). Refuses when
+ * `dir` is already a project (write-once `_project/id`). Declares the
+ * information map from `options` (undeclared primitives stay undeclared —
+ * doctor then asks for a home) and renders it into the project docs.
  */
-export function initProject(dir: string): InitProjectResult {
+export function initProject(dir: string, options: InitProjectOptions = {}): InitProjectResult {
   const projectRoot = path.resolve(dir);
   const existingUid = readProjectUid(projectRoot);
   if (existingUid !== null) {
@@ -432,6 +443,12 @@ export function initProject(dir: string): InitProjectResult {
       `already a project (uid ${existingUid}): ${projectRoot} — _project/id is write-once`,
     );
   }
+  // Validate every requested home BEFORE touching disk.
+  const specs: Array<[string, EntrySpec]> = [];
+  for (const prim of options.native ?? []) specs.push([prim, { kind: "native" }]);
+  for (const [key, spec] of Object.entries(options.homes ?? {})) specs.push([key, spec]);
+  for (const [key, spec] of specs) validateSpec(key, spec);
+
   const p = path.join(projectRoot, "_project");
   ensureDir(p);
 
@@ -440,22 +457,78 @@ export function initProject(dir: string): InitProjectResult {
   // race to a concurrent init must not half-stamp two skeletons.
   createExclusive(path.join(p, "id"), uid + "\n");
 
-  ensureDir(path.join(p, "plans"));
-  ensureDir(path.join(p, "tasks"));
-  ensureDir(path.join(p, "wiki"));
-  ensureDir(path.join(p, "decisions"));
-  ensureDir(path.join(p, "automations"));
-  ensureDir(path.join(p, "forum", "threads"));
-  ensureDir(path.join(p, "forum", "presence"));
-
   const stamp = (rel: string, content: string): void => {
     const target = path.join(p, rel);
     if (!fs.existsSync(target)) createExclusive(target, content);
   };
   stamp("README.md", PROJECT_README);
   stamp(".gitignore", PROJECT_GITIGNORE);
-  stamp(path.join("plans", "current.md"), PLAN_STUB);
-  stamp(path.join("forum", "README.md"), FORUM_README);
 
-  return { projectRoot, uid };
+  ensureMapDeclared(projectRoot);
+  for (const [key, spec] of specs) writeMapEntry(projectRoot, key, spec);
+
+  const rendered =
+    options.renderDocs === false ? [] : renderMapDocs(projectRoot).map((r) => r.file);
+  return { projectRoot, uid, rendered };
+}
+
+// ---------------------------------------------------------------------------
+// Pruning empty native stores (`projects map adopt --prune-empty`)
+// ---------------------------------------------------------------------------
+
+const IGNORABLE_FILES = new Set([".DS_Store", ".gitkeep"]);
+
+/**
+ * True when `dir` holds nothing a person wrote: only (nested) directories,
+ * ignorable files, and files byte-equal to a known stamped stub.
+ */
+function onlyStubs(dir: string, stubs: ReadonlyMap<string, string>, rel = ""): boolean {
+  let ents: fs.Dirent[];
+  try {
+    ents = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const ent of ents) {
+    const entRel = rel === "" ? ent.name : `${rel}/${ent.name}`;
+    const full = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      if (!onlyStubs(full, stubs, entRel)) return false;
+    } else if (ent.isFile()) {
+      if (IGNORABLE_FILES.has(ent.name)) continue;
+      const stub = stubs.get(entRel);
+      if (stub === undefined || readTextIfExists(full) !== stub) return false;
+    } else {
+      return false; // symlinks etc.: never prune
+    }
+  }
+  return true;
+}
+
+/** The legacy skeleton's store dirs and their stamped stubs (relative to the store). */
+const PRUNABLE_STORES: ReadonlyArray<{ rel: string; stubs: ReadonlyMap<string, string> }> = [
+  { rel: "tasks", stubs: new Map() },
+  { rel: "decisions", stubs: new Map() },
+  { rel: "wiki", stubs: new Map() },
+  { rel: "plans", stubs: new Map([["current.md", PLAN_STUB]]) },
+  { rel: "forum", stubs: new Map([["README.md", FORUM_README]]) },
+  { rel: "automations", stubs: new Map() },
+];
+
+/**
+ * Remove the native store directories that hold nothing but the old
+ * skeleton (empty dirs, the untouched plan stub, the stamped forum README).
+ * Anything with real content is left untouched. Returns the removed
+ * `_project/`-relative paths (or, with dryRun, what would be removed).
+ */
+export function pruneEmptyStores(projectRoot: string, options: { dryRun?: boolean } = {}): string[] {
+  const removed: string[] = [];
+  for (const store of PRUNABLE_STORES) {
+    const dir = path.join(projectRoot, "_project", store.rel);
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) continue;
+    if (!onlyStubs(dir, store.stubs)) continue;
+    if (options.dryRun !== true) fs.rmSync(dir, { recursive: true });
+    removed.push(`_project/${store.rel}/`);
+  }
+  return removed;
 }

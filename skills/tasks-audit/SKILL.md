@@ -19,6 +19,8 @@ Walks the task corpus and reports quality issues. Read-only — does not modify 
    - Default: all `~/Documents/*/_project/tasks/` (cross-project; excludes `Dormant Projects/*` and `Archives/*` by default).
    - If user passes a project name, scope to that project only.
 
+   - Projects whose information map homes tasks externally (`projects map show`; e.g. GitHub Issues or Teamwork) have no native corpus to audit — list them with their pointer instead. Any native task records still sitting in such a project are themselves a finding (migrate, then remove).
+
 2. **Gather data**: run `projects home scan` for the default cross-project scope, or `projects task list` for a single project. Parse.
 
 3. **Run checks**:
