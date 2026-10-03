@@ -110,6 +110,15 @@ together 2026-07-08):
   **cataloged** for hub-phase removal (`_project/wiki/compute-plane-
   vestigial-catalog.md`) rather than deleted, since live laptop automations
   still depend on it.
+- **The information map** (2026-10-03, decision-2 in this repo) — the
+  package's default purpose is now each project's declared map of where its
+  information lives (`[map]` in `project.toml`, rendered into README.md /
+  AGENTS.md); native stores are opt-in per primitive and created on first
+  write. Storage-plane posture is unchanged: the map is a tool-owned
+  declared-facts file like `lifecycle`/`[[owns]]`; the warm model reads it
+  at (re)build time and serves it as `ScanProject.map` (refreshed by the
+  periodic self-heal rebuild, not by `fs.watch`, which still watches only
+  `tasks/`).
 
 Phase 4 (the hub) is explicitly deferred, gated on token rotation
 (Personal OS task-201).
