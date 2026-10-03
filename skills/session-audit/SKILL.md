@@ -22,6 +22,11 @@ Pre-summary readiness check. Runs against whatever project the current working d
 
 For each project touched in the session, run these checks. Report findings grouped by check; *do not auto-fix without confirming* unless the fix is obviously safe (e.g., updating a one-line README pointer).
 
+### 0. The information map is current
+
+- **Records went to their declared homes.** For each project touched, `projects map show` (or the README/AGENTS "Where information lives" section) says where tasks, decisions, knowledge, plans and coordination live. Work recorded this session belongs in those homes — a decision that belongs in an external wiki, or a task that belongs in GitHub Issues, is a finding if it was written into a native `_project/` store instead.
+- **A home that changed this session is declared.** If the session moved where something lives (a new tracker, a new wiki page tree, a repo path for ADRs), check `projects map set …` was run and `projects doctor` reports no map findings. Checks 1–2 below apply to whichever homes are native.
+
 ### 1. Backlog hygiene
 
 - **Completed work has `## Final Summary`.** For every task moved to `done` in this session, the task file must have a populated `## Final Summary` section. Tasks marked done without one fail the audit.

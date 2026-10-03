@@ -42,6 +42,7 @@ import * as path from "node:path";
 import { FrontmatterRecord, readRecord } from "../lib/frontmatter.js";
 import { ConfigError, ConflictError, NotFoundError, OwError } from "../lib/errors.js";
 import { sha256Hex } from "../lib/fsatomic.js";
+import { readInfoMap } from "../lib/infomap.js";
 import { ParsedId, formatId, idFromFilename, parseId } from "../lib/ids.js";
 import { STORE_DIR_ENV, defaultStoreDir, openMachineStore } from "../lib/machine.js";
 import { TomlTable, readTomlIfExists } from "../lib/toml.js";
@@ -128,6 +129,34 @@ export interface ScanProject {
   taskCounts: { total: number; done: number; hidden: number };
   /** `<root>/.obsidian` exists — lets the client show an "Open in Obsidian" control. */
   hasObsidianVault: boolean;
+  /** The declared information map (decision-2); null for a legacy project with no [map]. */
+  map: ScanMapEntry[] | null;
+}
+
+/** One information-map entry as the dashboard shows it (where a kind of information lives). */
+export interface ScanMapEntry {
+  key: string;
+  label: string;
+  kind: "native" | "external" | "none" | "undeclared";
+  system: string | null;
+  url: string | null;
+  locator: string | null;
+  path: string | null;
+}
+
+/** The project's declared information map for the scan; null when none is declared. */
+export function scanMapOf(projectRoot: string): ScanMapEntry[] | null {
+  const map = readInfoMap(projectRoot);
+  if (!map.declared) return null;
+  return map.entries.map((e) => ({
+    key: e.key,
+    label: e.label,
+    kind: e.kind,
+    system: e.system,
+    url: e.url,
+    locator: e.locator,
+    path: e.path,
+  }));
 }
 
 export interface ScanResult {
@@ -498,6 +527,7 @@ interface ProjectScanData {
   info: ProjectInfo;
   tasks: ScanTask[];
   issues: DoctorIssue[];
+  map: ScanMapEntry[] | null;
 }
 
 /**
@@ -510,7 +540,7 @@ function assembleScanResult(ws: Workspace, now: Date, projectData: readonly Proj
   const taskIssues: DoctorIssue[] = [];
   const projects: ScanProject[] = [];
 
-  for (const { info, tasks, issues } of projectData) {
+  for (const { info, tasks, issues, map } of projectData) {
     taskIssues.push(...issues);
     projects.push({
       uid: info.uid,
@@ -526,6 +556,7 @@ function assembleScanResult(ws: Workspace, now: Date, projectData: readonly Proj
       },
       // Cheap: one stat per project per scan, no directory walk.
       hasObsidianVault: fs.existsSync(path.join(info.root, ".obsidian")),
+      map,
     });
   }
 
@@ -574,7 +605,7 @@ export function scanWorkspace(
   const infos = discoverProjects(ws, { all: true });
   const projectData: ProjectScanData[] = infos.map((info) => {
     const { tasks, issues } = scanProjectTasks(info, now, { includeBodies: options.includeTaskBodies ?? true });
-    return { info, tasks, issues };
+    return { info, tasks, issues, map: scanMapOf(info.root) };
   });
   return assembleScanResult(ws, now, projectData);
 }
@@ -1044,6 +1075,8 @@ interface ModelTaskFile {
 
 interface ModelProject {
   info: ProjectInfo;
+  /** Read at (re)build time; refreshed by the periodic self-heal rebuild. */
+  map: ScanMapEntry[] | null;
   tasksDir: string;
   files: Map<string, ModelTaskFile>; // fileName -> parsed file
   idToFile: Map<string, string>; // task id -> fileName (best-effort; duplicates keep the last-seen file)
@@ -1082,7 +1115,7 @@ function buildModelProject(info: ProjectInfo, now: Date): ModelProject {
     files.set(entry.name, file);
     idToFile.set(file.task.id, entry.name);
   }
-  return { info, tasksDir, files, idToFile };
+  return { info, map: scanMapOf(info.root), tasksDir, files, idToFile };
 }
 
 /**
@@ -1217,7 +1250,7 @@ export class WarmModel {
     const now = this.nowFn();
     const projectData: ProjectScanData[] = this.projects.map((mp) => {
       const { tasks, issues } = projectView(mp, includeBodies, now);
-      return { info: mp.info, tasks, issues };
+      return { info: mp.info, tasks, issues, map: mp.map };
     });
     return assembleScanResult(this.ws, now, projectData);
   }

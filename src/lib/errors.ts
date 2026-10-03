@@ -59,6 +59,20 @@ export class ResolveError extends OwError {
   }
 }
 
+/**
+ * The information map (decision-2, OpenWorkspace) says this primitive's
+ * canonical home is NOT a native OpenWorkspace store — it lives in an
+ * external system, is declared unused, or has no declared home yet. Nothing
+ * was written; the message says where the information lives (or how to
+ * declare a home). Exit code 3 so scripts can tell "redirected" from
+ * "failed".
+ */
+export class HomeElsewhereError extends OwError {
+  constructor(message: string) {
+    super("EELSEWHERE", message, 3);
+  }
+}
+
 /** A mint lock could not be acquired within the timeout. */
 export class LockError extends OwError {
   constructor(message: string) {

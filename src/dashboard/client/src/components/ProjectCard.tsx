@@ -3,7 +3,45 @@ import { useStore } from "../store";
 import { revealProject } from "../api";
 import { buildTaskTree, taskMatchesFilters } from "../taskTree";
 import { TaskBranch } from "./TaskBranch";
-import type { ScanProject, ViewState } from "../types";
+import type { ScanMapEntry, ScanProject, ViewState } from "../types";
+
+/** Where one kind of information lives — a link when the home is a URL. */
+function MapHome({ e }: { e: ScanMapEntry }): React.JSX.Element {
+  const label = e.label;
+  if (e.kind === "external") {
+    const name = e.system ?? (e.path !== null ? "local path" : "external");
+    const detail = e.locator ?? e.path;
+    const text = name + (detail !== null ? " · " + detail : "");
+    return (
+      <span className="map-home external" title={label + ": " + text}>
+        <span className="map-label">{label}</span>{" "}
+        {e.url !== null ? (
+          <a href={e.url} target="_blank" rel="noopener noreferrer">
+            {text} ↗
+          </a>
+        ) : (
+          <span>{text}</span>
+        )}
+      </span>
+    );
+  }
+  const text = e.kind === "native" ? "native" : e.kind === "none" ? "not used" : "undeclared";
+  return (
+    <span className={"map-home " + e.kind} title={label + ": " + text}>
+      <span className="map-label">{label}</span> {text}
+    </span>
+  );
+}
+
+function MapStrip({ map }: { map: ScanMapEntry[] }): React.JSX.Element {
+  return (
+    <div className="map-strip" aria-label="Where information lives">
+      {map.map((e) => (
+        <MapHome key={e.key} e={e} />
+      ))}
+    </div>
+  );
+}
 
 export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React.JSX.Element {
   const { collapsedProjects, toggleProjectCollapsed } = useStore();
@@ -23,6 +61,9 @@ export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React
   const summary = visible.length
     ? open.length + " open" + (done.length ? " · " + done.length + " done" : "")
     : "0 visible";
+
+  const tasksHome = p.map?.find((e) => e.key === "tasks") ?? null;
+  const tasksElsewhere = tasksHome !== null && tasksHome.kind === "external";
 
   const openTree = buildTaskTree(open);
   const doneTree = buildTaskTree(done);
@@ -78,8 +119,22 @@ export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React
           ) : null}
         </span>
       </h2>
+      {!collapsed && p.map ? <MapStrip map={p.map} /> : null}
       {collapsed ? null : visible.length === 0 ? (
-        <div className="empty">No visible tasks</div>
+        tasksElsewhere && tasksHome ? (
+          <div className="empty">
+            Tasks live in{" "}
+            {tasksHome.url !== null ? (
+              <a href={tasksHome.url} target="_blank" rel="noopener noreferrer">
+                {tasksHome.system ?? tasksHome.url} ↗
+              </a>
+            ) : (
+              (tasksHome.system ?? "an external system") + (tasksHome.locator ? " · " + tasksHome.locator : "")
+            )}
+          </div>
+        ) : (
+          <div className="empty">No visible tasks</div>
+        )
       ) : (
         <>
           {open.length ? (

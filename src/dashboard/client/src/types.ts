@@ -50,6 +50,18 @@ export interface ScanProject {
   tasks: ScanTask[];
   taskCounts: { total: number; done: number; hidden: number };
   hasObsidianVault: boolean;
+  /** Declared information map (where each kind of information lives); null when none is declared. */
+  map?: ScanMapEntry[] | null;
+}
+
+export interface ScanMapEntry {
+  key: string;
+  label: string;
+  kind: "native" | "external" | "none" | "undeclared";
+  system: string | null;
+  url: string | null;
+  locator: string | null;
+  path: string | null;
 }
 
 export interface ScanResult {

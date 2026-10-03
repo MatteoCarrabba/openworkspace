@@ -30,6 +30,7 @@ A reminder-shaped task can be lighter than a work-shaped one (no full ACs / Defi
 
 ## Prerequisites
 
+- **Check where this project's tasks live first** (`projects map show`, or the "Where information lives" section of the project's README/AGENTS.md). If the information map homes tasks in an external tracker (GitHub Issues, Teamwork, …), create the task there, not here — `projects task create` exits 3 and prints the pointer instead of writing a native file. Never work around that by hand-writing a file under `_project/tasks/`.
 - A `_project/` control plane must exist in the current working directory or an ancestor (the `_project/tasks/` directory is where the task lands). If not, scaffold the project first with the `projects` CLI (ask the user before initializing — that's a meaningful project setup choice, not a side-effect).
 
 ## Protocol

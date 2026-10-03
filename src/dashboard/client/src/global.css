@@ -111,6 +111,10 @@ details > summary::before { content: "▸ "; }
 details[open] > summary::before { content: "▾ "; }
 .indent { margin-left: 22px; border-left: 1px solid var(--line); }
 .empty { color: var(--muted); padding: 20px; text-align: center; }
+.map-strip { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 4px 14px 8px; font-size: 12px; color: var(--muted); }
+.map-home .map-label { font-weight: 600; }
+.map-home.undeclared { font-style: italic; }
+.map-home a { color: inherit; text-decoration: underline; }
 
 aside { border-left: 1px solid var(--line); background: var(--panel); padding: 16px; overflow: auto; overflow-wrap: break-word; }
 aside h3 { margin: 0 0 4px; font-size: 15px; }

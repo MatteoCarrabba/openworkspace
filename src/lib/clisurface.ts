@@ -23,6 +23,7 @@ export const CLI_SURFACE: Readonly<Record<string, ReadonlySet<string> | null>> =
   lifecycle: null,
   reconcile: null, // decision-2: heal location⟷metadata drift
 
+  map: new Set(["show", "set", "unset", "render", "adopt"]), // decision-2: the information map
   task: new Set([
     "create", "list", "show", "edit", "note", "status", "done", "hide", "recur", "archive",
   ]),
