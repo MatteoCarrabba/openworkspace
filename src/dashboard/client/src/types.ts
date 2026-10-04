@@ -52,6 +52,8 @@ export interface ScanProject {
   hasObsidianVault: boolean;
   /** Declared information map (where each kind of information lives); null when none is declared. */
   map?: ScanMapEntry[] | null;
+  /** "map-only": no _project/ folder — the map lives in the README/AGENTS block (decision-3). */
+  form?: "folder" | "map-only";
 }
 
 export interface ScanMapEntry {

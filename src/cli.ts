@@ -18,7 +18,15 @@ import { parseArgs } from "node:util";
 
 import { doctorProjectReport, doctorWorkspace, DoctorReport } from "./doctor.js";
 import { ImportPlan, applyLegacyImport, planLegacyImport, renderPlan } from "./importers.js";
-import { initProject, initWorkspace, pruneEmptyStores, updateMachineRegistry } from "./init.js";
+import {
+  convertToMapOnly,
+  ensureProjectFolder,
+  initProject,
+  initWorkspace,
+  planToMapOnly,
+  pruneEmptyStores,
+  updateMachineRegistry,
+} from "./init.js";
 import { scanWorkspace, startDashboard } from "./dashboard/server.js";
 import { ConfigError, ConflictError, HomeElsewhereError, NotFoundError, OwError, ResolveError } from "./lib/errors.js";
 import {
@@ -40,6 +48,7 @@ import {
   parseHomeShorthand,
   readInfoMap,
   renderMapDocs,
+  validateSpec,
   writeMapEntry,
 } from "./lib/infomap.js";
 import {
@@ -138,10 +147,13 @@ Locations (phase 2 — the workspace root lives in config, not just "wherever cw
                                            discovery is always a live tree walk, so there is nothing to rebuild yet)
 
 Projects
-  projects init [<path>] [--native <prims>] [--home <key>=<home> ...] [--no-docs]
-                                          make a project (default: the cwd): _project/id + README + .gitignore +
-                                          the information map; NO native stores are pre-created
-  projects new <name> [--parent <ref>] [--kind subproject|code|remote] [--native ...] [--home ...] [--no-docs]
+  projects init [<path>] [--native <prims>] [--home <key>=<home> ...] [--folder] [--no-docs]
+                                          make a project (default: the cwd). Without a native store it is MAP-ONLY:
+                                          no _project/ folder; the map + uid live in a TOML block inside the
+                                          README.md (and AGENTS.md) "Where information lives" section. With --native
+                                          (or --folder / --no-docs): _project/id + README + .gitignore + project.toml.
+                                          NO native stores are pre-created either way
+  projects new <name> [--parent <ref>] [--kind subproject|code|remote] [--native ...] [--home ...] [--folder] [--no-docs]
                                           create ./<name>/ and init it (--parent links it under a parent via [[owns]])
     --native tasks,wiki | all             home these core primitives in OpenWorkspace's native stores
     --home tasks=<url>|<path>|none        declare another home (repeatable); details via \`projects map set\`
@@ -165,6 +177,10 @@ Information map (where each kind of project information canonically lives — th
   projects map adopt [--apply] [--prune-empty] [--json]
                                           legacy project → declared map: populated native stores become "native";
                                           --prune-empty removes stores holding only the old empty skeleton
+  projects map adopt --map-only [--apply] no native store left: move the map + uid into the README/AGENTS block
+                                          and remove _project/ (only when nothing but stamps/empty stores remain)
+  projects map adopt --folder [--apply]   map-only → give the project a _project/ folder (the map moves into
+                                          project.toml); \`map set <prim> native\` and a first native write do this too
   All map verbs take [--project <ref>]. A native command whose primitive lives elsewhere prints the
   pointer instead (reads) or exits 3 without writing (task create, decision new, forum open/post, plan open);
   an undeclared primitive still writes natively, with a note asking you to declare it.
@@ -297,7 +313,7 @@ function resolveProject(ref: string | undefined): { root: string; uid: string } 
     const found = findProjectRoot(process.cwd());
     if (found === null) {
       throw new NotFoundError(
-        `not inside a project (no _project/id walking up from ${process.cwd()}); pass --project <ref>`,
+        `not inside a project (no _project/id or map-only README/AGENTS block walking up from ${process.cwd()}); pass --project <ref>`,
       );
     }
     return found;
@@ -569,7 +585,7 @@ function cmdHome(argv: string[]): void {
             locationOfDeclared(p.effectiveLifecycle) !== p.lifecycle
               ? `drift: at ${p.lifecycle}, reconcile`
               : null;
-          const tags = [p.effectiveLifecycle, p.nestedUnder !== null ? "nested" : null, drift]
+          const tags = [p.effectiveLifecycle, p.form === "map-only" ? "map-only" : null, p.nestedUnder !== null ? "nested" : null, drift]
             .filter((x) => x !== null)
             .join(", ");
           print(`${p.relPath}  (${tags})  ${p.uid}`);
@@ -655,12 +671,14 @@ const FLAG_MAP_INIT: Spec = {
   native: { type: "string", multiple: true },
   home: { type: "string", multiple: true },
   "no-docs": { type: "boolean", default: false },
+  folder: { type: "boolean", default: false },
 };
 
 function initMapOptions(values: Record<string, unknown>): {
   native: CorePrimitive[];
   homes: Record<string, EntrySpec>;
   renderDocs: boolean;
+  folder: boolean;
 } {
   const native: CorePrimitive[] = [];
   for (const raw of (values["native"] as string[] | undefined) ?? []) {
@@ -676,13 +694,21 @@ function initMapOptions(values: Record<string, unknown>): {
     if (eq <= 0) throw new ConfigError(`--home expects <key>=<native|none|url|path>, got "${raw}"`);
     homes[raw.slice(0, eq).trim()] = parseHomeShorthand(raw.slice(eq + 1));
   }
-  return { native: [...new Set(native)], homes, renderDocs: values["no-docs"] !== true };
+  return {
+    native: [...new Set(native)],
+    homes,
+    renderDocs: values["no-docs"] !== true,
+    folder: values["folder"] === true,
+  };
 }
 
 function printInitMapHint(root: string, rendered: string[]): void {
   const map = readInfoMap(root);
   const undeclared = map.entries.filter((e) => e.core && e.kind === "undeclared").map((e) => e.key);
-  if (rendered.length > 0) print(`  "Where information lives" rendered into ${rendered.join(", ")}`);
+  if (map.form === "map-only") {
+    print(`  map-only: no _project/ folder — the map and uid live in the ${map.source} information-map block (the source of truth)`);
+    if (rendered.length > 0) print(`  "Where information lives" written into ${rendered.join(", ")}`);
+  } else if (rendered.length > 0) print(`  "Where information lives" rendered into ${rendered.join(", ")}`);
   if (undeclared.length > 0) {
     print(`  no declared home yet for: ${undeclared.join(", ")} — declare each with \`projects map set <key> native|none|<url>\``);
   }
@@ -765,6 +791,7 @@ function projectView(root: string, uid: string): Record<string, unknown> {
     locatedLifecycle: ws !== null ? lifecycleOf(ws, root) : null,
     declaredLifecycle: declared.lifecycle,
     inWorktree: isGitWorktree(root),
+    form: readInfoMap(root).form,
     map: mapView(root),
   };
 }
@@ -779,6 +806,7 @@ function cmdShow(argv: string[]): void {
     print(`  root:      ${root}`);
     print(`  uid:       ${uid}`);
     print(`  lifecycle: ${String(view["lifecycle"] ?? "unknown (outside any workspace)")}`);
+    print(`  form:      ${view["form"] === "map-only" ? "map-only (no _project/ folder; the map lives in README.md/AGENTS.md)" : "_project/ folder"}`);
     print("");
     printMap(root);
   }
@@ -1794,16 +1822,42 @@ function cmdForum(argv: string[]): void {
  * drainable.
  */
 function requireNativeHome(root: string, prim: CorePrimitive): void {
-  const e = homeOf(root, prim);
-  if (e.kind === "native") return;
+  const map = readInfoMap(root);
+  const e = entryOf(map, prim) as MapEntry;
+  if (e.kind === "native") {
+    promoteForNativeWrite(root, map.form, prim);
+    return;
+  }
   if (e.kind === "undeclared") {
     process.stderr.write(
       `note: ${path.basename(root)} declares no home for ${prim}; writing to the native store ` +
         `(_project/${NATIVE_STORE[prim]}). Declare it: \`projects map set ${prim} native\` — or point it elsewhere.\n`,
     );
+    promoteForNativeWrite(root, map.form, prim);
     return;
   }
-  throw new HomeElsewhereError(elsewhereMessage(e, path.basename(root)));
+  throw new HomeElsewhereError(elsewhereMessage(e, path.basename(root), mapSourceLabel(map)));
+}
+
+/**
+ * decision-3: a map-only project has no `_project/` folder. The first native
+ * write creates it — the map moves from the README/AGENTS block into
+ * `_project/project.toml` (one source of truth) before the store is written.
+ */
+function promoteForNativeWrite(root: string, form: string | null, prim: string): void {
+  if (form !== "map-only") return;
+  const result = ensureProjectFolder(root);
+  if (result.converted) {
+    process.stderr.write(
+      `note: ${path.basename(root)} was map-only; created _project/ for its first native store (${prim}) — ` +
+        `the map now lives in _project/project.toml${result.rendered.length > 0 ? ` (re-rendered ${result.rendered.join(", ")})` : ""}\n`,
+    );
+  }
+}
+
+/** Where a map is declared, for messages. */
+function mapSourceLabel(map: { form: string | null; source: string }): string {
+  return map.form === "map-only" ? `the ${map.source} information-map block` : "_project/project.toml [map]";
 }
 
 /**
@@ -1812,9 +1866,10 @@ function requireNativeHome(root: string, prim: CorePrimitive): void {
  * then show any native records that remain. Returns true when elsewhere.
  */
 function noteHomeElsewhere(root: string, prim: CorePrimitive, json: boolean): boolean {
-  const e = homeOf(root, prim);
+  const map = readInfoMap(root);
+  const e = entryOf(map, prim) as MapEntry;
   if (e.kind === "native" || e.kind === "undeclared") return false;
-  const msg = elsewhereMessage(e, path.basename(root));
+  const msg = elsewhereMessage(e, path.basename(root), mapSourceLabel(map));
   if (json) process.stderr.write(msg + "\n");
   else print(msg);
   return true;
@@ -1822,7 +1877,19 @@ function noteHomeElsewhere(root: string, prim: CorePrimitive, json: boolean): bo
 
 function forumElsewhere(values: Record<string, unknown>): boolean {
   const { root } = resolveProject(values["project"] as string | undefined);
-  return noteHomeElsewhere(root, "forum", values["json"] === true);
+  if (noteHomeElsewhere(root, "forum", values["json"] === true)) return true;
+  // decision-3: a map-only project has no native forum — presence must never
+  // conjure a `_project/` folder. (forum open/post create it via the map.)
+  const map = readInfoMap(root);
+  if (map.form === "map-only") {
+    const msg =
+      `${path.basename(root)} is a map-only project with no native forum — ` +
+      "declare one with `projects map set forum native` (creates _project/), or point it elsewhere.";
+    if (values["json"] === true) process.stderr.write(msg + "\n");
+    else print(msg);
+    return true;
+  }
+  return false;
 }
 
 function sourceTag(e: MapEntry, root: string): string {
@@ -1840,9 +1907,11 @@ function sourceTag(e: MapEntry, root: string): string {
 function printMap(root: string): void {
   const map = readInfoMap(root);
   print(
-    map.declared
-      ? `Where information lives — ${path.basename(root)} (declared in _project/project.toml [map])`
-      : `Where information lives — ${path.basename(root)} (legacy: no [map] declared; every primitive treated as native — \`projects map adopt\`)`,
+    map.form === "map-only"
+      ? `Where information lives — ${path.basename(root)} (map-only: declared in the ${map.source} information-map block; no _project/ folder)`
+      : map.declared
+        ? `Where information lives — ${path.basename(root)} (declared in _project/project.toml [map])`
+        : `Where information lives — ${path.basename(root)} (legacy: no [map] declared; every primitive treated as native — \`projects map adopt\`)`,
   );
   const width = Math.max(...map.entries.map((e) => e.label.length)) + 2;
   for (const e of map.entries) {
@@ -1898,6 +1967,13 @@ function cmdMap(argv: string[]): void {
       for (const k of ["system", "url", "locator", "path", "note", "label"] as const) {
         if (flag(k) !== undefined) spec[k] = flag(k) as string;
       }
+      // decision-3: enabling the first native store gives a map-only project its
+      // `_project/` folder; the map moves there and stays the one source of truth.
+      let promoted = false;
+      if (spec.kind === "native" && isCorePrimitive(key) && readInfoMap(root).form === "map-only") {
+        validateSpec(key, spec);
+        promoted = ensureProjectFolder(root).converted;
+      }
       writeMapEntry(root, key, spec);
       const rendered = values["no-render"] === true ? [] : renderMapDocs(root).filter((r) => r.changed);
       const entry = entryOf(readInfoMap(root), key) as MapEntry;
@@ -1906,10 +1982,11 @@ function cmdMap(argv: string[]): void {
           ? nativeRecordCount(root, key)
           : 0;
       if (values["json"] === true) {
-        printJson({ entry, rendered: rendered.map((r) => r.file), nativeRecordsRemaining: remaining });
+        printJson({ entry, rendered: rendered.map((r) => r.file), nativeRecordsRemaining: remaining, createdProjectFolder: promoted });
         return;
       }
       print(`map.${key} → ${describeHome(entry).replace(/[`<>]/g, "")}`);
+      if (promoted) print("  created _project/ (first native store): the map moved from the README/AGENTS block into _project/project.toml");
       if (spec.kind === "native" && isCorePrimitive(key) && nativeStoreState(root, key) === "absent") {
         print(`  (_project/${NATIVE_STORE[key]} is created by the first write)`);
       }
@@ -1954,9 +2031,22 @@ function cmdMap(argv: string[]): void {
         apply: { type: "boolean", default: false },
         "dry-run": { type: "boolean", default: false },
         "prune-empty": { type: "boolean", default: false },
+        "map-only": { type: "boolean", default: false },
+        folder: { type: "boolean", default: false },
       });
       const { root } = resolveProject(values["project"] as string | undefined);
       const apply = values["apply"] === true && values["dry-run"] !== true;
+      if (values["map-only"] === true && values["folder"] === true) {
+        throw new ConfigError("--map-only and --folder are opposites — pick one");
+      }
+      if (values["map-only"] === true) {
+        adoptMapOnly(root, apply, values["json"] === true);
+        return;
+      }
+      if (values["folder"] === true) {
+        adoptFolder(root, apply, values["json"] === true);
+        return;
+      }
       const map = readInfoMap(root);
       const declare: CorePrimitive[] = [];
       const decide: CorePrimitive[] = [];
@@ -1992,11 +2082,70 @@ function cmdMap(argv: string[]): void {
       if (decide.length > 0) {
         print(`  still to decide (no content here to infer from): ${decide.join(", ")} — \`projects map set <key> native|none|<url>\``);
       }
+      if (map.form === "folder") {
+        const mo = planToMapOnly(root);
+        if (mo.eligible) {
+          print("  no native store is in use: this project can drop _project/ — `projects map adopt --map-only --apply`");
+        }
+      }
       return;
     }
     default:
       throw new ConfigError(`unknown map subcommand: ${sub ?? "(none)"} (expected show|set|unset|render|adopt)`);
   }
+}
+
+/**
+ * `projects map adopt --map-only`: a folder project whose stores are all
+ * retired moves its map (and uid, lifecycle, owns) into the README/AGENTS
+ * block and drops `_project/` — only when nothing but the tool's own stamps
+ * and empty stores is left in it (decision-3).
+ */
+function adoptMapOnly(root: string, apply: boolean, json: boolean): void {
+  const plan = planToMapOnly(root);
+  if (apply && plan.eligible) {
+    const result = convertToMapOnly(root);
+    if (json) printJson(result);
+    else {
+      print(`converted ${path.basename(root)} to map-only (uid ${result.uid})`);
+      print(`  the map now lives in the README.md/AGENTS.md information-map block (rendered into ${result.rendered.join(", ") || "—"})`);
+      print(`  removed _project/ (${plan.removes.join(", ")})`);
+      print("  if _project/ was tracked in git, commit the deletion");
+    }
+    return;
+  }
+  if (json) {
+    printJson({ ...plan, apply, converted: false });
+  } else if (plan.alreadyMapOnly) {
+    print(`${path.basename(root)} is already map-only`);
+  } else if (!plan.eligible) {
+    print(`${path.basename(root)} cannot become map-only yet:`);
+    for (const b of plan.blockers) print(`  - ${b}`);
+  } else {
+    print(`plan (dry-run; --apply to execute) — ${path.basename(root)} → map-only`);
+    print("  would move _project/project.toml (map, lifecycle, owns) and the uid into the README.md/AGENTS.md block");
+    print(`  would remove _project/ (${plan.removes.join(", ")})`);
+  }
+  if (!plan.eligible && !plan.alreadyMapOnly) process.exit(1);
+}
+
+/** `projects map adopt --folder`: the reverse — give a map-only project its `_project/` folder. */
+function adoptFolder(root: string, apply: boolean, json: boolean): void {
+  if (readInfoMap(root).form !== "map-only") {
+    if (json) printJson({ apply, converted: false, alreadyFolder: true });
+    else print(`${path.basename(root)} already has a _project/ folder`);
+    return;
+  }
+  const result = ensureProjectFolder(root, { dryRun: !apply });
+  if (json) {
+    printJson({ apply, ...result });
+    return;
+  }
+  const verb = apply ? "" : "would ";
+  print(`${apply ? "converted" : "plan (dry-run; --apply to execute)"} — ${path.basename(root)} → _project/ folder`);
+  print(`  ${verb}create _project/ (id ${result.uid}, project.toml, README.md, .gitignore)`);
+  print(`  ${verb}move the map from the README.md/AGENTS.md block into _project/project.toml (the source of truth from then on)`);
+  if (result.rendered.length > 0) print(`  ${verb}re-render ${result.rendered.join(", ")}`);
 }
 
 // --- import ---

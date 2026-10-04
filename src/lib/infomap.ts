@@ -49,7 +49,22 @@ import * as path from "node:path";
 
 import { ConfigError } from "./errors.js";
 import { readTextIfExists, writeFileAtomic } from "./fsatomic.js";
-import { TomlTable, readTomlIfExists, writeToml } from "./toml.js";
+import {
+  MAP_BEGIN,
+  MAP_BEGIN_MAP_ONLY,
+  MAP_END,
+  ProjectForm,
+  applyBlock,
+  composeBlock,
+  embeddedFence,
+  findMapBlock,
+  readProjectDocument,
+  realDocPath,
+  writeProjectDocument,
+} from "./projectdoc.js";
+import { TomlTable } from "./toml.js";
+
+export { MAP_BEGIN, MAP_BEGIN_MAP_ONLY, MAP_END };
 
 // ---------------------------------------------------------------------------
 // Vocabulary
@@ -113,8 +128,20 @@ export interface MapEntry {
 }
 
 export interface InfoMap {
-  /** project.toml carries a `[map]` table (map mode). False = legacy project. */
+  /** project.toml carries a `[map]` table (map mode), or the project is map-only. False = legacy project. */
   declared: boolean;
+  /**
+   * The project's form (decision-3): "folder" (`_project/project.toml`),
+   * "map-only" (the README/AGENTS block is the source of truth), or null when
+   * the directory is not (yet) a project.
+   */
+  form: ProjectForm | null;
+  /** Project-root-relative source of truth: `_project/project.toml` or e.g. `README.md`. */
+  source: string;
+  /** The map-only project's uid (embedded in the block); null for a folder project. */
+  uid: string | null;
+  /** The whole declared document (project.toml shape) — rendered into a map-only block. */
+  document: TomlTable;
   /** Core primitives first (fixed order), then extras in declaration order. */
   entries: MapEntry[];
   /** Docs the "Where information lives" block is rendered into (project-root-relative). */
@@ -359,15 +386,38 @@ function parseEntry(key: string, raw: unknown, problems: string[]): MapEntry | n
 export function readInfoMap(projectRoot: string): InfoMap {
   const problems: string[] = [];
   let raw: TomlTable = {};
+  let form: ProjectForm | null = null;
+  let source = path.join("_project", "project.toml");
+  let uid: string | null = null;
   try {
-    raw = readTomlIfExists(path.join(projectRoot, "_project", "project.toml"));
+    const doc = readProjectDocument(projectRoot);
+    raw = doc.raw;
+    form = doc.form;
+    source = doc.source;
+    uid = doc.form === "map-only" ? doc.uid : null;
+    problems.push(...doc.problems);
   } catch (err) {
     problems.push(`unparseable project.toml: ${(err as Error).message}`);
+    form = "folder";
   }
+  return buildInfoMap(projectRoot, raw, { form, source, uid, problems });
+}
+
+/**
+ * Build the effective map from a declared document. A map-only project is
+ * always in map mode (it has no native stores to be "legacy" about).
+ */
+export function buildInfoMap(
+  projectRoot: string,
+  raw: TomlTable,
+  meta: { form: ProjectForm | null; source: string; uid: string | null; problems?: string[] },
+): InfoMap {
+  const problems = [...(meta.problems ?? [])];
   const rawMap = raw["map"];
-  const declared = rawMap !== undefined && rawMap !== null && typeof rawMap === "object" && !Array.isArray(rawMap);
-  if (rawMap !== undefined && !declared) problems.push("map must be a table ([map])");
-  const table = declared ? (rawMap as Record<string, unknown>) : {};
+  const hasTable = rawMap !== undefined && rawMap !== null && typeof rawMap === "object" && !Array.isArray(rawMap);
+  const declared = hasTable || meta.form === "map-only";
+  if (rawMap !== undefined && !hasTable) problems.push("map must be a table ([map])");
+  const table = hasTable ? (rawMap as Record<string, unknown>) : {};
 
   let renderTo = [...DEFAULT_RENDER_TO];
   if (table["render_to"] !== undefined) {
@@ -404,7 +454,7 @@ export function readInfoMap(projectRoot: string): InfoMap {
   for (const [key, e] of declaredEntries) {
     if (!isCorePrimitive(key)) entries.push(e);
   }
-  return { declared, entries, renderTo, problems };
+  return { declared, form: meta.form, source: meta.source, uid: meta.uid, document: raw, entries, renderTo, problems };
 }
 
 export function entryOf(map: InfoMap, key: string): MapEntry | undefined {
@@ -420,6 +470,11 @@ export function homeOf(projectRoot: string, primitive: CorePrimitive): MapEntry 
 // Write
 
 const KEY_RE = /^[a-z][a-z0-9_-]*$/;
+
+/** How one entry is written into `[map]` (shorthand string or table). */
+export function serializeEntrySpec(spec: EntrySpec): string | Record<string, string> {
+  return serializeEntry(spec);
+}
 
 function serializeEntry(spec: EntrySpec): string | Record<string, string> {
   const hasDetail =
@@ -472,8 +527,14 @@ export function validateSpec(key: string, spec: EntrySpec): void {
  */
 export function writeMapEntry(projectRoot: string, key: string, spec: EntrySpec | null): void {
   if (spec !== null) validateSpec(key, spec);
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
-  const raw: TomlTable = readTomlIfExists(tomlPath);
+  const doc = readProjectDocument(projectRoot);
+  if (doc.form === "map-only" && spec !== null && spec.kind === "native") {
+    throw new ConfigError(
+      `${path.basename(projectRoot)} is a map-only project (no _project/ folder) — enabling a native store ` +
+        `creates the folder first: use \`projects map set ${key} native\` (or \`projects map adopt --folder --apply\`)`,
+    );
+  }
+  const raw: TomlTable = doc.raw;
   const existing = raw["map"];
   const map: Record<string, unknown> =
     existing !== null && typeof existing === "object" && !Array.isArray(existing)
@@ -482,17 +543,17 @@ export function writeMapEntry(projectRoot: string, key: string, spec: EntrySpec 
   if (spec === null) delete map[key];
   else map[key] = serializeEntry(spec);
   raw["map"] = orderedMap(map);
-  writeToml(tomlPath, raw);
+  writeProjectDocument(projectRoot, raw);
 }
 
 /** Ensure the project is in map mode (an empty `[map]` table) without declaring anything. */
 export function ensureMapDeclared(projectRoot: string): void {
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
-  const raw: TomlTable = readTomlIfExists(tomlPath);
+  const doc = readProjectDocument(projectRoot);
+  const raw: TomlTable = doc.raw;
   const existing = raw["map"];
   if (existing !== null && typeof existing === "object" && !Array.isArray(existing)) return;
   raw["map"] = {};
-  writeToml(tomlPath, raw);
+  writeProjectDocument(projectRoot, raw);
 }
 
 /** Stable key order: render_to, core primitives (fixed order), then extras as declared. */
@@ -583,13 +644,13 @@ export function pointerText(e: MapEntry): string {
 }
 
 /** The message a native command prints when the primitive's home is elsewhere. */
-export function elsewhereMessage(e: MapEntry, projectName: string): string {
+export function elsewhereMessage(e: MapEntry, projectName: string, source = "_project/project.toml [map]"): string {
   const what = e.label.toLowerCase();
   switch (e.kind) {
     case "external":
-      return `${e.label} for ${projectName} live in ${pointerText(e)} (declared in _project/project.toml [map]) — not in OpenWorkspace's native store.`;
+      return `${e.label} for ${projectName} live in ${pointerText(e)} (declared in ${source}) — not in OpenWorkspace's native store.`;
     case "none":
-      return `${projectName} declares no ${what} home ("none" in _project/project.toml [map]).`;
+      return `${projectName} declares no ${what} home ("none" in ${source}).`;
     case "undeclared":
       return (
         `${projectName} has no declared home for ${what} yet. Declare one: ` +
@@ -604,10 +665,6 @@ export function elsewhereMessage(e: MapEntry, projectName: string): string {
 // ---------------------------------------------------------------------------
 // Rendering into README.md / AGENTS.md
 
-export const MAP_BEGIN =
-  "<!-- BEGIN openworkspace:information-map (generated by `projects map render` from _project/project.toml [map]; edit the map, not this block) -->";
-export const MAP_END = "<!-- END openworkspace:information-map -->";
-
 /** The managed block body (between, not including, the markers). */
 export function renderMapSection(map: InfoMap): string {
   const lines: string[] = [];
@@ -621,35 +678,44 @@ export function renderMapSection(map: InfoMap): string {
     lines.push(`- **${e.label}:** ${describeHome(e)}`);
   }
   lines.push("");
-  lines.push("_Generated from `_project/project.toml` `[map]` by `projects map render`; `projects doctor` checks it stays current._");
+  if (map.form === "map-only") {
+    // decision-3: the block itself is the source of truth — embed the map.
+    lines.push(
+      "_This project keeps no `_project/` folder: the TOML below is its information map and identity (the source of truth), " +
+        "parsed by the `projects` CLI. Change it with `projects map set`, or edit it and run `projects map render`; " +
+        "`projects doctor` checks it._",
+    );
+    lines.push("");
+    lines.push(embeddedFence({ format: "", uid: map.uid ?? "", ...map.document }));
+  } else {
+    lines.push("_Generated from `_project/project.toml` `[map]` by `projects map render`; `projects doctor` checks it stays current._");
+  }
   return lines.join("\n");
+}
+
+/** The BEGIN marker line for a map's form. */
+export function beginLineFor(map: InfoMap): string {
+  return map.form === "map-only" ? MAP_BEGIN_MAP_ONLY : MAP_BEGIN;
+}
+
+/** The full managed block (markers included) for a map. */
+export function renderMapBlock(map: InfoMap): string {
+  return composeBlock(beginLineFor(map), renderMapSection(map));
 }
 
 /**
  * Replace (or append) the managed block in a document's text. Idempotent:
  * same map ⇒ byte-identical output; text outside the markers is preserved.
+ * Marker lines inside fenced code blocks are ignored (a doc that documents
+ * the format is not a block).
  */
-export function applyMapSection(current: string, section: string): string {
-  const block = `${MAP_BEGIN}\n${section}\n${MAP_END}`;
-  const beginIdx = current.indexOf(MAP_BEGIN);
-  const endIdx = current.indexOf(MAP_END);
-  if (beginIdx !== -1 && endIdx !== -1 && endIdx > beginIdx) {
-    let next = current.slice(0, beginIdx) + block + current.slice(endIdx + MAP_END.length);
-    if (!next.endsWith("\n")) next += "\n";
-    return next;
-  }
-  let base = current;
-  if (base.length > 0 && !base.endsWith("\n")) base += "\n";
-  if (base.length > 0 && !base.endsWith("\n\n")) base += "\n";
-  return base + block + "\n";
+export function applyMapSection(current: string, section: string, beginLine: string = MAP_BEGIN): string {
+  return applyBlock(current, composeBlock(beginLine, section));
 }
 
 /** Extract the managed block body from a document, or null when absent. */
 export function extractMapSection(text: string): string | null {
-  const beginIdx = text.indexOf(MAP_BEGIN);
-  const endIdx = text.indexOf(MAP_END);
-  if (beginIdx === -1 || endIdx === -1 || endIdx < beginIdx) return null;
-  return text.slice(beginIdx + MAP_BEGIN.length, endIdx).replace(/^\n/, "").replace(/\n$/, "");
+  return findMapBlock(text)?.body ?? null;
 }
 
 function docSkeleton(rel: string, projectName: string): string {
@@ -665,6 +731,26 @@ export interface RenderResult {
 }
 
 /**
+ * Render targets: `render_to`, plus — for a map-only project — its source doc
+ * (always rendered, so the source of truth can never be skipped). Targets that
+ * resolve to the same file (CLAUDE.md → AGENTS.md symlink) are written once,
+ * through the link.
+ */
+function renderTargets(projectRoot: string, map: InfoMap): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (rel: string): void => {
+    const real = realDocPath(path.resolve(projectRoot, rel));
+    if (seen.has(real)) return;
+    seen.add(real);
+    out.push(rel);
+  };
+  for (const rel of map.renderTo) add(rel);
+  if (map.form === "map-only") add(map.source);
+  return out;
+}
+
+/**
  * Render the map block into every `render_to` doc (creating a missing doc
  * with a one-line title). Idempotent: an unchanged map writes nothing.
  */
@@ -673,14 +759,17 @@ export function renderMapDocs(
   options: { dryRun?: boolean; map?: InfoMap } = {},
 ): RenderResult[] {
   const map = options.map ?? readInfoMap(projectRoot);
-  const section = renderMapSection(map);
+  if (map.form === "map-only" && map.problems.some((p) => p.startsWith("unparseable map TOML"))) {
+    throw new ConfigError(`${map.problems[0]} — fix it before rendering (nothing written)`);
+  }
+  const block = renderMapBlock(map);
   const name = path.basename(projectRoot);
   const results: RenderResult[] = [];
-  for (const rel of map.renderTo) {
-    const abs = path.resolve(projectRoot, rel);
+  for (const rel of renderTargets(projectRoot, map)) {
+    const abs = realDocPath(path.resolve(projectRoot, rel));
     const current = readTextIfExists(abs);
     const base = current ?? docSkeleton(rel, name);
-    const next = applyMapSection(base, section);
+    const next = applyBlock(base, block);
     const changed = current === null || next !== current;
     if (changed && options.dryRun !== true) writeFileAtomic(abs, next);
     results.push({ file: rel, created: current === null, changed });
@@ -692,13 +781,14 @@ export type DocState = "ok" | "missing-file" | "missing-section" | "stale";
 
 /** Compare every render target against the map (pure read). */
 export function checkMapDocs(projectRoot: string, map: InfoMap = readInfoMap(projectRoot)): Array<{ file: string; state: DocState }> {
-  const want = renderMapSection(map);
-  return map.renderTo.map((rel) => {
+  const wantBody = renderMapSection(map);
+  const wantBegin = beginLineFor(map);
+  return renderTargets(projectRoot, map).map((rel) => {
     const text = readTextIfExists(path.resolve(projectRoot, rel));
     if (text === null) return { file: rel, state: "missing-file" as const };
-    const got = extractMapSection(text);
+    const got = findMapBlock(text);
     if (got === null) return { file: rel, state: "missing-section" as const };
-    return { file: rel, state: got === want ? ("ok" as const) : ("stale" as const) };
+    return { file: rel, state: got.body === wantBody && got.beginLine === wantBegin ? ("ok" as const) : ("stale" as const) };
   });
 }
 
@@ -722,12 +812,16 @@ export interface MapEntryView {
 
 export function mapView(projectRoot: string, map: InfoMap = readInfoMap(projectRoot)): {
   declared: boolean;
+  form: ProjectForm | null;
+  source: string;
   renderTo: string[];
   entries: MapEntryView[];
   problems: string[];
 } {
   return {
     declared: map.declared,
+    form: map.form,
+    source: map.source,
     renderTo: map.renderTo,
     problems: map.problems,
     entries: map.entries.map((e) => ({

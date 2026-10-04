@@ -61,6 +61,7 @@ import {
   retireLifecycleIntents,
   writeUidCacheEntry,
 } from "./lib/machine.js";
+import { folderProjectUid, parseMapOnlyText, readMapOnlyDoc } from "./lib/projectdoc.js";
 import { gitShowAtHead, isGitRepo, isGitWorktree } from "./lib/resolve.js";
 import {
   DeclaredLifecycle,
@@ -101,6 +102,18 @@ export interface DriftClassification {
  */
 export function committedLifecycle(projectRoot: string): DeclaredLifecycle | null {
   if (!isGitRepo(projectRoot)) return null;
+  // decision-3: a map-only project's facts live in its README/AGENTS block —
+  // the committed block is the same tier-1 evidence.
+  const mapOnly = folderProjectUid(projectRoot) === null ? readMapOnlyDoc(projectRoot) : null;
+  if (mapOnly !== null) {
+    const committedDoc = gitShowAtHead(projectRoot, mapOnly.file);
+    if (committedDoc === null) return null;
+    const parsed = parseMapOnlyText(committedDoc, mapOnly.file);
+    if (parsed === null || parsed.uid !== mapOnly.uid) return null;
+    const v = parsed.raw["lifecycle"];
+    if (v === "active" || v === "dormant" || v === "archived") return v;
+    return "active";
+  }
   const text = gitShowAtHead(projectRoot, path.join("_project", "project.toml"));
   if (text === null) return null; // untracked or no HEAD
   // minimal TOML scan for `lifecycle = "..."` — we only need this one key, and

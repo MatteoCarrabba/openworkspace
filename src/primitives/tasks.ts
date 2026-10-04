@@ -28,6 +28,7 @@ import {
 } from "../lib/frontmatter.js";
 import { ParsedId, formatId, idFromFilename, mintId, parseId } from "../lib/ids.js";
 import { MachineStore } from "../lib/machine.js";
+import { ensureProjectFolder } from "../init.js";
 import { readProjectUid } from "../lib/workspace.js";
 
 /** Invalid task-state transition (done-with-recur, missing Final Summary, …). */
@@ -492,6 +493,8 @@ export function createTask(
     throw new ConfigError(`not a project (no _project/id): ${projectRoot}`);
   }
 
+  // decision-3: the first native write gives a map-only project its _project/.
+  ensureProjectFolder(projectRoot);
   const dir = tasksDir(projectRoot);
   ensureDir(dir);
 

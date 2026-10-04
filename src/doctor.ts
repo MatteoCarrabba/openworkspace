@@ -56,6 +56,7 @@ import {
   readInfoMap,
 } from "./lib/infomap.js";
 import { readRecord } from "./lib/frontmatter.js";
+import { folderProjectUid, readMapOnlyDoc } from "./lib/projectdoc.js";
 import { formatId, idFromFilename, parseId } from "./lib/ids.js";
 import { MachineStore, readRunnerNode } from "./lib/machine.js";
 import { readTomlIfExists } from "./lib/toml.js";
@@ -206,6 +207,13 @@ export function doctorProject(
 ): DoctorIssue[] {
   const project = options.relPath ?? projectRoot;
   const now = options.now ?? new Date();
+
+  // decision-3: a map-only project has no `_project/` folder — only its map
+  // (the README/AGENTS block, the source of truth) is checked.
+  if (folderProjectUid(projectRoot) === null && readMapOnlyDoc(projectRoot) !== null) {
+    return mapOnlyProjectIssues(projectRoot, project);
+  }
+
   const issues: DoctorIssue[] = [];
   const err = (file: string | null, message: string) =>
     issues.push({ severity: "error", project, file, message });
@@ -653,6 +661,39 @@ export function doctorProject(
   return issues;
 }
 
+/**
+ * Checks for a map-only project (decision-3): the map checks every project gets
+ * (declared homes, pointers, the rendered blocks — here the source block
+ * itself), plus the form's own invariants: no native home may be declared (it
+ * has no store to hold one) and no stray `_project/` may exist without an id.
+ */
+export function mapOnlyProjectIssues(projectRoot: string, project: string): DoctorIssue[] {
+  const issues: DoctorIssue[] = [];
+  const map = readInfoMap(projectRoot);
+  const push = (severity: DoctorSeverity, file: string | null, message: string) =>
+    issues.push({ severity, project, file, message });
+  if (fs.existsSync(path.join(projectRoot, "_project"))) {
+    push(
+      "warn",
+      "_project",
+      "map-only project has a stray _project/ folder (no _project/id) — its map lives in the " +
+        `${map.source} block; give it a real folder (\`projects map adopt --folder --apply\`) or remove the stray directory`,
+    );
+  }
+  for (const e of map.entries) {
+    if (e.core && e.kind === "native" && e.source === "declared") {
+      push(
+        "error",
+        map.source,
+        `${e.label}: declared native, but a map-only project has no _project/ store — ` +
+          "`projects map adopt --folder --apply` creates the folder (or point it at its real home)",
+      );
+    }
+  }
+  issues.push(...infoMapIssues(projectRoot, project));
+  return issues;
+}
+
 /** The message doctor uses for a project with no `[map]` (legacy). */
 export const LEGACY_MAP_NOTICE =
   "no information map declared — every primitive is treated as a native store (legacy). " +
@@ -678,11 +719,12 @@ export function infoMapIssues(
   options: { legacyNotice?: boolean } = {},
 ): DoctorIssue[] {
   const issues: DoctorIssue[] = [];
-  const tomlRel = path.join("_project", "project.toml");
   const push = (severity: DoctorSeverity, file: string | null, message: string) =>
     issues.push({ severity, project, file, message });
 
   const map = readInfoMap(projectRoot);
+  // The map's source of truth: project.toml, or a map-only project's README/AGENTS block.
+  const tomlRel = map.source;
   for (const prob of map.problems) push("error", tomlRel, `information map: ${prob}`);
   if (!map.declared) {
     if (options.legacyNotice !== false) push("info", tomlRel, LEGACY_MAP_NOTICE);
