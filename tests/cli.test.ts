@@ -116,9 +116,12 @@ test("cli: no-arg init defaults to the cwd, with guard rails", (t) => {
   assert.equal(ok.status, 0, ok.stderr);
   const result = JSON.parse(ok.stdout) as { projectRoot: string; uid: string };
   assert.equal(fs.realpathSync(result.projectRoot), fs.realpathSync(fresh));
-  assert.ok(fs.existsSync(path.join(fresh, "_project", "id")));
+  // decision-3: no native store requested ⇒ map-only: no _project/, the uid
+  // lives in the README.md information-map block.
+  assert.ok(!fs.existsSync(path.join(fresh, "_project")));
+  assert.match(fs.readFileSync(path.join(fresh, "README.md"), "utf8"), new RegExp(`uid = "${result.uid}"`));
 
-  // re-running in the now-initialized cwd refuses (write-once _project/id)
+  // re-running in the now-initialized cwd refuses (the identity is write-once)
   const reinit = run(["init"], fresh, fx.storeDir);
   assert.equal(reinit.status, 1);
   assert.match(reinit.stderr, /already a project/);

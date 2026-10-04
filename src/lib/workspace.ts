@@ -15,7 +15,8 @@ import * as path from "node:path";
 
 import { ConfigError, NotFoundError } from "./errors.js";
 import { configuredWorkspaceRoot } from "./locations.js";
-import { TomlTable, readTomlIfExists, writeToml } from "./toml.js";
+import { ProjectForm, folderProjectUid, projectIdentity, readProjectDocument, writeProjectDocument } from "./projectdoc.js";
+import { TomlTable, readTomlIfExists } from "./toml.js";
 
 export const MARKER_DIR = ".openworkspace";
 export const CONFIG_FILE = "config.toml";
@@ -100,10 +101,9 @@ export interface OwnsResult {
  * in {subproject, code, remote}; `name` and `lifecycle` are optional.
  */
 export function readOwns(projectRoot: string): OwnsResult {
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
   let raw: TomlTable;
   try {
-    raw = readTomlIfExists(tomlPath);
+    raw = readProjectDocument(projectRoot).raw;
   } catch (err) {
     return { owns: [], problems: [`unparseable project.toml: ${(err as Error).message}`] };
   }
@@ -154,8 +154,7 @@ export function readOwns(projectRoot: string): OwnsResult {
  * exactly like writeDeclaredLifecycle's empty-doc branch.
  */
 export function writeOwns(projectRoot: string, owns: OwnEdge[]): void {
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
-  const raw: TomlTable = readTomlIfExists(tomlPath);
+  const raw: TomlTable = readProjectDocument(projectRoot).raw;
 
   if (owns.length === 0) {
     delete raw["owns"];
@@ -167,16 +166,9 @@ export function writeOwns(projectRoot: string, owns: OwnEdge[]): void {
       ...(o.lifecycle ? { lifecycle: o.lifecycle } : {}),
     }));
   }
-
-  if (Object.keys(raw).length === 0) {
-    try {
-      fs.unlinkSync(tomlPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
-    return;
-  }
-  writeToml(tomlPath, raw);
+  // Folder form: an empty document removes project.toml (as before). Map-only:
+  // the facts live in the README/AGENTS block (decision-3).
+  writeProjectDocument(projectRoot, raw, { emptyRemovesFile: true });
 }
 
 /** Map a declared lifecycle to the location-comparable `Lifecycle` (identity). */
@@ -202,10 +194,9 @@ export interface DeclaredLifecycleResult {
  * it, never as a discovery blocker.
  */
 export function readDeclaredLifecycle(projectRoot: string): DeclaredLifecycleResult {
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
   let raw: TomlTable;
   try {
-    raw = readTomlIfExists(tomlPath);
+    raw = readProjectDocument(projectRoot).raw;
   } catch (err) {
     return { lifecycle: null, setAt: null, problem: `unparseable project.toml: ${(err as Error).message}` };
   }
@@ -243,8 +234,7 @@ export function writeDeclaredLifecycle(
   lifecycle: DeclaredLifecycle,
   setAt: string | null,
 ): void {
-  const tomlPath = path.join(projectRoot, "_project", "project.toml");
-  const raw: TomlTable = readTomlIfExists(tomlPath);
+  const raw: TomlTable = readProjectDocument(projectRoot).raw;
 
   if (lifecycle === "active") {
     delete raw["lifecycle"];
@@ -254,16 +244,7 @@ export function writeDeclaredLifecycle(
     if (setAt !== null) raw["lifecycle_set"] = setAt;
     else delete raw["lifecycle_set"];
   }
-
-  if (Object.keys(raw).length === 0) {
-    try {
-      fs.unlinkSync(tomlPath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-    }
-    return;
-  }
-  writeToml(tomlPath, raw);
+  writeProjectDocument(projectRoot, raw, { emptyRemovesFile: true });
 }
 
 export interface WorkspaceConfig {
@@ -324,6 +305,12 @@ export interface ProjectInfo {
    * for every project.
    */
   externalRoot: string | null;
+  /**
+   * The project's form (decision-3): "folder" (a `_project/` folder with
+   * `_project/id` + `project.toml`) or "map-only" (no `_project/`; identity and
+   * map live in the README.md/AGENTS.md information-map block).
+   */
+  form: ProjectForm;
 }
 
 export function defaultConfig(): WorkspaceConfig {
@@ -467,38 +454,26 @@ export function openWorkspace(startDir: string, env: NodeJS.ProcessEnv = process
   return { root, config: loadWorkspaceConfig(root) };
 }
 
-/** Read `_project/id` for a directory; null when it is not a project. */
+/**
+ * A directory's project UID; null when it is not a project. A folder project's
+ * identity is `_project/id`; a map-only project's (decision-3) is the `uid` in
+ * the information-map block of its README.md/AGENTS.md. The folder wins.
+ */
 export function readProjectUid(dir: string): string | null {
-  try {
-    const text = fs.readFileSync(path.join(dir, "_project", "id"), "utf8").trim();
-    return text.length > 0 ? text : null;
-  } catch {
-    return null;
-  }
+  return projectIdentity(dir)?.uid ?? null;
 }
 
-/** True when `dir` is a project boundary (has `_project/id`). */
+/** `_project/id` only (a folder project), ignoring map-only blocks. */
+export function readFolderProjectUid(dir: string): string | null {
+  return folderProjectUid(dir);
+}
+
+/** True when `dir` is a project boundary (folder or map-only). */
 export function isProjectBoundary(dir: string): boolean {
   return readProjectUid(dir) !== null;
 }
 
-/**
- * True when `dir` is the working tree of a foreign git repo — it contains a
- * `.git` entry but is NOT an OpenWorkspace project. Such trees (a cloned repo,
- * a code checkout) hold no projects and can be enormous; the discovery walk
- * skips descending into them. A `.git` inside a real OpenWorkspace project is
- * fine — that's the workspace's own repo — so the project check wins.
- */
-function isForeignGitWorktree(dir: string): boolean {
-  if (readProjectUid(dir) !== null) return false;
-  try {
-    return fs.existsSync(path.join(dir, ".git"));
-  } catch {
-    return false;
-  }
-}
-
-/** Walk up from `startDir` to the nearest enclosing project boundary. */
+/** Walk up from `startDir` to the nearest enclosing project boundary (folder or map-only). */
 export function findProjectRoot(startDir: string): { root: string; uid: string } | null {
   let dir = path.resolve(startDir);
   for (;;) {
@@ -680,6 +655,24 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
   // roots are walked (the in-tree walk alone cannot visit a dir twice).
   let seenReal: Set<string> | null = null;
 
+  // One identity probe per directory: the foreign-git check and the walk both
+  // need it, and a map-only probe reads README.md/AGENTS.md (decision-3).
+  const identities = new Map<string, { uid: string; form: ProjectForm } | null>();
+  const identityOf = (dir: string): { uid: string; form: ProjectForm } | null => {
+    if (identities.has(dir)) return identities.get(dir) ?? null;
+    const id = projectIdentity(dir);
+    identities.set(dir, id);
+    return id;
+  };
+  const isForeignGit = (dir: string): boolean => {
+    if (identityOf(dir) !== null) return false;
+    try {
+      return fs.existsSync(path.join(dir, ".git"));
+    } catch {
+      return false;
+    }
+  };
+
   const walk = (
     dir: string,
     depth: number,
@@ -690,9 +683,10 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
     if (externalRoot === null && !includeShelves && shelves.some((s) => s === dir)) return;
     if (externalRoot !== null && isLinkedWorktreeCheckout(dir)) return;
 
-    const uid = externalRoot === null && dir === ws.root ? null : readProjectUid(dir);
+    const identity = externalRoot === null && dir === ws.root ? null : identityOf(dir);
+    const uid = identity?.uid ?? null;
     let enclosing = enclosingProject;
-    if (uid !== null) {
+    if (identity !== null && uid !== null) {
       const real = seenReal !== null ? realpathOrSelf(dir) : null;
       if (seenReal !== null && real !== null && seenReal.has(real)) return; // already found
       if (seenReal !== null && real !== null) seenReal.add(real);
@@ -709,6 +703,7 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
         declaredLifecycle: declared.lifecycle,
         lifecycleSetAt: declared.setAt,
         externalRoot,
+        form: identity.form,
       });
       enclosing = dir;
     }
@@ -730,9 +725,9 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
       // no projects yet can be enormous — the single biggest cost when serving
       // a large real workspace (~Documents has ~20 nested git repos). A real
       // OpenWorkspace project that happens to carry `.git` is NOT skipped:
-      // isForeignGitWorktree returns false for any dir with `_project/id`, so
+      // isForeignGit returns false for any project dir (folder or map-only), so
       // the project boundary and any nested projects under it are still found.
-      if (isForeignGitWorktree(child)) continue;
+      if (isForeignGit(child)) continue;
       walk(child, depth + 1, enclosing, externalRoot);
     }
   };
@@ -751,7 +746,7 @@ export function discoverProjects(ws: Workspace, options: DiscoverOptions = {}): 
           continue; // missing root: doctor warns, discovery never crashes
         }
         if (!st.isDirectory()) continue;
-        if (isForeignGitWorktree(ext.path)) continue; // a code checkout, not a project
+        if (isForeignGit(ext.path)) continue; // a code checkout, not a project
         walk(ext.path, 0, null, ext.path);
       }
     }

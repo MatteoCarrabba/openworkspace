@@ -51,7 +51,7 @@ test("acceptance: projects init stamps identity + orientation + the information 
   t.after(() => rmrf(tmp));
   const projectDir = path.join(tmp, "Colon: And Space Project");
 
-  const { uid, rendered } = initProject(projectDir);
+  const { uid, rendered } = initProject(projectDir, { folder: true });
   assert.match(uid, /^[0-9a-f-]{36}$/);
 
   // No native store is scaffolded: they appear on first write.
@@ -234,7 +234,7 @@ test("acceptance: state-named subdirectory under tasks/ is a doctor error", (t) 
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectDir = path.join(tmp, "Stateful");
-  initProject(projectDir);
+  initProject(projectDir, { folder: true });
   fs.mkdirSync(path.join(projectDir, "_project", "tasks", "todo"), { recursive: true });
   fs.mkdirSync(path.join(projectDir, "_project", "tasks", "archive")); // allowed
 

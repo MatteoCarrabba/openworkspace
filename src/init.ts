@@ -20,18 +20,29 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { ConflictError, NotFoundError } from "./lib/errors.js";
+import { ConfigError, ConflictError, NotFoundError } from "./lib/errors.js";
 import { createExclusive, ensureDir, readTextIfExists, writeFileAtomic } from "./lib/fsatomic.js";
 import {
+  CORE_PRIMITIVES,
   CorePrimitive,
+  DEFAULT_RENDER_TO,
   EntrySpec,
   PLAN_STUB,
+  buildInfoMap,
   ensureMapDeclared,
+  readInfoMap,
   renderMapDocs,
+  serializeEntrySpec,
   validateSpec,
   writeMapEntry,
 } from "./lib/infomap.js";
-import { readTomlIfExists, writeToml } from "./lib/toml.js";
+import {
+  MAP_ONLY_CANDIDATES,
+  PROJECT_TOML_REL,
+  folderProjectUid,
+  readMapOnlyDoc,
+} from "./lib/projectdoc.js";
+import { TomlTable, readTomlIfExists, writeToml } from "./lib/toml.js";
 import { CONFIG_FILE, MARKER_DIR, readProjectUid } from "./lib/workspace.js";
 
 // ---------------------------------------------------------------------------
@@ -408,8 +419,10 @@ export function recordRegistryRunOutcome(
 // ---------------------------------------------------------------------------
 
 /**
- * What init stamps, relative to _project/. Dirs end with "/". Native stores
- * are deliberately absent (decision-2): they appear on first write.
+ * What a FOLDER init stamps, relative to _project/. Native stores are
+ * deliberately absent (decision-2): they appear on first write. A map-only
+ * init (decision-3, the default without native stores) stamps no `_project/`
+ * at all.
  */
 export const SKELETON_ENTRIES = ["README.md", ".gitignore", "id", "project.toml"] as const;
 
@@ -418,8 +431,14 @@ export interface InitProjectOptions {
   native?: readonly CorePrimitive[];
   /** Other declared homes (external pointers or "none"), by map key. */
   homes?: Readonly<Record<string, EntrySpec>>;
-  /** Render the map into README.md / AGENTS.md (default true). */
+  /**
+   * Render the map into README.md / AGENTS.md (default true). A map-only
+   * project's map LIVES in those docs, so `renderDocs: false` implies the
+   * `_project/` folder form.
+   */
   renderDocs?: boolean;
+  /** Force the `_project/` folder form even with no native store (decision-3). */
+  folder?: boolean;
 }
 
 export interface InitProjectResult {
@@ -427,27 +446,41 @@ export interface InitProjectResult {
   uid: string;
   /** Docs the map section was rendered into (project-root-relative). */
   rendered: string[];
+  /** "map-only" (no `_project/`; the map lives in README.md/AGENTS.md) or "folder". */
+  form: "folder" | "map-only";
 }
 
 /**
  * Stamp a project at `dir` (creating the directory when absent). Refuses when
- * `dir` is already a project (write-once `_project/id`). Declares the
- * information map from `options` (undeclared primitives stay undeclared —
- * doctor then asks for a home) and renders it into the project docs.
+ * `dir` is already a project (folder or map-only). Declares the information
+ * map from `options` (undeclared primitives stay undeclared — doctor then asks
+ * for a home) and renders it into the project docs.
+ *
+ * decision-3: with no native store requested the project is MAP-ONLY — no
+ * `_project/` folder; its identity and map live in the README.md/AGENTS.md
+ * block. A native store (`--native`, a `native` home), `folder: true` or
+ * `renderDocs: false` gives the `_project/` folder form.
  */
 export function initProject(dir: string, options: InitProjectOptions = {}): InitProjectResult {
   const projectRoot = path.resolve(dir);
   const existingUid = readProjectUid(projectRoot);
   if (existingUid !== null) {
-    throw new ConflictError(
-      `already a project (uid ${existingUid}): ${projectRoot} — _project/id is write-once`,
-    );
+    const where = folderProjectUid(projectRoot) !== null ? "_project/id is write-once" : "map-only: the uid is in its README/AGENTS map block";
+    throw new ConflictError(`already a project (uid ${existingUid}): ${projectRoot} — ${where}`);
   }
   // Validate every requested home BEFORE touching disk.
   const specs: Array<[string, EntrySpec]> = [];
   for (const prim of options.native ?? []) specs.push([prim, { kind: "native" }]);
   for (const [key, spec] of Object.entries(options.homes ?? {})) specs.push([key, spec]);
   for (const [key, spec] of specs) validateSpec(key, spec);
+
+  const wantsNative = specs.some(([, spec]) => spec.kind === "native");
+  const folder =
+    wantsNative ||
+    options.folder === true ||
+    options.renderDocs === false ||
+    fs.existsSync(path.join(projectRoot, "_project"));
+  if (!folder) return initMapOnlyProject(projectRoot, specs);
 
   const p = path.join(projectRoot, "_project");
   ensureDir(p);
@@ -469,7 +502,224 @@ export function initProject(dir: string, options: InitProjectOptions = {}): Init
 
   const rendered =
     options.renderDocs === false ? [] : renderMapDocs(projectRoot).map((r) => r.file);
-  return { projectRoot, uid, rendered };
+  return { projectRoot, uid, rendered, form: "folder" };
+}
+
+/** Map-only init: the identity + map block, rendered into README.md and AGENTS.md. */
+function initMapOnlyProject(projectRoot: string, specs: Array<[string, EntrySpec]>): InitProjectResult {
+  ensureDir(projectRoot);
+  const uid = crypto.randomUUID();
+  const map: Record<string, unknown> = {};
+  for (const [key, spec] of specs) map[key] = serializeEntrySpec(spec);
+  const document: TomlTable = { map: orderMapKeys(map) };
+  const info = buildInfoMap(projectRoot, document, { form: "map-only", source: mapOnlySourceFor(DEFAULT_RENDER_TO), uid });
+  const rendered = renderMapDocs(projectRoot, { map: info }).map((r) => r.file);
+  return { projectRoot, uid, rendered, form: "map-only" };
+}
+
+/**
+ * The doc that carries a map-only project's source block: the first discovery
+ * candidate (README.md, then AGENTS.md) among the render targets, else README.md.
+ */
+export function mapOnlySourceFor(renderTo: readonly string[]): string {
+  const normalized = new Set(renderTo.map((r) => path.normalize(r)));
+  return MAP_ONLY_CANDIDATES.find((c) => normalized.has(c)) ?? (MAP_ONLY_CANDIDATES[0] as string);
+}
+
+function orderMapKeys(map: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const k of CORE_PRIMITIVES) if (map[k] !== undefined) out[k] = map[k];
+  for (const [k, v] of Object.entries(map)) if (!(k in out)) out[k] = v;
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Converting between the two forms (decision-3)
+// ---------------------------------------------------------------------------
+
+export interface ToFolderResult {
+  /** False when the project already had a `_project/` folder (nothing done). */
+  converted: boolean;
+  uid: string;
+  /** Docs re-rendered (their blocks switch to the folder flavor). */
+  rendered: string[];
+}
+
+/**
+ * Give a map-only project its `_project/` folder — the moment its first native
+ * store is enabled. The map moves VERBATIM from the README/AGENTS block into
+ * `_project/project.toml` (which becomes the one source of truth), `_project/id`
+ * keeps the same uid, and the docs are re-rendered in the folder flavor.
+ * Idempotent: a folder project is left untouched.
+ *
+ * Crash-safe ordering: project.toml first, then id (the moment the folder
+ * becomes authoritative), then the docs (a stale block is only cosmetic —
+ * doctor flags it and `projects map render` fixes it).
+ */
+export function ensureProjectFolder(projectRoot: string, options: { dryRun?: boolean } = {}): ToFolderResult {
+  const folderUid = folderProjectUid(projectRoot);
+  if (folderUid !== null) return { converted: false, uid: folderUid, rendered: [] };
+  const doc = readMapOnlyDoc(projectRoot);
+  if (doc === null) throw new NotFoundError(`not a project (no _project/id and no map-only block): ${projectRoot}`);
+  if (doc.problems.length > 0) {
+    throw new ConfigError(`${doc.problems[0]} — fix the TOML block in ${doc.file} first (nothing written)`);
+  }
+  if (options.dryRun === true) {
+    return { converted: true, uid: doc.uid, rendered: renderMapDocs(projectRoot, { dryRun: true }).map((r) => r.file) };
+  }
+  const raw: TomlTable = {};
+  for (const [k, v] of Object.entries(doc.raw)) if (k !== "format" && k !== "uid") raw[k] = v;
+  if (raw["map"] === undefined) raw["map"] = {};
+
+  const p = path.join(projectRoot, "_project");
+  ensureDir(p);
+  writeToml(path.join(projectRoot, PROJECT_TOML_REL), raw);
+  const stamp = (rel: string, content: string): void => {
+    const target = path.join(p, rel);
+    if (!fs.existsSync(target)) createExclusive(target, content);
+  };
+  stamp("README.md", PROJECT_README);
+  stamp(".gitignore", PROJECT_GITIGNORE);
+  createExclusive(path.join(p, "id"), doc.uid + "\n");
+  const rendered = renderMapDocs(projectRoot).filter((r) => r.changed).map((r) => r.file);
+  return { converted: true, uid: doc.uid, rendered };
+}
+
+export interface ToMapOnlyPlan {
+  /** True when the project can become map-only (no blockers). */
+  eligible: boolean;
+  /** Why not (each a human sentence). */
+  blockers: string[];
+  /** `_project/`-relative entries that would be removed (tool stamps, empty stores). */
+  removes: string[];
+  /** True when the project already is map-only. */
+  alreadyMapOnly: boolean;
+}
+
+const STAMPED_README_HEADING = "# _project/ — OpenWorkspace control plane";
+const GITIGNORE_STAMP_LINES = new Set(["forum/presence/", "automations/*/logs/", "/archive/", "archive/"]);
+
+/** Plan `projects map adopt --map-only` (pure read). */
+export function planToMapOnly(projectRoot: string): ToMapOnlyPlan {
+  if (folderProjectUid(projectRoot) === null) {
+    const already = readMapOnlyDoc(projectRoot) !== null;
+    return {
+      eligible: false,
+      blockers: already ? [] : ["not an OpenWorkspace project"],
+      removes: [],
+      alreadyMapOnly: already,
+    };
+  }
+  const blockers: string[] = [];
+  const removes: string[] = [];
+  const map = readInfoMap(projectRoot);
+  for (const prob of map.problems) blockers.push(`information map problem: ${prob}`);
+  if (!map.declared) {
+    blockers.push("no [map] declared (legacy: every primitive is treated as native) — declare homes first (`projects map adopt --apply`, `projects map set`)");
+  }
+  const prunable = new Set(pruneEmptyStores(projectRoot, { dryRun: true }));
+  for (const e of map.entries) {
+    if (!e.core) continue;
+    const prim = e.key as CorePrimitive;
+    if (e.kind === "native" && e.source === "declared") {
+      blockers.push(`${prim} is declared native — point it at its real home first (\`projects map set ${prim} <url>|none\`)`);
+    }
+  }
+  const p = path.join(projectRoot, "_project");
+  let names: string[] = [];
+  try {
+    names = fs.readdirSync(p);
+  } catch {
+    names = [];
+  }
+  for (const name of names.sort()) {
+    const full = path.join(p, name);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(full);
+    } catch {
+      continue;
+    }
+    if (name === ".DS_Store") {
+      removes.push(name);
+      continue;
+    }
+    if (st.isDirectory()) {
+      if (prunable.has(`_project/${name}/`)) removes.push(`${name}/`);
+      else if (isEmptyTree(full)) removes.push(`${name}/`);
+      else blockers.push(`_project/${name}/ still holds content — migrate it to its declared home (or keep the folder)`);
+      continue;
+    }
+    if (!st.isFile()) {
+      blockers.push(`_project/${name} is not a regular file`);
+      continue;
+    }
+    if (name === "id" || name === "project.toml") {
+      removes.push(name);
+    } else if (name === "README.md") {
+      const text = readTextIfExists(full) ?? "";
+      if (text.startsWith(STAMPED_README_HEADING)) removes.push(name);
+      else blockers.push("_project/README.md is not the stamped orientation file — move what it says somewhere else first");
+    } else if (name === ".gitignore") {
+      const lines = (readTextIfExists(full) ?? "").split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== "" && !l.startsWith("#"));
+      if (lines.every((l) => GITIGNORE_STAMP_LINES.has(l))) removes.push(name);
+      else blockers.push("_project/.gitignore carries rules beyond the stamped git posture — review it first");
+    } else {
+      blockers.push(`_project/${name} is left in the folder — move or remove it first`);
+    }
+  }
+  return { eligible: blockers.length === 0, blockers, removes, alreadyMapOnly: false };
+}
+
+function isEmptyTree(dir: string): boolean {
+  let ents: fs.Dirent[];
+  try {
+    ents = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const ent of ents) {
+    if (ent.name === ".DS_Store" || ent.name === ".gitkeep") continue;
+    if (ent.isDirectory() && isEmptyTree(path.join(dir, ent.name))) continue;
+    return false;
+  }
+  return true;
+}
+
+export interface ToMapOnlyResult extends ToMapOnlyPlan {
+  converted: boolean;
+  uid: string | null;
+  rendered: string[];
+}
+
+/**
+ * Convert a folder project whose stores are all retired to map-only: the map
+ * (and lifecycle, owns — everything in project.toml) plus the uid move into
+ * the README/AGENTS block, then `_project/` is removed — only when nothing but
+ * the tool's own stamps and empty stores is left in it. Refuses otherwise.
+ *
+ * Ordering: docs first (while the folder is still authoritative — a crash here
+ * leaves a folder project with a stale-flavored block), then `_project/` (the
+ * moment the block becomes authoritative).
+ */
+export function convertToMapOnly(projectRoot: string): ToMapOnlyResult {
+  const plan = planToMapOnly(projectRoot);
+  if (!plan.eligible) return { ...plan, converted: false, uid: null, rendered: [] };
+  const uid = folderProjectUid(projectRoot) as string;
+  const raw = readTomlIfExists(path.join(projectRoot, PROJECT_TOML_REL));
+  if (raw["map"] === undefined) raw["map"] = {};
+  const info0 = buildInfoMap(projectRoot, raw, { form: "map-only", source: "README.md", uid });
+  const info = buildInfoMap(projectRoot, raw, { form: "map-only", source: mapOnlySourceFor(info0.renderTo), uid });
+  // Stores that are about to be removed must not read as "inferred native".
+  for (const e of info.entries) {
+    if (e.core && e.source === "inferred") {
+      e.kind = "undeclared";
+      e.source = "undeclared";
+    }
+  }
+  const rendered = renderMapDocs(projectRoot, { map: info }).filter((r) => r.changed).map((r) => r.file);
+  fs.rmSync(path.join(projectRoot, "_project"), { recursive: true });
+  return { ...plan, converted: true, uid, rendered };
 }
 
 // ---------------------------------------------------------------------------

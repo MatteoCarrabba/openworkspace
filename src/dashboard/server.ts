@@ -131,6 +131,11 @@ export interface ScanProject {
   hasObsidianVault: boolean;
   /** The declared information map (decision-2); null for a legacy project with no [map]. */
   map: ScanMapEntry[] | null;
+  /**
+   * decision-3: "map-only" (no `_project/` folder; the map lives in the
+   * README/AGENTS block) or "folder".
+   */
+  form: "folder" | "map-only";
 }
 
 /** One information-map entry as the dashboard shows it (where a kind of information lives). */
@@ -557,6 +562,7 @@ function assembleScanResult(ws: Workspace, now: Date, projectData: readonly Proj
       // Cheap: one stat per project per scan, no directory walk.
       hasObsidianVault: fs.existsSync(path.join(info.root, ".obsidian")),
       map,
+      form: info.form,
     });
   }
 

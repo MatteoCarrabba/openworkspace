@@ -31,6 +31,7 @@ import {
 } from "../lib/frontmatter.js";
 import { formatId, idFromFilename, mintId, parseId } from "../lib/ids.js";
 import { MachineStore } from "../lib/machine.js";
+import { ensureProjectFolder } from "../init.js";
 import { readProjectUid } from "../lib/workspace.js";
 
 export type DecisionStatus = "draft" | "accepted" | "superseded";
@@ -117,6 +118,8 @@ export function newDecision(
   if (uid === null) {
     throw new ConfigError(`not a project (no _project/id): ${projectRoot}`);
   }
+  // decision-3: the first native write gives a map-only project its _project/.
+  ensureProjectFolder(projectRoot);
   const dir = decisionsDir(projectRoot);
   ensureDir(dir);
   const date = options.date ?? localToday();

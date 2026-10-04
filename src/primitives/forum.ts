@@ -29,6 +29,7 @@ import {
   updateRecordFile,
   writeRecord,
 } from "../lib/frontmatter.js";
+import { ensureProjectFolder } from "../init.js";
 import { MachineStore, machineId } from "../lib/machine.js";
 import { resolveCanonicalProject } from "../lib/resolve.js";
 
@@ -210,6 +211,7 @@ export function announce(
   const machine = machineId(ctx.store);
   const ts = isoUtc(clock(ctx));
   const file = presenceFilePath(paths, machine, actor);
+  ensureProjectFolder(paths.projectRoot); // decision-3: never a bare _project/ without its id
   // Sole-writer file: atomic replace (not wx) is the heartbeat semantics.
   const rec = parseRecord("");
   setFields(rec, { participant: actor, machine, ts });
@@ -465,6 +467,7 @@ export function openThread(
   const now = clock(ctx);
   const name = `${isoUtc(now).slice(0, 10)}--${slug}`;
   const threadDir = path.join(paths.threadsDir, name);
+  ensureProjectFolder(paths.projectRoot); // decision-3: first native write on a map-only project
   ensureDir(paths.threadsDir);
   try {
     fs.mkdirSync(threadDir); // atomic creation = the thread's identity claim

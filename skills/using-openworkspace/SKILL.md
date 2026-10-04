@@ -8,8 +8,9 @@ description: >-
   tasks (including reminders-as-tasks and recurring tasks), recording
   decisions, coordinating with other agents on the forum, navigating projects,
   and validating with doctor. Use this skill whenever you are operating in a
-  directory tree that contains a `.openworkspace/` marker or a `_project/`
-  directory, or when the user mentions the `projects` CLI, OpenWorkspace,
+  directory tree that contains a `.openworkspace/` marker, a `_project/`
+  directory, or a README/AGENTS.md "Where information lives" block marked
+  `openworkspace:information-map`, or when the user mentions the `projects` CLI, OpenWorkspace,
   project tasks/decisions/forum, or asks you to organize work in such a
   workspace.
 ---
@@ -22,7 +23,9 @@ knowledge base, plans, coordination channel, and extras like a credentials
 vault or data stores. That **information map** lives in
 `_project/project.toml` under `[map]` and is rendered into a generated
 "Where information lives" section of the project's `README.md` and
-`AGENTS.md`. OpenWorkspace also ships plain-file **native stores** for tasks,
+`AGENTS.md` — or, for a **map-only** project (every primitive external or
+`none`), there is no `_project/` folder at all and that section *is* the
+map (see below). OpenWorkspace also ships plain-file **native stores** for tasks,
 decisions, wiki, plans and forum — one option per primitive, chosen à la
 carte, never the default expectation. The CLI is `projects`. Validate
 anything you're unsure about with `projects doctor`.
@@ -73,6 +76,29 @@ before; `projects map adopt` (dry-run; `--apply` to execute, `--prune-empty`
 to remove stores holding only the old empty skeleton) declares a map from
 what is actually in use.
 
+### Map-only projects (no `_project/` folder)
+
+When no primitive is native, the project has **no `_project/` folder**. Its
+map and identity (`uid`) live in a fenced TOML block inside the
+"Where information lives" section of `README.md` (or `AGENTS.md`); the BEGIN
+marker carries the `map-only` flavor. That block is the source of truth:
+
+- Read it with `projects map show` (or just read the README). Change it with
+  `projects map set|unset` — or edit the TOML and run `projects map render`.
+  Keep `format` and `uid` as they are; never copy a block into another
+  project (the uid is that project's identity).
+- `projects init`/`new` make a map-only project unless you pass `--native`,
+  `--folder` or `--no-docs`.
+- Enabling a native store (`projects map set <prim> native`, or the first
+  `task create`/`decision new`/`forum open` on an undeclared primitive)
+  creates `_project/` with the same uid and moves the map into
+  `project.toml`. Prefer declaring the real external home instead.
+- `projects map adopt --map-only --apply` turns a folder project whose
+  stores are retired back into map-only (it refuses, listing blockers, while
+  anything but stamps and empty stores is left); `--folder --apply` is the
+  reverse.
+- `home list` tags these projects `map-only`; doctor checks the block.
+
 ## Rules for native records
 
 1. **Location encodes visibility and retention for records; project lifecycle
@@ -95,19 +121,21 @@ projects home list --all      # what projects exist (live scan; --all includes s
 projects home scan --json     # task/planning view (+ each project's declared map); plain scan is a summary
 projects show                 # which project am I in (walk-up from cwd) + its information map
 projects doctor               # are this project's invariants intact (incl. the map and its rendered sections)
-cat _project/README.md        # every project carries its own orientation file
+cat _project/README.md        # a folder project's orientation file (map-only projects: read README.md)
 ```
 
 Any directory becomes a project with `projects init [<path>]` (path defaults
 to the cwd, which must be inside a workspace and be neither the workspace
 root nor a shelf root) — or `projects new "Name"` to create a fresh
-directory. Init stamps only `_project/id`, the orientation README, a
-`.gitignore` and `project.toml` with the `[map]`, and renders the map into
-the project's `README.md`/`AGENTS.md` (`--no-docs` skips that). Declare homes
+directory. Without a native store, init makes a **map-only** project: no
+`_project/`, just the map block (with the uid) in `README.md`/`AGENTS.md`.
+With one (or `--folder`/`--no-docs`), init stamps only `_project/id`, the
+orientation README, a `.gitignore` and `project.toml` with the `[map]`, and
+renders the map into the project's `README.md`/`AGENTS.md`. Declare homes
 up front with `--native tasks,wiki` (or `--native all`) and
 `--home tasks=<url>` / `--home forum=none`; otherwise doctor asks for each.
 **No native store is pre-created.** Never restamp by hand; never edit
-`_project/id`.
+`_project/id` (or a map-only block's `uid`).
 
 A project can also live **outside** the workspace tree — typically a git repo
 that is itself a project, kept under `~/Code` (out of iCloud). The workspace

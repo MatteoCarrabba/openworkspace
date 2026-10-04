@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 
-import { readOwns } from "../src/lib/workspace.js";
+import { readOwns, writeOwns } from "../src/lib/workspace.js";
 import { makeTmpDir, rmrf } from "./helpers.js";
 
 const CLI = path.resolve(__dirname, "..", "src", "cli.js");
@@ -218,10 +218,8 @@ test("cli tree: renders parent→child indentation; tags a cycle and terminates"
 
   // Force a cycle by hand-editing the children's owns (bypass the add-time guard),
   // then assert tree still terminates and tags the cycle.
-  fs.writeFileSync(
-    path.join(fx.root, "Child", "_project", "project.toml"),
-    `[[owns]]\nref = "Parent"\nkind = "subproject"\n`,
-  );
+  // Projects are map-only by default (decision-3): write through the library.
+  writeOwns(path.join(fx.root, "Child"), [{ ref: "Parent", kind: "subproject", name: null, lifecycle: null }]);
   const cycleTree = run(["tree", "--project", "Parent"], fx.root, fx.storeDir);
   assert.equal(cycleTree.status, 0, cycleTree.stderr);
   assert.match(cycleTree.stdout, /\(cycle\)/);
@@ -257,10 +255,8 @@ test("cli tree (default, no --project): renders a whole-graph cycle (no acyclic 
   // so the old roots-only computation dropped the whole SCC. Hand-edit Bar's
   // owns to bypass the add-time cycle guard.
   assert.equal(run(["link", "add", "Bar", "--project", "Foo"], fx.root, fx.storeDir).status, 0);
-  fs.writeFileSync(
-    path.join(fx.root, "Bar", "_project", "project.toml"),
-    `[[owns]]\nref = "Foo"\nkind = "subproject"\n`,
-  );
+  // Projects are map-only by default (decision-3): write through the library.
+  writeOwns(path.join(fx.root, "Bar"), [{ ref: "Foo", kind: "subproject", name: null, lifecycle: null }]);
 
   const tree = run(["tree"], fx.root, fx.storeDir);
   assert.equal(tree.status, 0, tree.stderr);
@@ -276,10 +272,8 @@ test("cli tree (default): a self-loop (X owns X) renders once, tagged (cycle)", 
   t.after(fx.cleanup);
   assert.equal(run(["new", "Solo"], fx.root, fx.storeDir).status, 0);
   // Hand-edit a self-owning edge (the add-time self-link guard would refuse it).
-  fs.writeFileSync(
-    path.join(fx.root, "Solo", "_project", "project.toml"),
-    `[[owns]]\nref = "Solo"\nkind = "subproject"\n`,
-  );
+  // Projects are map-only by default (decision-3): write through the library.
+  writeOwns(path.join(fx.root, "Solo"), [{ ref: "Solo", kind: "subproject", name: null, lifecycle: null }]);
 
   const tree = run(["tree"], fx.root, fx.storeDir);
   assert.equal(tree.status, 0, tree.stderr);

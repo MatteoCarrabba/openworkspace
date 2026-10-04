@@ -84,6 +84,11 @@ export function ProjectCard({ p, st }: { p: ScanProject; st: ViewState }): React
         </button>
         <span className="project-name">{p.name}</span>
         <span className="lifecycle-tag">{p.lifecycle}</span>
+        {p.form === "map-only" ? (
+          <span className="lifecycle-tag map-only-tag" title="No _project/ folder: this project's map lives in its README/AGENTS.md block">
+            map-only
+          </span>
+        ) : null}
         <span className="meta">
           {p.relPath}
           {hiddenN ? " · " + hiddenN + " hidden" : ""}

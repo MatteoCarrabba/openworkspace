@@ -129,7 +129,7 @@ test("doctor: state-named subdirs flagged under plans/, automations/, forum/ —
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
   const p = path.join(projectRoot, "_project");
   fs.mkdirSync(path.join(p, "plans", "done"), { recursive: true });
   fs.mkdirSync(path.join(p, "automations", "pending"), { recursive: true });
@@ -170,7 +170,7 @@ test("doctor: resolved thread untouched >30 days gets an archive PROPOSAL (warn)
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
   const now = new Date("2026-06-10T12:00:00Z");
   makeThread(
     projectRoot,
@@ -195,7 +195,7 @@ test("doctor: unanswered to: question aging >7 days in an OPEN thread warns; ans
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
   const now = new Date("2026-06-10T12:00:00Z");
   const q = (id: string, ts: string, to: string) =>
     ({ filename: `${id}.md`, text: `---\nfrom: a\nkind: question\nts: ${ts}\nto: ${to}\n---\nq?\n` });
@@ -248,7 +248,7 @@ test("doc-currency: dead commands and retired primitive dirs in a stamped README
   const tmp = makeTmpDir();
   t.after(() => rmrf(tmp));
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
   const readmePath = path.join(projectRoot, "_project", "README.md");
   fs.appendFileSync(
     readmePath,
@@ -313,7 +313,7 @@ test("doctor: _project/id git-ignored and tracked-should-be-ignored files are pr
   t.after(() => rmrf(tmp));
   git(["init", "-q"], tmp);
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
   // allowlist-style root gitignore that never admitted the project
   fs.writeFileSync(path.join(tmp, ".gitignore"), "*\n!.gitignore\n");
   // and a presence file that got committed despite the stamp
@@ -347,7 +347,7 @@ test("git posture: the stamped /archive/ pattern is ANCHORED — tasks/archive/ 
   t.after(() => rmrf(tmp));
   git(["init", "-q"], tmp);
   const projectRoot = path.join(tmp, "Proj");
-  initProject(projectRoot);
+  initProject(projectRoot, { folder: true });
 
   const checkIgnored = (rel: string): boolean => {
     try {
