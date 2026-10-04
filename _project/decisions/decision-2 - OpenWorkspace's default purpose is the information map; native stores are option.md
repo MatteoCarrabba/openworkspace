@@ -4,6 +4,7 @@ title: "OpenWorkspace's default purpose is the information map; native stores ar
 status: accepted
 date: 2026-10-03
 superseded_by: null
+amended_by: decision-3
 ---
 
 ## Context
@@ -83,3 +84,7 @@ empty."
   homes) and "Tasks live in …" where tasks are external.
 - MBI is the first adopter; its per-project migration plan is in
   `_project/wiki/mbi-information-map-migration.md` (not yet applied).
+- **Amended by decision-3 (2026-10-04):** a project with no native store
+  is *map-only* — no `_project/` folder; its map and uid live in the
+  README/AGENTS block, which is its source of truth. §3's init stamp now
+  applies only when a native store is requested.

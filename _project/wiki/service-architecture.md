@@ -119,6 +119,13 @@ together 2026-07-08):
   at (re)build time and serves it as `ScanProject.map` (refreshed by the
   periodic self-heal rebuild, not by `fs.watch`, which still watches only
   `tasks/`).
+- **Map-only projects** (2026-10-04, decision-3) — a project with no native
+  store has no `_project/` folder: its map and uid live in a fenced TOML
+  block inside the README/AGENTS "Where information lives" block, which is
+  its source of truth. Discovery reads README.md/AGENTS.md per walked
+  directory (strict, fence-aware); the warm model serves `ScanProject.form`
+  (`folder` | `map-only`) and picks up block edits on the same periodic
+  rebuild as the map.
 
 Phase 4 (the hub) is explicitly deferred, gated on token rotation
 (Personal OS task-201).
